@@ -1,0 +1,32 @@
+[package]
+name = "sid-isnt-done"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrrg = "^0.8"
+async-trait = "0.1"
+claudius = { version = "0.19.0" }
+ctrlc = { version = "3.5", features = ["termination"] }
+handled = { version = "0.5", path = "../blue/handled" }
+rc_conf = { version = "0.13.0", default-features = false }
+rustyline = "17.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shvar = "^0.8"
+tokio = { version = "1.49", features = ["full"] }
+utf8path = "^0.9"
+crossterm = { version = "0.27", features = ["event-stream"] }
+futures = "0.3"
+
+[[bin]]
+name = "sid"
+path = "src/bin/sid.rs"
+
+[[bin]]
+name = "sid-bash-tool"
+path = "src/bin/sid-bash-tool.rs"
+
+[[bin]]
+name = "sid-editor-tool"
+path = "src/bin/sid-editor-tool.rs"
