@@ -214,6 +214,34 @@ impl SidAgent {
             ));
         };
 
+        match binding.enabled {
+            SwitchPosition::Yes => {}
+            SwitchPosition::No => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "bash is disabled",
+                ));
+            }
+            SwitchPosition::Manual => {
+                let input_value = serde_json::json!({
+                    "command": command,
+                    "restart": restart,
+                });
+                match confirm_manual_tool_call("bash", &input_value) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "bash call denied by operator",
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(std::io::Error::other(err));
+                    }
+                }
+            }
+        }
+
         let input = serde_json::Map::from_iter([
             (
                 "command".to_string(),
@@ -361,6 +389,27 @@ impl Agent for SidAgent {
         let Some(binding) = self.builtin_bindings.edit.as_ref() else {
             return self.default_text_editor(tool_use).await;
         };
+        match binding.enabled {
+            SwitchPosition::Yes => {}
+            SwitchPosition::No => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "edit is disabled",
+                ));
+            }
+            SwitchPosition::Manual => match confirm_manual_tool_call("edit", &tool_use.input) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "edit call denied by operator",
+                    ));
+                }
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
+            },
+        }
         let input = tool_use.input.as_object().cloned().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -405,6 +454,7 @@ struct BuiltinToolBindings {
 struct RcToolBinding {
     service_name: String,
     canonical_id: String,
+    enabled: SwitchPosition,
     executable_path: Path<'static>,
 }
 
@@ -448,6 +498,7 @@ impl BuiltinToolKind {
 struct ExternalTool {
     name: String,
     canonical_id: String,
+    enabled: SwitchPosition,
     executable_path: Path<'static>,
     description: String,
     input_schema: serde_json::Value,
@@ -462,6 +513,7 @@ impl ExternalTool {
         Self {
             name,
             canonical_id,
+            enabled: tool.enabled,
             executable_path: tool.executable_path.clone(),
             description: manifest.description.clone(),
             input_schema: manifest.input_schema.clone(),
@@ -598,6 +650,25 @@ async fn invoke_external_tool(
     agent: &SidAgent,
     tool_use: &ToolUseBlock,
 ) -> ToolResult {
+    match tool.enabled {
+        SwitchPosition::Yes => {}
+        SwitchPosition::No => {
+            return tool_error_result(&tool_use.id, format!("tool '{}' is disabled", tool.name));
+        }
+        SwitchPosition::Manual => match confirm_manual_tool_call(&tool.name, &tool_use.input) {
+            Ok(true) => {}
+            Ok(false) => {
+                return tool_error_result(
+                    &tool_use.id,
+                    format!("tool '{}' call denied by operator", tool.name),
+                );
+            }
+            Err(err) => {
+                return tool_error_result(&tool_use.id, err);
+            }
+        },
+    }
+
     let input = match tool_use.input.as_object() {
         Some(input) => input.clone(),
         None => {
@@ -904,6 +975,48 @@ fn extract_tool_output(
     Err(message)
 }
 
+/// Prompt the operator to confirm a manual tool call via stdin/stdout.
+///
+/// Returns `Ok(true)` when the operator approves, `Ok(false)` when denied or
+/// stdin reaches EOF, and `Err` on I/O failure.
+fn confirm_manual_tool_call(tool_name: &str, input: &serde_json::Value) -> Result<bool, String> {
+    use std::io::{self, Write};
+
+    let input_display =
+        serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"));
+
+    let mut buf = String::new();
+    loop {
+        print!("Tool '{tool_name}' is MANUAL.\n{input_display}\nAllow this call? [yes/no]: ");
+        io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush manual-tool confirmation prompt: {err}"))?;
+
+        buf.clear();
+        if io::stdin()
+            .read_line(&mut buf)
+            .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
+            == 0
+        {
+            println!();
+            return Ok(false);
+        }
+
+        match parse_tool_confirmation(&buf) {
+            Some(answer) => return Ok(answer),
+            None => println!("Please answer yes or no."),
+        }
+    }
+}
+
+fn parse_tool_confirmation(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn write_json_file(path: &StdPath, value: &impl Serialize) -> Result<(), SError> {
     let path_display = path.to_string_lossy();
     let payload = serde_json::to_vec_pretty(value).map_err(|err| {
@@ -1043,6 +1156,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
                 RcToolBinding {
                     service_name: tool_name.clone(),
                     canonical_id,
+                    enabled: tool_config.enabled,
                     executable_path: tool_config.executable_path.clone(),
                 },
             );
@@ -1449,6 +1563,88 @@ mod tests {
 
         assert_eq!(agent.id(), "plan");
         assert!(agent.requires_confirmation());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn parse_tool_confirmation_accepts_yes() {
+        assert_eq!(parse_tool_confirmation("yes"), Some(true));
+        assert_eq!(parse_tool_confirmation("YES"), Some(true));
+        assert_eq!(parse_tool_confirmation("y"), Some(true));
+        assert_eq!(parse_tool_confirmation("Y"), Some(true));
+        assert_eq!(parse_tool_confirmation("  yes  \n"), Some(true));
+    }
+
+    #[test]
+    fn parse_tool_confirmation_accepts_no() {
+        assert_eq!(parse_tool_confirmation("no"), Some(false));
+        assert_eq!(parse_tool_confirmation("NO"), Some(false));
+        assert_eq!(parse_tool_confirmation("n"), Some(false));
+        assert_eq!(parse_tool_confirmation("N"), Some(false));
+        assert_eq!(parse_tool_confirmation("  no  \n"), Some(false));
+    }
+
+    #[test]
+    fn parse_tool_confirmation_rejects_other() {
+        assert_eq!(parse_tool_confirmation(""), None);
+        assert_eq!(parse_tool_confirmation("maybe"), None);
+        assert_eq!(parse_tool_confirmation("yep"), None);
+        assert_eq!(parse_tool_confirmation("nope"), None);
+    }
+
+    #[test]
+    fn manual_external_tool_stores_enabled_state() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='fmt'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "fmt_ENABLED=MANUAL\n").unwrap();
+        write_tool_contract(&root, "fmt", "Format files.", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let tool_config = config.tools.get("fmt").unwrap();
+        assert_eq!(tool_config.enabled, SwitchPosition::Manual);
+
+        let canonical_id = resolve_canonical_tool_id(&config.tools_rc_conf, "fmt").unwrap();
+        let tool = ExternalTool::from_config("fmt".to_string(), canonical_id, tool_config);
+        assert_eq!(tool.enabled, SwitchPosition::Manual);
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn manual_builtin_binding_stores_enabled_state() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash edit'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            "bash_ENABLED=MANUAL\nedit_ENABLED=MANUAL\n",
+        )
+        .unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        write_tool_runtime(&root, "edit", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        assert_eq!(
+            agent.builtin_bindings.bash.as_ref().unwrap().enabled,
+            SwitchPosition::Manual,
+        );
+        assert_eq!(
+            agent.builtin_bindings.edit.as_ref().unwrap().enabled,
+            SwitchPosition::Manual,
+        );
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
