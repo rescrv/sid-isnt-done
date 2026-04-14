@@ -16,6 +16,8 @@ pub const AGENTS_CONF_FILE: &str = "agents.conf";
 pub const TOOLS_CONF_FILE: &str = "tools.conf";
 pub const AGENTS_DIR: &str = "agents";
 pub const TOOLS_DIR: &str = "tools";
+pub const SKILLS_DIR: &str = "skills";
+pub const SKILL_FILE: &str = "SKILL.md";
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -23,6 +25,7 @@ pub struct Config {
     pub root: Path<'static>,
     pub agents: BTreeMap<String, AgentConfig>,
     pub tools: BTreeMap<String, ToolConfig>,
+    pub skills: BTreeMap<String, SkillConfig>,
     pub(crate) tools_rc_conf: RcConf,
 }
 
@@ -39,12 +42,15 @@ impl Config {
         let tools_rc_conf = parse_rc_conf(&tools_conf_path)?;
         let agent_names = collect_names_from_rc_conf(&agents_rc_conf)?;
         let tool_names = collect_names_from_rc_conf(&tools_rc_conf)?;
+        let skills_dirs = resolve_skills_dirs(&root);
+        let skills = load_skills(&skills_dirs)?;
         Self::from_parts(
             root,
             agents_rc_conf,
             &agent_names,
             tools_rc_conf,
             &tool_names,
+            skills,
         )
     }
 
@@ -54,6 +60,7 @@ impl Config {
         agent_names: &[String],
         tools_rc_conf: RcConf,
         tool_names: &[String],
+        skills: BTreeMap<String, SkillConfig>,
     ) -> Result<Self, SError> {
         let agents_dir = root.join(AGENTS_DIR).into_owned();
         let tools_dir = root.join(TOOLS_DIR).into_owned();
@@ -70,6 +77,7 @@ impl Config {
             root,
             agents,
             tools,
+            skills,
             tools_rc_conf,
         })
     }
@@ -145,6 +153,17 @@ pub struct ToolManifest {
     pub protocol_version: u32,
     pub description: String,
     pub input_schema: serde_json::Value,
+}
+
+/// Per-skill configuration loaded from a markdown file in the skills directory.
+#[derive(Debug)]
+pub struct SkillConfig {
+    /// Skill identifier derived from the filename without the `.md` extension.
+    pub id: String,
+    /// Absolute path to the skill markdown file.
+    pub path: Path<'static>,
+    /// Markdown content of the skill file.
+    pub content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +346,76 @@ fn load_tool_manifest(tool: &str, path: &Path) -> Result<ToolManifest, SError> {
 
 fn builtin_tool_manifest_is_optional(tool: &str) -> bool {
     matches!(tool, "bash" | "edit")
+}
+
+fn resolve_skills_dirs(root: &Path) -> Vec<Path<'static>> {
+    match std::env::var("SID_SKILLS_PATH") {
+        Ok(path) if !path.is_empty() => path
+            .split(':')
+            .filter(|component| !component.is_empty())
+            .map(|component| Path::new(component).into_owned())
+            .collect(),
+        _ => vec![root.join(SKILLS_DIR).into_owned()],
+    }
+}
+
+fn load_skills(dirs: &[Path<'static>]) -> Result<BTreeMap<String, SkillConfig>, SError> {
+    let mut skills = BTreeMap::new();
+    for dir in dirs {
+        if !std::path::Path::new(dir.as_str()).is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(dir.as_str()).map_err(|err| {
+            SError::new("config")
+                .with_code("io_error")
+                .with_message("failed to read skills directory")
+                .with_string_field("path", dir.as_str())
+                .with_string_field("cause", &err.to_string())
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                SError::new("config")
+                    .with_code("io_error")
+                    .with_message("failed to read skills directory entry")
+                    .with_string_field("path", dir.as_str())
+                    .with_string_field("cause", &err.to_string())
+            })?;
+            let entry_path = entry.path();
+            if !entry_path.is_dir() {
+                continue;
+            }
+            let skill_file = entry_path.join(SKILL_FILE);
+            if !skill_file.is_file() {
+                continue;
+            }
+            let dir_name = entry.file_name();
+            let skill_name = dir_name.to_string_lossy();
+            if skill_name.is_empty() {
+                continue;
+            }
+            if skills.contains_key(skill_name.as_ref()) {
+                continue;
+            }
+            let path = Path::try_from(skill_file)
+                .map_err(|err| {
+                    SError::new("config")
+                        .with_code("invalid_skill_path")
+                        .with_message("skill path is not valid UTF-8")
+                        .with_string_field("cause", &format!("{err:?}"))
+                })?
+                .into_owned();
+            let content = read_utf8_file(&path, &skill_name, "skill")?;
+            skills.insert(
+                skill_name.to_string(),
+                SkillConfig {
+                    id: skill_name.to_string(),
+                    path,
+                    content,
+                },
+            );
+        }
+    }
+    Ok(skills)
 }
 
 fn apply_chat_config_overrides(
@@ -1033,6 +1122,100 @@ format_ALIASES="fmt"
         let err = Config::load(&root).unwrap_err().to_string();
         assert!(err.contains("unknown_tool"));
         assert!(err.contains("fmt"));
+    }
+
+    #[test]
+    fn load_skills_from_skills_directory() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/rust").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/python").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/empty-dir").as_str()).unwrap();
+
+        fs::write(root.join("agents.conf").as_str(), "").unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+        fs::write(
+            root.join("skills/rust/SKILL.md").as_str(),
+            "# Rust\n\nYou are a Rust expert.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("skills/python/SKILL.md").as_str(),
+            "# Python\n\nYou know Python.\n",
+        )
+        .unwrap();
+        // Bare file in skills/ should be ignored.
+        fs::write(root.join("skills/notes.txt").as_str(), "not a skill").unwrap();
+        // Subdirectory without SKILL.md should be ignored.
+
+        let config = Config::load(&root).unwrap();
+        assert_eq!(config.skills.len(), 2);
+
+        let rust_skill = config.skills.get("rust").unwrap();
+        assert_eq!(rust_skill.id, "rust");
+        assert_eq!(rust_skill.content, "# Rust\n\nYou are a Rust expert.\n");
+        assert_eq!(rust_skill.path, root.join("skills/rust/SKILL.md"));
+
+        let python_skill = config.skills.get("python").unwrap();
+        assert_eq!(python_skill.id, "python");
+        assert_eq!(python_skill.content, "# Python\n\nYou know Python.\n");
+    }
+
+    #[test]
+    fn missing_skills_directory_produces_empty_skills() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("agents.conf").as_str(), "").unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        assert!(config.skills.is_empty());
+    }
+
+    #[test]
+    fn load_skills_earlier_directory_wins() {
+        let dir_a = unique_temp_dir("skills-a");
+        let dir_b = unique_temp_dir("skills-b");
+        fs::create_dir_all(dir_a.join("rust").as_str()).unwrap();
+        fs::create_dir_all(dir_a.join("go").as_str()).unwrap();
+        fs::create_dir_all(dir_b.join("rust").as_str()).unwrap();
+        fs::create_dir_all(dir_b.join("python").as_str()).unwrap();
+
+        fs::write(dir_a.join("rust/SKILL.md").as_str(), "# Rust from A\n").unwrap();
+        fs::write(dir_a.join("go/SKILL.md").as_str(), "# Go from A\n").unwrap();
+        fs::write(
+            dir_b.join("rust/SKILL.md").as_str(),
+            "# Rust from B (should be shadowed)\n",
+        )
+        .unwrap();
+        fs::write(dir_b.join("python/SKILL.md").as_str(), "# Python from B\n").unwrap();
+
+        let dirs = vec![dir_a.clone(), dir_b.clone()];
+        let skills = load_skills(&dirs).unwrap();
+        assert_eq!(skills.len(), 3);
+
+        let rust_skill = skills.get("rust").unwrap();
+        assert_eq!(rust_skill.content, "# Rust from A\n");
+        assert_eq!(rust_skill.path, dir_a.join("rust/SKILL.md"));
+
+        assert_eq!(skills.get("go").unwrap().content, "# Go from A\n");
+
+        let python_skill = skills.get("python").unwrap();
+        assert_eq!(python_skill.content, "# Python from B\n");
+        assert_eq!(python_skill.path, dir_b.join("python/SKILL.md"));
+    }
+
+    #[test]
+    fn load_skills_skips_nonexistent_directories() {
+        let dir_exists = unique_temp_dir("skills-exists");
+        let dir_missing = unique_temp_dir("skills-missing");
+        fs::create_dir_all(dir_exists.join("rust").as_str()).unwrap();
+        fs::write(dir_exists.join("rust/SKILL.md").as_str(), "# Rust\n").unwrap();
+
+        let dirs = vec![dir_missing, dir_exists];
+        let skills = load_skills(&dirs).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert!(skills.contains_key("rust"));
     }
 
     fn write_tool_contract(root: &Path, tool: &str, description: &str) {
