@@ -14,9 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
-    Agent, Anthropic, Error, FileSystem, IntermediateToolResult, Model, SystemPrompt,
-    ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolParam, ToolResult, ToolResultBlock,
-    ToolTextEditor20250728, ToolUnionParam, ToolUseBlock,
+    Agent, Anthropic, Error, FileSystem, IntermediateToolResult, Model, MountHierarchy,
+    Permissions, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolParam,
+    ToolResult, ToolResultBlock, ToolTextEditor20250728, ToolUnionParam, ToolUseBlock,
 };
 use handled::SError;
 use rc_conf::{RcConf, SwitchPosition, var_name_from_service, var_prefix_from_service};
@@ -25,8 +25,8 @@ use tokio::process::Command;
 use utf8path::Path;
 
 use crate::config::{
-    AGENTS_CONF_FILE, AgentConfig, Config, TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR,
-    ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
+    AGENTS_CONF_FILE, AgentConfig, Config, SkillConfig, TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE,
+    TOOLS_DIR, ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
 };
 const DEFAULT_AGENT_ID: &str = "sid";
 
@@ -47,19 +47,21 @@ pub struct SidAgent {
     tools: Vec<Arc<dyn Tool<Self>>>,
     builtin_bindings: BuiltinToolBindings,
     config_root: Path<'static>,
-    filesystem: Path<'static>,
+    workspace_root: Path<'static>,
+    filesystem: MountHierarchy,
 }
 
 impl SidAgent {
-    pub fn new(config: ChatConfig, filesystem: Path<'static>) -> Self {
-        Self::new_with_roots(config, filesystem.clone(), filesystem)
+    pub fn new(config: ChatConfig, workspace_root: Path<'static>) -> Self {
+        Self::new_with_roots(config, workspace_root.clone(), workspace_root)
     }
 
     fn new_with_roots(
         config: ChatConfig,
         config_root: Path<'static>,
-        filesystem: Path<'static>,
+        workspace_root: Path<'static>,
     ) -> Self {
+        let filesystem = build_default_filesystem(&workspace_root);
         Self::with_parts(
             DEFAULT_AGENT_ID.to_string(),
             SwitchPosition::Yes,
@@ -67,6 +69,7 @@ impl SidAgent {
             vec![],
             BuiltinToolBindings::default(),
             config_root,
+            workspace_root,
             filesystem,
         )
     }
@@ -151,7 +154,7 @@ impl SidAgent {
         config: &Config,
         agent: &str,
         fallback: Option<&ChatConfig>,
-        filesystem: Path<'static>,
+        workspace_root: Path<'static>,
     ) -> Result<Self, SError> {
         let agent_config = config
             .agents
@@ -163,6 +166,7 @@ impl SidAgent {
 
         let built_tools = build_tools(config, agent_config)?;
         let chat_config = merged_chat_config(agent_config, fallback);
+        let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
         Ok(Self::with_parts(
             agent.to_string(),
             agent_config.enabled,
@@ -170,10 +174,12 @@ impl SidAgent {
             built_tools.tools,
             built_tools.builtin_bindings,
             config.root.clone(),
+            workspace_root,
             filesystem,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_parts(
         id: String,
         enabled: SwitchPosition,
@@ -181,7 +187,8 @@ impl SidAgent {
         tools: Vec<Arc<dyn Tool<Self>>>,
         builtin_bindings: BuiltinToolBindings,
         config_root: Path<'static>,
-        filesystem: Path<'static>,
+        workspace_root: Path<'static>,
+        filesystem: MountHierarchy,
     ) -> Self {
         Self {
             id,
@@ -190,6 +197,7 @@ impl SidAgent {
             tools,
             builtin_bindings,
             config_root,
+            workspace_root,
             filesystem,
         }
     }
@@ -652,8 +660,8 @@ async fn invoke_rc_tool_text(
             id: agent.id.clone(),
         },
         workspace: ToolRequestWorkspace {
-            root: agent.filesystem.as_str().to_string(),
-            cwd: agent.filesystem.as_str().to_string(),
+            root: agent.workspace_root.as_str().to_string(),
+            cwd: agent.workspace_root.as_str().to_string(),
         },
         files: ToolRequestFiles {
             scratch_dir: scratch_dir.to_string_lossy().into_owned(),
@@ -686,7 +694,7 @@ async fn invoke_rc_tool_text(
 
     let status = Command::new(executable_path.as_str())
         .arg("run")
-        .current_dir(agent.filesystem.as_str())
+        .current_dir(agent.workspace_root.as_str())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -788,7 +796,7 @@ fn render_tool_rc_overlay(
     let request_file = overlay_context.request_file.to_string_lossy().into_owned();
     let result_file = overlay_context.result_file.to_string_lossy().into_owned();
     let scratch_dir = overlay_context.scratch_dir.to_string_lossy().into_owned();
-    let workspace_root = agent.filesystem.as_str().to_string();
+    let workspace_root = agent.workspace_root.as_str().to_string();
     let tool_protocol = TOOL_PROTOCOL_VERSION.to_string();
     let mut overlay = String::new();
 
@@ -1129,6 +1137,86 @@ fn disabled_tool_error(agent: &str, tool: &str, enabled: SwitchPosition) -> SErr
         .with_string_field("enabled", &format!("{enabled:?}"))
 }
 
+/// Build a default filesystem hierarchy with only the workspace root mounted at `/`.
+fn build_default_filesystem(workspace_root: &Path) -> MountHierarchy {
+    let mut hierarchy = MountHierarchy::default();
+    hierarchy
+        .mount(
+            "/".into(),
+            Permissions::ReadWrite,
+            workspace_root.clone().into_owned(),
+        )
+        .expect("root mount at / must succeed as the first mount");
+    hierarchy
+}
+
+/// Build a filesystem hierarchy with the workspace root at `/` and agent skills
+/// mounted read-only under `/skills/<skill_id>/`.
+fn build_agent_filesystem(
+    workspace_root: &Path,
+    config: &Config,
+    agent_config: &AgentConfig,
+) -> Result<MountHierarchy, SError> {
+    let mut hierarchy = build_default_filesystem(workspace_root);
+    let skills = resolve_agent_skills(config, agent_config);
+    for skill in skills {
+        mount_skill(&mut hierarchy, skill)?;
+    }
+    Ok(hierarchy)
+}
+
+/// Resolve which skills an agent has access to based on its skill configuration.
+fn resolve_agent_skills<'a>(
+    config: &'a Config,
+    agent_config: &AgentConfig,
+) -> Vec<&'a SkillConfig> {
+    if agent_config.skills.is_empty() {
+        return vec![];
+    }
+    let include_all = agent_config.skills.iter().any(|s| s == "*");
+    if include_all {
+        config.skills.values().collect()
+    } else {
+        agent_config
+            .skills
+            .iter()
+            .filter_map(|name| config.skills.get(name))
+            .collect()
+    }
+}
+
+/// Mount a skill's directory as read-only under `/skills/<skill_id>/`.
+fn mount_skill(hierarchy: &mut MountHierarchy, skill: &SkillConfig) -> Result<(), SError> {
+    let parent = skill_parent_dir(&skill.path)?;
+    let mount_path = format!("/skills/{}", skill.id);
+    hierarchy
+        .mount(
+            Path::new(&mount_path).into_owned(),
+            Permissions::ReadOnly,
+            parent,
+        )
+        .map_err(|err| {
+            sid_agent_error("mount_error", &err).with_string_field("skill", &skill.id)
+        })?;
+    Ok(())
+}
+
+/// Extract the parent directory from a skill's file path.
+fn skill_parent_dir(skill_path: &Path) -> Result<Path<'static>, SError> {
+    let std_path = StdPath::new(skill_path.as_str());
+    let parent = std_path.parent().ok_or_else(|| {
+        sid_agent_error("invalid_skill_path", "skill path has no parent directory")
+            .with_string_field("path", skill_path.as_str())
+    })?;
+    Path::try_from(parent.to_path_buf())
+        .map(Path::into_owned)
+        .map_err(|err| {
+            sid_agent_error("invalid_skill_path", "skill parent path is not valid UTF-8")
+                .with_string_field("path", skill_path.as_str())
+                .with_string_field("cause", &format!("{err:?}"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1361,6 +1449,131 @@ mod tests {
 
         assert_eq!(agent.id(), "plan");
         assert!(agent.requires_confirmation());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn from_config_mounts_skills_as_read_only_files() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/rust").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/python").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_SKILLS='rust python'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(
+            root.join("agents/build.md").as_str(),
+            "# Build\n\nYou are a builder.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("skills/rust/SKILL.md").as_str(),
+            "# Rust Skill\n\nWrite safe Rust.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("skills/python/SKILL.md").as_str(),
+            "# Python Skill\n\nWrite clean Python.\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let rust_content = runtime
+            .block_on(agent.filesystem.view("/skills/rust/SKILL.md", None))
+            .unwrap();
+        assert!(
+            rust_content.contains("Write safe Rust."),
+            "skill content should be viewable: {rust_content}"
+        );
+        let python_content = runtime
+            .block_on(agent.filesystem.view("/skills/python/SKILL.md", None))
+            .unwrap();
+        assert!(
+            python_content.contains("Write clean Python."),
+            "skill content should be viewable: {python_content}"
+        );
+
+        let replace_err = runtime
+            .block_on(agent.filesystem.str_replace(
+                "/skills/rust/SKILL.md",
+                "Write safe Rust.",
+                "Replaced.",
+            ))
+            .unwrap_err();
+        assert_eq!(
+            replace_err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "skill files should be read-only: {replace_err}"
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn from_config_mounts_all_skills_with_wildcard() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/docs").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_SKILLS='*'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("skills/docs/SKILL.md").as_str(), "# Docs Skill\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let docs_content = runtime
+            .block_on(agent.filesystem.view("/skills/docs/SKILL.md", None))
+            .unwrap();
+        assert!(
+            docs_content.contains("# Docs Skill"),
+            "wildcard should mount all skills: {docs_content}"
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn from_config_no_skills_mounts_workspace_only() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let content = runtime
+            .block_on(agent.filesystem.view("/agents/build.md", None))
+            .unwrap();
+        assert!(
+            content.contains("# Build"),
+            "workspace files should be viewable: {content}"
+        );
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
