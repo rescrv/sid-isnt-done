@@ -3,7 +3,7 @@ pub mod config;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Path as StdPath, PathBuf};
@@ -14,14 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
-    Agent, Anthropic, Error, FileSystem, IntermediateToolResult, Model, MountHierarchy,
-    Permissions, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolParam,
-    ToolResult, ToolResultBlock, ToolTextEditor20250728, ToolUnionParam, ToolUseBlock,
+    Agent, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error, FileSystem,
+    IntermediateToolResult, Model, MountHierarchy, Permissions, SystemPrompt, ThinkingConfig, Tool,
+    ToolBash20250124, ToolCallback, ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728,
+    ToolUnionParam, ToolUseBlock,
 };
 use handled::SError;
 use rc_conf::{RcConf, SwitchPosition, var_name_from_service, var_prefix_from_service};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use utf8path::Path;
 
 use crate::config::{
@@ -49,6 +51,7 @@ pub struct SidAgent {
     config_root: Path<'static>,
     workspace_root: Path<'static>,
     filesystem: MountHierarchy,
+    bash_session: Mutex<Option<BashPtySession>>,
 }
 
 impl SidAgent {
@@ -199,6 +202,7 @@ impl SidAgent {
             config_root,
             workspace_root,
             filesystem,
+            bash_session: Mutex::new(None),
         }
     }
 
@@ -242,15 +246,37 @@ impl SidAgent {
             }
         }
 
-        let input = serde_json::Map::from_iter([
-            (
-                "command".to_string(),
-                serde_json::Value::String(command.to_string()),
-            ),
-            ("restart".to_string(), serde_json::Value::Bool(restart)),
-        ]);
-        let tool_use_id = synthetic_tool_use_id(&binding.service_name);
-        self.invoke_rc_tool(binding, &tool_use_id, input).await
+        let mut session = self.bash_session.lock().await;
+        if session.is_none() {
+            *session = Some(BashPtySession::new(self.bash_pty_config()).await?);
+        }
+
+        let result = {
+            let session = session
+                .as_mut()
+                .expect("bash PTY session should be initialized");
+            session.run(command, restart).await
+        };
+        match result {
+            Ok(result) => render_bash_pty_result(result),
+            Err(err) => {
+                *session = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn bash_pty_config(&self) -> BashPtyConfig {
+        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        env.insert(
+            "SID_WORKSPACE_ROOT".to_string(),
+            self.workspace_root.as_str().to_string(),
+        );
+        BashPtyConfig {
+            cwd: PathBuf::from(self.workspace_root.as_str()),
+            env,
+            ..BashPtyConfig::default()
+        }
     }
 
     async fn invoke_rc_tool(
@@ -446,8 +472,13 @@ fn tool_runtime_error(tool: &str, code: &str, message: &str) -> SError {
 
 #[derive(Clone, Debug, Default)]
 struct BuiltinToolBindings {
-    bash: Option<RcToolBinding>,
+    bash: Option<BuiltinBashBinding>,
     edit: Option<RcToolBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct BuiltinBashBinding {
+    enabled: SwitchPosition,
 }
 
 #[derive(Clone, Debug)]
@@ -484,14 +515,6 @@ impl BuiltinToolKind {
             Self::Edit => Arc::new(ToolTextEditor20250728::new()) as Arc<dyn Tool<SidAgent>>,
         }
     }
-
-    fn bind(self, builtins: &mut BuiltinToolBindings, binding: RcToolBinding) {
-        match self {
-            Self::Bash if builtins.bash.is_none() => builtins.bash = Some(binding),
-            Self::Edit if builtins.edit.is_none() => builtins.edit = Some(binding),
-            _ => {}
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -510,11 +533,15 @@ impl ExternalTool {
             .manifest
             .as_ref()
             .expect("external tools require a manifest");
+        let executable_path = tool
+            .executable_path
+            .clone()
+            .expect("external tools require an executable path");
         Self {
             name,
             canonical_id,
             enabled: tool.enabled,
-            executable_path: tool.executable_path.clone(),
+            executable_path,
             description: manifest.description.clone(),
             input_schema: manifest.input_schema.clone(),
         }
@@ -1058,8 +1085,20 @@ fn next_request_id() -> String {
     format!("sidreq_{timestamp}_{}_{}", std::process::id(), sequence)
 }
 
-fn synthetic_tool_use_id(name: &str) -> String {
-    format!("toolu_builtin_{name}_{}", next_request_id())
+fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Error> {
+    let mut rendered = result.output;
+    if result.status.success() {
+        if rendered.is_empty() {
+            rendered.push_str("success\n");
+        }
+        Ok(rendered)
+    } else {
+        if !rendered.is_empty() && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered.push_str(&format!("{}\n", result.status));
+        Err(std::io::Error::other(rendered))
+    }
 }
 
 fn create_tool_scratch_dir(request_id: &str) -> Result<PathBuf, SError> {
@@ -1151,15 +1190,25 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
         let tool = builtin_kind.tool();
         let exposed_name = tool.name();
         if seen.insert(exposed_name) {
-            builtin_kind.bind(
-                &mut builtin_bindings,
-                RcToolBinding {
-                    service_name: tool_name.clone(),
-                    canonical_id,
-                    enabled: tool_config.enabled,
-                    executable_path: tool_config.executable_path.clone(),
-                },
-            );
+            match builtin_kind {
+                BuiltinToolKind::Bash if builtin_bindings.bash.is_none() => {
+                    builtin_bindings.bash = Some(BuiltinBashBinding {
+                        enabled: tool_config.enabled,
+                    });
+                }
+                BuiltinToolKind::Edit if builtin_bindings.edit.is_none() => {
+                    builtin_bindings.edit = Some(RcToolBinding {
+                        service_name: tool_name.clone(),
+                        canonical_id,
+                        enabled: tool_config.enabled,
+                        executable_path: tool_config
+                            .executable_path
+                            .clone()
+                            .expect("built-in edit tool requires an executable path"),
+                    });
+                }
+                _ => {}
+            }
             tools.push(tool);
         }
     }
@@ -1838,41 +1887,70 @@ mod tests {
     }
 
     #[test]
-    fn builtin_bash_uses_rc_tool_runtime() {
+    fn builtin_bash_persists_shell_state_across_calls() {
         let root = temp_config_root("agent");
-        write_builtin_config(
-            &root,
-            &capturing_tool_script(
-                "bash via rc",
-                "bash-request-capture.json",
-                "bash-env-capture.json",
-            ),
-            "#!/bin/sh\nexit 0\n",
-        );
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_agents = Path::try_from(
+            fs::canonicalize(root.join("agents").as_str())
+                .expect("canonicalize agents directory should succeed"),
+        )
+        .expect("canonical agents path should be valid UTF-8")
+        .into_owned();
 
         let config = Config::load(&root).unwrap();
         let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let result = runtime.block_on(agent.bash("printf hi", true)).unwrap();
-        assert_eq!(result, "bash via rc");
-
-        let request: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("bash-request-capture.json").as_str()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(request["tool"]["id"], json!("bash"));
+        runtime
+            .block_on(agent.bash("export FOO=bar\nf() { printf hi; }\ncd agents", true))
+            .unwrap();
+        let result = runtime
+            .block_on(agent.bash("printf '%s:%s:%s' \"$FOO\" \"$(f)\" \"$PWD\"", false))
+            .unwrap();
         assert_eq!(
-            request["invocation"]["input"],
-            json!({ "command": "printf hi", "restart": true })
+            result.trim_end(),
+            format!("bar:hi:{}", canonical_agents.as_str()),
         );
 
-        let env: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("bash-env-capture.json").as_str()).unwrap(),
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn builtin_bash_restart_resets_shell_state() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_root = Path::try_from(
+            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
         )
-        .unwrap();
-        assert_eq!(env["tool_id"], json!("bash"));
-        assert_eq!(env["tool_name"], json!("bash"));
-        assert_eq!(env["workspace_root"], json!(root.as_str()));
+        .expect("canonical root path should be valid UTF-8")
+        .into_owned();
+        let canonical_agents = Path::try_from(
+            fs::canonicalize(root.join("agents").as_str())
+                .expect("canonicalize agents directory should succeed"),
+        )
+        .expect("canonical agents path should be valid UTF-8")
+        .into_owned();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.bash("export FOO=bar\ncd agents", true))
+            .unwrap();
+        let persisted = runtime
+            .block_on(agent.bash("printf '%s:%s' \"$FOO\" \"$PWD\"", false))
+            .unwrap();
+        assert_eq!(
+            persisted.trim_end(),
+            format!("bar:{}", canonical_agents.as_str()),
+        );
+
+        let restarted = runtime
+            .block_on(agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", true))
+            .unwrap();
+        assert_eq!(
+            restarted.trim_end(),
+            format!("unset:{}", canonical_root.as_str())
+        );
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }

@@ -143,7 +143,7 @@ impl AgentConfig {
 pub struct ToolConfig {
     pub id: String,
     pub enabled: SwitchPosition,
-    pub executable_path: Path<'static>,
+    pub executable_path: Option<Path<'static>>,
     pub manifest_path: Path<'static>,
     pub manifest: Option<ToolManifest>,
 }
@@ -190,8 +190,13 @@ fn resolve_tool_configs(
         if canonical_metadata.contains_key(canonical_id) {
             continue;
         }
-        let executable_path = tools_dir.join(canonical_id).into_owned();
-        require_tool_executable(canonical_id, &executable_path)?;
+        let executable_path = if builtin_tool_executable_is_optional(canonical_id) {
+            None
+        } else {
+            let executable_path = tools_dir.join(canonical_id).into_owned();
+            require_tool_executable(canonical_id, &executable_path)?;
+            Some(executable_path)
+        };
 
         let manifest_path = tools_dir.join(format!("{canonical_id}.json")).into_owned();
         let manifest = if manifest_path.is_file() {
@@ -346,6 +351,10 @@ fn load_tool_manifest(tool: &str, path: &Path) -> Result<ToolManifest, SError> {
 
 fn builtin_tool_manifest_is_optional(tool: &str) -> bool {
     matches!(tool, "bash" | "edit")
+}
+
+fn builtin_tool_executable_is_optional(tool: &str) -> bool {
+    matches!(tool, "bash")
 }
 
 fn resolve_skills_dirs(root: &Path) -> Vec<Path<'static>> {
@@ -916,7 +925,7 @@ format_ALIASES="fmt"
 
         let fmt = config.tools.get("fmt").unwrap();
         assert_eq!(fmt.enabled, SwitchPosition::Yes);
-        assert_eq!(fmt.executable_path, root.join("tools/fmt"));
+        assert_eq!(fmt.executable_path, Some(root.join("tools/fmt")));
         assert_eq!(fmt.manifest_path, root.join("tools/fmt.json"));
         let fmt_manifest = fmt.manifest.as_ref().unwrap();
         assert_eq!(fmt_manifest.protocol_version, TOOL_PROTOCOL_VERSION);
@@ -924,7 +933,7 @@ format_ALIASES="fmt"
 
         let format = config.tools.get("format").unwrap();
         assert_eq!(format.enabled, SwitchPosition::Yes);
-        assert_eq!(format.executable_path, root.join("tools/fmt"));
+        assert_eq!(format.executable_path, Some(root.join("tools/fmt")));
         assert_eq!(format.manifest_path, root.join("tools/fmt.json"));
         assert_eq!(
             format.manifest.as_ref().unwrap().description,
@@ -933,7 +942,7 @@ format_ALIASES="fmt"
 
         let bash = config.tools.get("bash").unwrap();
         assert_eq!(bash.enabled, SwitchPosition::Yes);
-        assert_eq!(bash.executable_path, root.join("tools/bash"));
+        assert!(bash.executable_path.is_none());
     }
 
     #[test]
@@ -1001,17 +1010,34 @@ format_ALIASES="fmt"
             "bash_ENABLED=YES\nedit_ENABLED=YES\n",
         )
         .unwrap();
-        write_tool_script(&root, "bash", "#!/bin/sh\nexit 0\n");
         write_tool_script(&root, "edit", "#!/bin/sh\nexit 0\n");
 
         let config = Config::load(&root).unwrap();
         let bash = config.tools.get("bash").unwrap();
+        assert!(bash.executable_path.is_none());
         assert_eq!(bash.manifest_path, root.join("tools/bash.json"));
         assert!(bash.manifest.is_none());
 
         let edit = config.tools.get("edit").unwrap();
+        assert_eq!(edit.executable_path, Some(root.join("tools/edit")));
         assert_eq!(edit.manifest_path, root.join("tools/edit.json"));
         assert!(edit.manifest.is_none());
+    }
+
+    #[test]
+    fn missing_builtin_edit_executable_is_reported_during_config_load() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("agents.conf").as_str(), "").unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            "bash_ENABLED=YES\nedit_ENABLED=YES\n",
+        )
+        .unwrap();
+
+        let err = Config::load(&root).unwrap_err().to_string();
+        assert!(err.contains("missing_tool_executable"));
+        assert!(err.contains("edit"));
     }
 
     #[test]
