@@ -18,6 +18,8 @@ tokio = { version = "1.49", features = ["full"] }
 utf8path = "^0.9"
 crossterm = { version = "0.27", features = ["event-stream"] }
 futures = "0.3"
+arrrg_derive = "0.8.0"
+getopts = "0.2.24"
 
 [[bin]]
 name = "sid"
@@ -26,3 +28,7 @@ path = "src/bin/sid.rs"
 [[bin]]
 name = "sid-editor-tool"
 path = "src/bin/sid-editor-tool.rs"
+
+[[bin]]
+name = "sid-seatbelt"
+path = "src/bin/sid-seatbelt.rs"

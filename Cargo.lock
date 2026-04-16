@@ -1507,11 +1507,13 @@ name = "sid-isnt-done"
 version = "0.1.0"
 dependencies = [
  "arrrg",
+ "arrrg_derive",
  "async-trait",
  "claudius",
  "crossterm",
  "ctrlc",
  "futures",
+ "getopts",
  "handled",
  "rc_conf",
  "rustyline",

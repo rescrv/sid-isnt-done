@@ -1,6 +1,7 @@
 pub mod builtin_tools;
 pub mod config;
 mod filesystem;
+pub mod seatbelt;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_protocol;
@@ -28,9 +29,11 @@ use crate::config::{
     is_valid_anthropic_tool_name, resolve_canonical_tool_id,
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
+use crate::seatbelt::WritableRoots;
 use crate::tool_runtime::ToolRuntimeContext;
 const DEFAULT_AGENT_ID: &str = "sid";
 
+/// Top-level agent combining chat configuration, tool bindings, and sandbox policy.
 pub struct SidAgent {
     id: String,
     enabled: SwitchPosition,
@@ -39,6 +42,7 @@ pub struct SidAgent {
     builtin_bindings: BuiltinToolBindings,
     config_root: Path<'static>,
     workspace_root: Path<'static>,
+    writable_roots: WritableRoots,
     filesystem: MountHierarchy,
     bash_session: Mutex<Option<BashPtySession>>,
 }
@@ -54,6 +58,7 @@ impl SidAgent {
         workspace_root: Path<'static>,
     ) -> Self {
         let filesystem = build_default_filesystem(&workspace_root);
+        let writable_roots = default_writable_roots(&workspace_root);
         Self::with_parts(
             DEFAULT_AGENT_ID.to_string(),
             SwitchPosition::Yes,
@@ -62,6 +67,7 @@ impl SidAgent {
             BuiltinToolBindings::default(),
             config_root,
             workspace_root,
+            writable_roots,
             filesystem,
         )
     }
@@ -160,6 +166,7 @@ impl SidAgent {
         let mut chat_config = merged_chat_config(agent_config, fallback);
         let skills = resolve_agent_skills(config, agent_config)?;
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
+        let writable_roots = default_writable_roots(&workspace_root);
         if !skills.is_empty() {
             append_skill_index_to_system_prompt(&mut chat_config, &skills);
         }
@@ -171,6 +178,7 @@ impl SidAgent {
             built_tools.builtin_bindings,
             config.root.clone(),
             workspace_root,
+            writable_roots,
             filesystem,
         ))
     }
@@ -184,6 +192,7 @@ impl SidAgent {
         builtin_bindings: BuiltinToolBindings,
         config_root: Path<'static>,
         workspace_root: Path<'static>,
+        writable_roots: WritableRoots,
         filesystem: MountHierarchy,
     ) -> Self {
         Self {
@@ -194,6 +203,7 @@ impl SidAgent {
             builtin_bindings,
             config_root,
             workspace_root,
+            writable_roots,
             filesystem,
             bash_session: Mutex::new(None),
         }
@@ -268,6 +278,7 @@ impl SidAgent {
         BashPtyConfig {
             cwd: PathBuf::from(self.workspace_root.as_str()),
             env,
+            shell_wrapper: seatbelt::shell_wrapper(&self.writable_roots),
             ..BashPtyConfig::default()
         }
     }
@@ -282,6 +293,7 @@ impl SidAgent {
             agent_id: &self.id,
             config_root: &self.config_root,
             workspace_root: &self.workspace_root,
+            writable_roots: &self.writable_roots,
         };
         tool_runtime::invoke_rc_tool_text(
             &binding.service_name,
@@ -626,6 +638,7 @@ async fn invoke_external_tool(
         agent_id: &agent.id,
         config_root: &agent.config_root,
         workspace_root: &agent.workspace_root,
+        writable_roots: &agent.writable_roots,
     };
     match tool_runtime::invoke_rc_tool_text(
         &tool.name,
@@ -711,6 +724,31 @@ fn tool_error_result(tool_use_id: &str, message: String) -> ToolResult {
     ControlFlow::Continue(Err(ToolResultBlock::new(tool_use_id.to_string())
         .with_string_content(message)
         .with_error(true)))
+}
+
+/// Build the default writable roots for a workspace.
+///
+/// Includes the workspace root itself and the system temp directory.  Paths are
+/// canonicalized so that the sandbox policy matches the kernel-resolved paths
+/// (e.g. `/var` -> `/private/var` on macOS).
+fn default_writable_roots(workspace_root: &Path) -> WritableRoots {
+    let mut roots = WritableRoots::default();
+    if let Ok(canonical) = std::fs::canonicalize(workspace_root.as_str()) {
+        if let Some(s) = canonical.to_str() {
+            roots.push(s.to_string());
+        }
+    } else {
+        roots.push(workspace_root.as_str().to_string());
+    }
+    let temp_dir = std::env::temp_dir();
+    if let Ok(canonical) = std::fs::canonicalize(&temp_dir) {
+        if let Some(s) = canonical.to_str() {
+            roots.push(s.to_string());
+        }
+    } else if let Some(s) = temp_dir.to_str() {
+        roots.push(s.to_string());
+    }
+    roots
 }
 
 fn workspace_has_config(root: &Path) -> bool {

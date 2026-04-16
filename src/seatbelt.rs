@@ -1,58 +1,82 @@
-#!/bin/bash
-# seatbelt.sh - Run a command in a macOS Seatbelt sandbox.
-#
-# Policy: deny-default, then allow:
-#   Filesystem: full read, write only to WRITABLE_ROOT and /tmp
-#   Network:    localhost only (inbound + outbound)
-#
-# Usage: WRITABLE_ROOT=/path ./seatbelt.sh <command> [args...]
-#
-# Derived from the Codex sandbox profiles:
-#   codex-rs/sandboxing/src/seatbelt_base_policy.sbpl
-#   codex-rs/sandboxing/src/seatbelt_network_policy.sbpl
-#   codex-rs/sandboxing/src/restricted_read_only_platform_defaults.sbpl
+/// macOS Seatbelt sandbox integration.
+///
+/// Generates SBPL policies with configurable writable roots and provides
+/// helpers for wrapping child processes in `sandbox-exec`.
+use std::fmt;
+use std::path::Path;
+use std::process::Command;
+use std::str::FromStr;
 
-set -euo pipefail
+/// Colon-separated list of directories that a sandboxed process may write to.
+///
+/// Parses from a PATH-style string (e.g. `/workspace:/tmp/scratch`).  Empty
+/// components are silently dropped.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WritableRoots(Vec<String>);
 
-if [ $# -eq 0 ]; then
-    echo "Usage: $0 <command> [args...]" >&2
-    exit 1
-fi
+impl WritableRoots {
+    /// Returns the roots as a slice of strings.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
 
-# Use the absolute path to sandbox-exec to defend against PATH injection.
-SANDBOX_EXEC=/usr/bin/sandbox-exec
+    /// Returns the roots as a vec of `&str` suitable for [`build_policy`].
+    pub fn as_str_slice(&self) -> Vec<&str> {
+        self.0.iter().map(String::as_str).collect()
+    }
 
-if [ ! -x "$SANDBOX_EXEC" ]; then
-    echo "error: $SANDBOX_EXEC not found; this script requires macOS" >&2
-    exit 1
-fi
+    /// Returns `true` when no writable roots are configured.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
-# Resolve the writable root.  Honor a caller-provided WRITABLE_ROOT, otherwise
-# default to ~/src.  Canonicalize if the directory already exists; fall back to
-# the literal expansion so the sandbox still works before the first mkdir.
-WRITABLE_ROOT="${SID_WORKSPACE_ROOT:-$HOME/src}"
-if [ -d "$WRITABLE_ROOT" ]; then
-    WRITABLE_ROOT="$(cd "$WRITABLE_ROOT" && pwd -P)"
-fi
+    /// Appends a root directory.
+    pub fn push(&mut self, root: String) {
+        if !root.is_empty() {
+            self.0.push(root);
+        }
+    }
+}
 
-# DARWIN_USER_CACHE_DIR is needed by the network-policy section so that
-# libnetwork/nsurlsession can write its TLS session cache.
-DARWIN_USER_CACHE_DIR="$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || echo "/private/var/folders")"
-# Strip trailing slash that getconf sometimes appends.
-DARWIN_USER_CACHE_DIR="${DARWIN_USER_CACHE_DIR%/}"
+impl FromStr for WritableRoots {
+    type Err = std::convert::Infallible;
 
-# --- Assemble the policy ------------------------------------------------
-#
-# The policy is built from four sections in the same order the Codex Rust
-# code uses:
-#   1. Base policy         (deny default, process control, PTY, sysctls, IPC)
-#   2. Read policy         (full disk read)
-#   3. Write policy        (WRITABLE_ROOT + /tmp)
-#   4. Network policy      (localhost only + platform services)
-#   5. Platform defaults   (system libs, frameworks, /dev, /tmp, binaries)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let roots = s
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        Ok(WritableRoots(roots))
+    }
+}
 
-read -r -d '' POLICY <<'SBPL' || true
-(version 1)
+impl fmt::Display for WritableRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for root in &self.0 {
+            if !first {
+                write!(f, ":")?;
+            }
+            write!(f, "{root}")?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+/// Absolute path to the macOS `sandbox-exec` binary.
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// SBPL policy text before the writable-roots section.
+///
+/// The policy is deny-default, then allows:
+///   - Process control (fork, exec, signals within the same sandbox)
+///   - Full disk read
+///   - Write only to caller-specified roots and /tmp
+///   - Localhost-only networking
+///   - Platform defaults (system libs, frameworks, /dev, /tmp, binaries)
+const POLICY_BEFORE_WRITE_RULES: &str = r#"(version 1)
 
 ;; =======================================================================
 ;; 1. BASE POLICY — deny-default, process control, PTY, sysctls, IPC
@@ -172,12 +196,13 @@ read -r -d '' POLICY <<'SBPL' || true
 (allow file-read*)
 
 ;; =======================================================================
-;; 3. WRITE POLICY — WRITABLE_ROOT (parameterized) + /tmp
+;; 3. WRITE POLICY — writable roots + /tmp
 ;; =======================================================================
 
-; Write access to the workspace root.
-(allow file-write* (subpath (param "WRITABLE_ROOT")))
+"#;
 
+/// SBPL policy text after the writable-roots section.
+const POLICY_AFTER_WRITE_RULES: &str = r#"
 ;; =======================================================================
 ;; 4. NETWORK POLICY — localhost only + platform services
 ;; =======================================================================
@@ -409,10 +434,172 @@ read -r -d '' POLICY <<'SBPL' || true
 ; App sandbox extensions.
 (allow file-read* (extension "com.apple.app-sandbox.read"))
 (allow file-read* file-write* (extension "com.apple.app-sandbox.read-write"))
-SBPL
+"#;
 
-exec "$SANDBOX_EXEC" \
-    -p "$POLICY" \
-    -D "WRITABLE_ROOT=$WRITABLE_ROOT" \
-    -D "DARWIN_USER_CACHE_DIR=$DARWIN_USER_CACHE_DIR" \
-    -- "$@"
+/// Returns `true` when macOS `sandbox-exec` is available.
+pub fn sandbox_available() -> bool {
+    Path::new(SANDBOX_EXEC).is_file()
+}
+
+/// Resolve `DARWIN_USER_CACHE_DIR` for the current user.
+///
+/// Falls back to `/private/var/folders` when `getconf` is unavailable.
+pub fn darwin_user_cache_dir() -> String {
+    let output = Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_CACHE_DIR")
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            dir.trim_end_matches('/').to_string()
+        }
+        _ => "/private/var/folders".to_string(),
+    }
+}
+
+/// Build an SBPL policy string with the given writable roots inlined.
+///
+/// Each entry becomes an `(allow file-write* (subpath "..."))` rule.
+/// `DARWIN_USER_CACHE_DIR` remains a `sandbox-exec` parameter.
+pub fn build_policy(writable_roots: &WritableRoots) -> String {
+    let roots = writable_roots.as_slice();
+    let mut policy = String::with_capacity(
+        POLICY_BEFORE_WRITE_RULES.len() + POLICY_AFTER_WRITE_RULES.len() + roots.len() * 64,
+    );
+    policy.push_str(POLICY_BEFORE_WRITE_RULES);
+    for root in roots {
+        policy.push_str(&format!("(allow file-write* (subpath \"{root}\"))\n"));
+    }
+    policy.push_str(POLICY_AFTER_WRITE_RULES);
+    policy
+}
+
+/// Build the `shell_wrapper` argument list for [`claudius::BashPtyConfig`].
+///
+/// Returns `None` when sandboxing is unavailable (non-macOS).
+/// The returned vec is `[sandbox-exec, -p, <policy>, -D, DARWIN_USER_CACHE_DIR=..., --]`.
+pub fn shell_wrapper(writable_roots: &WritableRoots) -> Option<Vec<String>> {
+    if !sandbox_available() {
+        return None;
+    }
+    let policy = build_policy(writable_roots);
+    let cache_dir = darwin_user_cache_dir();
+    Some(vec![
+        SANDBOX_EXEC.to_string(),
+        "-p".to_string(),
+        policy,
+        "-D".to_string(),
+        format!("DARWIN_USER_CACHE_DIR={cache_dir}"),
+        "--".to_string(),
+    ])
+}
+
+/// Build a [`tokio::process::Command`] that runs `program` with `args` inside
+/// the seatbelt sandbox.
+///
+/// When sandboxing is unavailable, returns a plain command without wrapping.
+pub fn sandboxed_command(
+    program: &str,
+    args: &[&str],
+    writable_roots: &WritableRoots,
+) -> tokio::process::Command {
+    if sandbox_available() {
+        let policy = build_policy(writable_roots);
+        let cache_dir = darwin_user_cache_dir();
+        let mut cmd = tokio::process::Command::new(SANDBOX_EXEC);
+        cmd.arg("-p").arg(policy);
+        cmd.arg("-D")
+            .arg(format!("DARWIN_USER_CACHE_DIR={cache_dir}"));
+        cmd.arg("--");
+        cmd.arg(program);
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args);
+        cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(paths: &[&str]) -> WritableRoots {
+        let mut wr = WritableRoots::default();
+        for p in paths {
+            wr.push(p.to_string());
+        }
+        wr
+    }
+
+    #[test]
+    fn writable_roots_from_str_splits_on_colon() {
+        let wr: WritableRoots = "/a:/b:/c".parse().unwrap();
+        assert_eq!(wr.as_slice(), &["/a", "/b", "/c"]);
+    }
+
+    #[test]
+    fn writable_roots_from_str_drops_empty_components() {
+        let wr: WritableRoots = ":/a::/b:".parse().unwrap();
+        assert_eq!(wr.as_slice(), &["/a", "/b"]);
+    }
+
+    #[test]
+    fn writable_roots_display_round_trips() {
+        let wr: WritableRoots = "/a:/b".parse().unwrap();
+        assert_eq!(wr.to_string(), "/a:/b");
+    }
+
+    #[test]
+    fn writable_roots_push_ignores_empty() {
+        let mut wr = WritableRoots::default();
+        wr.push(String::new());
+        assert!(wr.is_empty());
+    }
+
+    #[test]
+    fn build_policy_contains_writable_root_rules() {
+        let policy = build_policy(&roots(&["/home/user/src", "/tmp/scratch"]));
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/home/user/src\"))"),
+            "policy should contain first writable root"
+        );
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/tmp/scratch\"))"),
+            "policy should contain second writable root"
+        );
+    }
+
+    #[test]
+    fn build_policy_with_no_roots_has_no_writable_root_rules() {
+        let policy = build_policy(&WritableRoots::default());
+        assert!(
+            !policy.contains("(allow file-write* (subpath \"/home"),
+            "policy should have no writable-root rules"
+        );
+    }
+
+    #[test]
+    fn build_policy_is_valid_sbpl_structure() {
+        let policy = build_policy(&roots(&["/workspace"]));
+        assert!(policy.starts_with("(version 1)"));
+        assert!(policy.contains("(deny default)"));
+        assert!(policy.contains("(allow file-read*)"));
+        assert!(policy.contains("(param \"DARWIN_USER_CACHE_DIR\")"));
+    }
+
+    #[test]
+    fn shell_wrapper_returns_sandbox_exec_args() {
+        if !sandbox_available() {
+            return;
+        }
+        let wrapper = shell_wrapper(&roots(&["/workspace"])).expect("sandbox should be available");
+        assert_eq!(wrapper[0], SANDBOX_EXEC);
+        assert_eq!(wrapper[1], "-p");
+        assert!(wrapper[2].contains("(version 1)"));
+        assert_eq!(wrapper[3], "-D");
+        assert!(wrapper[4].starts_with("DARWIN_USER_CACHE_DIR="));
+        assert_eq!(wrapper[5], "--");
+    }
+}

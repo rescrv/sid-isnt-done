@@ -10,10 +10,11 @@ use std::process::Stdio;
 
 use handled::SError;
 use rc_conf::{RcConf, var_name_from_service, var_prefix_from_service};
-use tokio::process::Command;
 use utf8path::Path;
 
 use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
+use crate::seatbelt;
+use crate::seatbelt::WritableRoots;
 use crate::tool_protocol::{
     ToolRequestAgent, ToolRequestEnvelope, ToolRequestFiles, ToolRequestInvocation,
     ToolRequestTool, ToolRequestWorkspace, create_tool_scratch_dir, extract_tool_output,
@@ -31,6 +32,8 @@ pub(crate) struct ToolRuntimeContext<'a> {
     pub(crate) config_root: &'a Path<'a>,
     /// Workspace root used as cwd and included in request envelopes.
     pub(crate) workspace_root: &'a Path<'a>,
+    /// Directories the sandboxed tool may write to.
+    pub(crate) writable_roots: &'a WritableRoots,
 }
 
 #[derive(Debug)]
@@ -117,8 +120,9 @@ pub(crate) async fn invoke_rc_tool_text(
         )
     })?;
 
-    let status = Command::new(executable_path.as_str())
-        .arg("run")
+    let mut cmd =
+        seatbelt::sandboxed_command(executable_path.as_str(), &["run"], context.writable_roots);
+    let status = cmd
         .current_dir(context.workspace_root.as_str())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
