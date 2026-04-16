@@ -1,46 +1,35 @@
 pub mod builtin_tools;
 pub mod config;
+mod filesystem;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod tool_protocol;
+mod tool_runtime;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-use std::path::{Path as StdPath, PathBuf};
-use std::process::Stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
     Agent, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error, FileSystem,
-    IntermediateToolResult, Model, MountHierarchy, Permissions, SystemPrompt, ThinkingConfig, Tool,
+    IntermediateToolResult, Model, MountHierarchy, SystemPrompt, ThinkingConfig, Tool,
     ToolBash20250124, ToolCallback, ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728,
     ToolUnionParam, ToolUseBlock,
 };
 use handled::SError;
-use rc_conf::{RcConf, SwitchPosition, var_name_from_service, var_prefix_from_service};
-use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+use rc_conf::SwitchPosition;
 use tokio::sync::Mutex;
 use utf8path::Path;
 
 use crate::config::{
-    AGENTS_CONF_FILE, AgentConfig, Config, SkillConfig, TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE,
-    TOOLS_DIR, ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
+    AGENTS_CONF_FILE, AgentConfig, Config, SkillConfig, TOOLS_CONF_FILE, ToolConfig,
+    is_valid_anthropic_tool_name, resolve_canonical_tool_id,
 };
+use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
+use crate::tool_runtime::ToolRuntimeContext;
 const DEFAULT_AGENT_ID: &str = "sid";
-
-pub fn initialize_sid_workspace_root_env(workspace_root: &Path) {
-    let effective_workspace_root = std::env::var("SID_WORKSPACE_ROOT")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| workspace_root.as_str().to_string());
-    unsafe {
-        std::env::set_var("SID_WORKSPACE_ROOT", effective_workspace_root);
-    }
-}
 
 pub struct SidAgent {
     id: String,
@@ -168,8 +157,12 @@ impl SidAgent {
         }
 
         let built_tools = build_tools(config, agent_config)?;
-        let chat_config = merged_chat_config(agent_config, fallback);
+        let mut chat_config = merged_chat_config(agent_config, fallback);
+        let skills = resolve_agent_skills(config, agent_config)?;
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
+        if !skills.is_empty() {
+            append_skill_index_to_system_prompt(&mut chat_config, &skills);
+        }
         Ok(Self::with_parts(
             agent.to_string(),
             agent_config.enabled,
@@ -285,12 +278,17 @@ impl SidAgent {
         tool_use_id: &str,
         input: serde_json::Map<String, serde_json::Value>,
     ) -> Result<String, std::io::Error> {
-        invoke_rc_tool_text(
+        let context = ToolRuntimeContext {
+            agent_id: &self.id,
+            config_root: &self.config_root,
+            workspace_root: &self.workspace_root,
+        };
+        tool_runtime::invoke_rc_tool_text(
             &binding.service_name,
             &binding.service_name,
             &binding.canonical_id,
             &binding.executable_path,
-            self,
+            &context,
             tool_use_id,
             input,
         )
@@ -460,16 +458,6 @@ impl ChatAgent for SidAgent {
     }
 }
 
-fn sid_agent_error(code: &str, message: &str) -> SError {
-    SError::new("sid-agent")
-        .with_code(code)
-        .with_message(message)
-}
-
-fn tool_runtime_error(tool: &str, code: &str, message: &str) -> SError {
-    sid_agent_error(code, message).with_string_field("tool", tool)
-}
-
 #[derive(Clone, Debug, Default)]
 struct BuiltinToolBindings {
     bash: Option<BuiltinBashBinding>,
@@ -597,81 +585,6 @@ impl ToolCallback<SidAgent> for ExternalToolCallback {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ToolRequestEnvelope {
-    protocol_version: u32,
-    request_id: String,
-    tool: ToolRequestTool,
-    invocation: ToolRequestInvocation,
-    agent: ToolRequestAgent,
-    workspace: ToolRequestWorkspace,
-    files: ToolRequestFiles,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolRequestTool {
-    id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolRequestInvocation {
-    tool_use_id: String,
-    input: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolRequestAgent {
-    id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolRequestWorkspace {
-    root: String,
-    cwd: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolRequestFiles {
-    scratch_dir: String,
-    result_file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolResultEnvelope {
-    protocol_version: u32,
-    request_id: String,
-    ok: bool,
-    output: Option<ToolResultOutput>,
-    error: Option<ToolResultError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolResultOutput {
-    kind: String,
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolResultError {
-    code: Option<String>,
-    message: Option<String>,
-}
-
-#[derive(Debug)]
-struct ToolRcRuntime {
-    rc_conf_path: String,
-    rc_d_path: String,
-    bindings: HashMap<String, String>,
-}
-
-struct ToolOverlayContext<'a> {
-    request_file: &'a StdPath,
-    result_file: &'a StdPath,
-    scratch_dir: &'a StdPath,
-    rc_conf_path: &'a str,
-    rc_d_path: &'a str,
-}
-
 async fn invoke_external_tool(
     tool: &ExternalTool,
     agent: &SidAgent,
@@ -709,12 +622,17 @@ async fn invoke_external_tool(
         }
     };
 
-    match invoke_rc_tool_text(
+    let context = ToolRuntimeContext {
+        agent_id: &agent.id,
+        config_root: &agent.config_root,
+        workspace_root: &agent.workspace_root,
+    };
+    match tool_runtime::invoke_rc_tool_text(
         &tool.name,
         &tool.name,
         &tool.canonical_id,
         &tool.executable_path,
-        agent,
+        &context,
         &tool_use.id,
         input,
     )
@@ -723,283 +641,6 @@ async fn invoke_external_tool(
         Ok(text) => tool_success_result(&tool_use.id, text),
         Err(message) => tool_error_result(&tool_use.id, message),
     }
-}
-
-async fn invoke_rc_tool_text(
-    display_name: &str,
-    rc_service_name: &str,
-    canonical_id: &str,
-    executable_path: &Path<'_>,
-    agent: &SidAgent,
-    tool_use_id: &str,
-    input: serde_json::Map<String, serde_json::Value>,
-) -> Result<String, String> {
-    let request_id = next_request_id();
-    let scratch_dir = create_tool_scratch_dir(&request_id).map_err(|err| {
-        format!(
-            "tool '{}' failed to create scratch directory: {}",
-            display_name, err
-        )
-    })?;
-    let request_file = scratch_dir.join("request.json");
-    let result_file = scratch_dir.join("result.json");
-
-    let request = ToolRequestEnvelope {
-        protocol_version: TOOL_PROTOCOL_VERSION,
-        request_id: request_id.clone(),
-        tool: ToolRequestTool {
-            id: canonical_id.to_string(),
-        },
-        invocation: ToolRequestInvocation {
-            tool_use_id: tool_use_id.to_string(),
-            input,
-        },
-        agent: ToolRequestAgent {
-            id: agent.id.clone(),
-        },
-        workspace: ToolRequestWorkspace {
-            root: agent.workspace_root.as_str().to_string(),
-            cwd: agent.workspace_root.as_str().to_string(),
-        },
-        files: ToolRequestFiles {
-            scratch_dir: scratch_dir.to_string_lossy().into_owned(),
-            result_file: result_file.to_string_lossy().into_owned(),
-        },
-    };
-
-    write_json_file(&request_file, &request).map_err(|err| {
-        format!(
-            "tool '{}' failed to write request.json: {}",
-            display_name, err
-        )
-    })?;
-
-    let runtime = prepare_tool_rc_runtime(
-        display_name,
-        rc_service_name,
-        executable_path,
-        agent,
-        &request_file,
-        &result_file,
-        &scratch_dir,
-    )
-    .map_err(|err| {
-        format!(
-            "tool '{}' failed to prepare rc invocation: {}",
-            display_name, err
-        )
-    })?;
-
-    let status = Command::new(executable_path.as_str())
-        .arg("run")
-        .current_dir(agent.workspace_root.as_str())
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .envs(&runtime.bindings)
-        .env("RCVAR_ARGV0", var_name_from_service(rc_service_name))
-        .env("RC_CONF_PATH", &runtime.rc_conf_path)
-        .env("RC_D_PATH", &runtime.rc_d_path)
-        .status()
-        .await
-        .map_err(|err| format!("tool '{}' failed to launch: {}", display_name, err))?;
-    if !status.success() {
-        return Err(format!(
-            "tool '{}' exited with status {}",
-            display_name, status
-        ));
-    }
-
-    let result = read_tool_result(&result_file)
-        .map_err(|err| format!("tool '{}' protocol error: {}", display_name, err))?;
-    extract_tool_output(display_name, &request_id, result)
-}
-
-fn prepare_tool_rc_runtime(
-    display_name: &str,
-    rc_service_name: &str,
-    executable_path: &Path,
-    agent: &SidAgent,
-    request_file: &StdPath,
-    result_file: &StdPath,
-    scratch_dir: &StdPath,
-) -> Result<ToolRcRuntime, SError> {
-    let tools_conf_path = agent.config_root.join(TOOLS_CONF_FILE);
-    let rc_d_path = agent.config_root.join(TOOLS_DIR);
-    let overlay_path = scratch_dir.join("tool-invoke.conf");
-    let base_rc_conf = RcConf::parse(tools_conf_path.as_str()).map_err(|err| {
-        tool_runtime_error(display_name, "rc_conf_error", "failed to parse tools.conf")
-            .with_string_field("path", tools_conf_path.as_str())
-            .with_string_field("cause", &format!("{err:?}"))
-    })?;
-    let services = base_rc_conf.list().map_err(|err| {
-        tool_runtime_error(
-            display_name,
-            "rc_conf_error",
-            "failed to list configured tools",
-        )
-        .with_string_field("path", tools_conf_path.as_str())
-        .with_string_field("cause", &format!("{err:?}"))
-    })?;
-    let services = services.collect::<Vec<_>>();
-    let rc_conf_path = format!("{}:{}", tools_conf_path.as_str(), overlay_path.display());
-    let rc_d_path = rc_d_path.as_str().to_string();
-    let overlay_context = ToolOverlayContext {
-        request_file,
-        result_file,
-        scratch_dir,
-        rc_conf_path: &rc_conf_path,
-        rc_d_path: &rc_d_path,
-    };
-    let overlay = render_tool_rc_overlay(&base_rc_conf, &services, agent, &overlay_context);
-    fs::write(&overlay_path, overlay).map_err(|err| {
-        tool_runtime_error(display_name, "io_error", "failed to write tool rc overlay")
-            .with_string_field("path", overlay_path.to_string_lossy().as_ref())
-            .with_string_field("cause", &err.to_string())
-    })?;
-    let rc_conf = RcConf::parse(&rc_conf_path).map_err(|err| {
-        tool_runtime_error(
-            display_name,
-            "rc_conf_error",
-            "failed to parse tool rc overlay",
-        )
-        .with_string_field("path", &rc_conf_path)
-        .with_string_field("cause", &format!("{err:?}"))
-    })?;
-    let bindings = rc_conf
-        .bind_for_invoke(rc_service_name, executable_path)
-        .map_err(|err| {
-            tool_runtime_error(
-                display_name,
-                "rc_conf_error",
-                "failed to bind rcvars for tool invocation",
-            )
-            .with_string_field("path", executable_path.as_str())
-            .with_string_field("cause", &format!("{err:?}"))
-        })?;
-
-    Ok(ToolRcRuntime {
-        rc_conf_path,
-        rc_d_path,
-        bindings,
-    })
-}
-
-fn render_tool_rc_overlay(
-    rc_conf: &RcConf,
-    services: &[String],
-    agent: &SidAgent,
-    overlay_context: &ToolOverlayContext<'_>,
-) -> String {
-    let request_file = overlay_context.request_file.to_string_lossy().into_owned();
-    let result_file = overlay_context.result_file.to_string_lossy().into_owned();
-    let scratch_dir = overlay_context.scratch_dir.to_string_lossy().into_owned();
-    let workspace_root = agent.workspace_root.as_str().to_string();
-    let tool_protocol = TOOL_PROTOCOL_VERSION.to_string();
-    let mut overlay = String::new();
-
-    for service in services {
-        let prefix = var_prefix_from_service(service);
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}REQUEST_FILE"),
-            &request_file,
-        );
-        append_rc_conf_assignment(&mut overlay, &format!("{prefix}RESULT_FILE"), &result_file);
-        append_rc_conf_assignment(&mut overlay, &format!("{prefix}SCRATCH_DIR"), &scratch_dir);
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}WORKSPACE_ROOT"),
-            &workspace_root,
-        );
-        append_rc_conf_assignment(&mut overlay, &format!("{prefix}AGENT_ID"), &agent.id);
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}TOOL_ID"),
-            rc_conf.resolve_alias(service),
-        );
-        append_rc_conf_assignment(&mut overlay, &format!("{prefix}TOOL_NAME"), service);
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}TOOL_PROTOCOL"),
-            &tool_protocol,
-        );
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}RC_CONF_PATH"),
-            overlay_context.rc_conf_path,
-        );
-        append_rc_conf_assignment(
-            &mut overlay,
-            &format!("{prefix}RC_D_PATH"),
-            overlay_context.rc_d_path,
-        );
-    }
-
-    overlay
-}
-
-fn append_rc_conf_assignment(output: &mut String, name: &str, value: &str) {
-    output.push_str(name);
-    output.push('=');
-    output.push_str(&shvar::quote(vec![value.to_string()]));
-    output.push('\n');
-}
-
-fn extract_tool_output(
-    display_name: &str,
-    request_id: &str,
-    result: ToolResultEnvelope,
-) -> Result<String, String> {
-    if result.protocol_version != TOOL_PROTOCOL_VERSION {
-        return Err(format!(
-            "tool '{}' protocol error: unsupported result protocol version {}",
-            display_name, result.protocol_version
-        ));
-    }
-    if result.request_id != request_id {
-        return Err(format!(
-            "tool '{}' protocol error: request_id mismatch (expected {}, got {})",
-            display_name, request_id, result.request_id
-        ));
-    }
-
-    if result.ok {
-        let Some(output) = result.output else {
-            return Err(format!(
-                "tool '{}' protocol error: missing success output",
-                display_name
-            ));
-        };
-        if output.kind != "text" {
-            return Err(format!(
-                "tool '{}' protocol error: unsupported output kind '{}'",
-                display_name, output.kind
-            ));
-        }
-        let Some(text) = output.text else {
-            return Err(format!(
-                "tool '{}' protocol error: missing output.text",
-                display_name
-            ));
-        };
-        return Ok(text);
-    }
-
-    let Some(error) = result.error else {
-        return Err(format!(
-            "tool '{}' protocol error: missing error object",
-            display_name
-        ));
-    };
-    let Some(message) = error.message else {
-        return Err(format!(
-            "tool '{}' protocol error: missing error.message",
-            display_name
-        ));
-    };
-    let _ = error.code;
-    Err(message)
 }
 
 /// Prompt the operator to confirm a manual tool call via stdin/stdout.
@@ -1044,47 +685,6 @@ fn parse_tool_confirmation(input: &str) -> Option<bool> {
     }
 }
 
-fn write_json_file(path: &StdPath, value: &impl Serialize) -> Result<(), SError> {
-    let path_display = path.to_string_lossy();
-    let payload = serde_json::to_vec_pretty(value).map_err(|err| {
-        sid_agent_error("json_serialize_error", "failed to serialize JSON file")
-            .with_string_field("path", path_display.as_ref())
-            .with_string_field("cause", &err.to_string())
-    })?;
-    fs::write(path, payload).map_err(|err| {
-        sid_agent_error("io_error", "failed to write JSON file")
-            .with_string_field("path", path_display.as_ref())
-            .with_string_field("cause", &err.to_string())
-    })
-}
-
-fn read_tool_result(path: &StdPath) -> Result<ToolResultEnvelope, SError> {
-    let path_display = path.to_string_lossy();
-    let payload = fs::read_to_string(path).map_err(|err| {
-        sid_agent_error("io_error", "failed to read tool result file")
-            .with_string_field("path", path_display.as_ref())
-            .with_string_field("cause", &err.to_string())
-    })?;
-    serde_json::from_str(&payload).map_err(|err| {
-        sid_agent_error(
-            "invalid_tool_result_json",
-            "failed to parse tool result file",
-        )
-        .with_string_field("path", path_display.as_ref())
-        .with_string_field("cause", &err.to_string())
-    })
-}
-
-fn next_request_id() -> String {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("sidreq_{timestamp}_{}_{}", std::process::id(), sequence)
-}
-
 fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Error> {
     let mut rendered = result.output;
     if result.status.success() {
@@ -1099,24 +699,6 @@ fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Erro
         rendered.push_str(&format!("{}\n", result.status));
         Err(std::io::Error::other(rendered))
     }
-}
-
-fn create_tool_scratch_dir(request_id: &str) -> Result<PathBuf, SError> {
-    let parent = std::env::temp_dir().join("sid-tool");
-    fs::create_dir_all(&parent).map_err(|err| {
-        sid_agent_error("io_error", "failed to create tool scratch root")
-            .with_string_field("path", parent.to_string_lossy().as_ref())
-            .with_string_field("request_id", request_id)
-            .with_string_field("cause", &err.to_string())
-    })?;
-    let scratch_dir = parent.join(request_id);
-    fs::create_dir(&scratch_dir).map_err(|err| {
-        sid_agent_error("io_error", "failed to create tool scratch directory")
-            .with_string_field("path", scratch_dir.to_string_lossy().as_ref())
-            .with_string_field("request_id", request_id)
-            .with_string_field("cause", &err.to_string())
-    })?;
-    Ok(scratch_dir)
 }
 
 fn tool_success_result(tool_use_id: &str, message: String) -> ToolResult {
@@ -1135,7 +717,28 @@ fn workspace_has_config(root: &Path) -> bool {
     root.join(AGENTS_CONF_FILE).is_file() || root.join(TOOLS_CONF_FILE).is_file()
 }
 
+/// Determine the default agent to use when none is explicitly requested.
+///
+/// Prefers the explicit `DEFAULT_AGENT` setting from agents.conf when present.
+/// Falls back to the first enabled agent, then the first manual agent.
 fn default_agent_id(config: &Config) -> Result<String, SError> {
+    if let Some(default) = config.default_agent.as_ref() {
+        let agent_config = config.agents.get(default).ok_or_else(|| {
+            SError::new("sid-agent")
+                .with_code("invalid_default_agent")
+                .with_message("DEFAULT_AGENT names an undefined agent")
+                .with_string_field("default_agent", default)
+        })?;
+        if !agent_config.enabled.can_be_started() {
+            return Err(SError::new("sid-agent")
+                .with_code("disabled_default_agent")
+                .with_message("DEFAULT_AGENT names a disabled agent")
+                .with_string_field("default_agent", default)
+                .with_string_field("enabled", &format!("{:?}", agent_config.enabled)));
+        }
+        return Ok(default.clone());
+    }
+
     if let Some(agent) = config
         .agents
         .values()
@@ -1276,6 +879,17 @@ fn merged_chat_config(agent_config: &AgentConfig, fallback: Option<&ChatConfig>)
     merged
 }
 
+/// Append a skill index to the system prompt so the model knows what skills are
+/// available and where they are mounted.
+fn append_skill_index_to_system_prompt(chat_config: &mut ChatConfig, skills: &[&SkillConfig]) {
+    let mut index = String::from("\n\nAvailable skills (mounted read-only under /skills/):\n");
+    for skill in skills {
+        index.push_str(&format!("  - /skills/{}/SKILL.md\n", skill.id));
+    }
+    let existing = chat_config.system_prompt_text().unwrap_or("").to_string();
+    chat_config.set_system_prompt(Some(format!("{existing}{index}")));
+}
+
 fn missing_agent_error(agent: &str) -> SError {
     SError::new("sid-agent")
         .with_code("unknown_agent")
@@ -1300,86 +914,6 @@ fn disabled_tool_error(agent: &str, tool: &str, enabled: SwitchPosition) -> SErr
         .with_string_field("enabled", &format!("{enabled:?}"))
 }
 
-/// Build a default filesystem hierarchy with only the workspace root mounted at `/`.
-fn build_default_filesystem(workspace_root: &Path) -> MountHierarchy {
-    let mut hierarchy = MountHierarchy::default();
-    hierarchy
-        .mount(
-            "/".into(),
-            Permissions::ReadWrite,
-            workspace_root.clone().into_owned(),
-        )
-        .expect("root mount at / must succeed as the first mount");
-    hierarchy
-}
-
-/// Build a filesystem hierarchy with the workspace root at `/` and agent skills
-/// mounted read-only under `/skills/<skill_id>/`.
-fn build_agent_filesystem(
-    workspace_root: &Path,
-    config: &Config,
-    agent_config: &AgentConfig,
-) -> Result<MountHierarchy, SError> {
-    let mut hierarchy = build_default_filesystem(workspace_root);
-    let skills = resolve_agent_skills(config, agent_config);
-    for skill in skills {
-        mount_skill(&mut hierarchy, skill)?;
-    }
-    Ok(hierarchy)
-}
-
-/// Resolve which skills an agent has access to based on its skill configuration.
-fn resolve_agent_skills<'a>(
-    config: &'a Config,
-    agent_config: &AgentConfig,
-) -> Vec<&'a SkillConfig> {
-    if agent_config.skills.is_empty() {
-        return vec![];
-    }
-    let include_all = agent_config.skills.iter().any(|s| s == "*");
-    if include_all {
-        config.skills.values().collect()
-    } else {
-        agent_config
-            .skills
-            .iter()
-            .filter_map(|name| config.skills.get(name))
-            .collect()
-    }
-}
-
-/// Mount a skill's directory as read-only under `/skills/<skill_id>/`.
-fn mount_skill(hierarchy: &mut MountHierarchy, skill: &SkillConfig) -> Result<(), SError> {
-    let parent = skill_parent_dir(&skill.path)?;
-    let mount_path = format!("/skills/{}", skill.id);
-    hierarchy
-        .mount(
-            Path::new(&mount_path).into_owned(),
-            Permissions::ReadOnly,
-            parent,
-        )
-        .map_err(|err| {
-            sid_agent_error("mount_error", &err).with_string_field("skill", &skill.id)
-        })?;
-    Ok(())
-}
-
-/// Extract the parent directory from a skill's file path.
-fn skill_parent_dir(skill_path: &Path) -> Result<Path<'static>, SError> {
-    let std_path = StdPath::new(skill_path.as_str());
-    let parent = std_path.parent().ok_or_else(|| {
-        sid_agent_error("invalid_skill_path", "skill path has no parent directory")
-            .with_string_field("path", skill_path.as_str())
-    })?;
-    Path::try_from(parent.to_path_buf())
-        .map(Path::into_owned)
-        .map_err(|err| {
-            sid_agent_error("invalid_skill_path", "skill parent path is not valid UTF-8")
-                .with_string_field("path", skill_path.as_str())
-                .with_string_field("cause", &format!("{err:?}"))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1391,6 +925,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_DIR};
     use crate::test_support::{
         make_executable, temp_config_root, unique_temp_dir, write_default_tool_manifest,
     };
@@ -1824,6 +1359,119 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_unknown_skill_references() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/rust").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_SKILLS='rust missing'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("skills/rust/SKILL.md").as_str(), "# Rust Skill\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let err = SidAgent::from_config(&config, "build", root.clone())
+            .err()
+            .expect("unknown skills should fail")
+            .to_string();
+        assert!(err.contains("unknown_skill"), "error: {err}");
+        assert!(err.contains("missing"), "error: {err}");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn explicit_default_agent_is_preferred() {
+        let root = temp_config_root("agent");
+        write_sample_config(&root);
+        fs::write(
+            root.join("agents.conf").as_str(),
+            concat!(
+                "DEFAULT_AGENT=plan\n",
+                "ROLE='principal engineer'\n",
+                "build_ENABLED=\"YES\"\n",
+                "plan_ENABLED=\"MANUAL\"\n",
+                "evil_ENABLED=\"NO\"\n",
+                "build_TOOLS='format shell'\n",
+                "plan_MODEL=claude-sonnet-4-5\n",
+                "plan_SYSTEM=\"You are ${ROLE}\"\n",
+                "plan_MAX_TOKENS=8192\n",
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent_id = default_agent_id(&config).unwrap();
+        assert_eq!(agent_id, "plan");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn invalid_default_agent_is_rejected_at_config_load() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "DEFAULT_AGENT=nonexistent\nbuild_ENABLED=YES\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+
+        let err = Config::load(&root)
+            .expect_err("invalid DEFAULT_AGENT should fail")
+            .to_string();
+        assert!(err.contains("invalid_default_agent"), "error: {err}");
+        assert!(err.contains("nonexistent"), "error: {err}");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn skills_are_advertised_in_system_prompt() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/rust").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/python").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_SKILLS='rust python'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("skills/rust/SKILL.md").as_str(), "# Rust Skill\n").unwrap();
+        fs::write(
+            root.join("skills/python/SKILL.md").as_str(),
+            "# Python Skill\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        let prompt = agent.config.system_prompt_text().unwrap();
+        assert!(
+            prompt.contains("/skills/rust/SKILL.md"),
+            "system prompt should list rust skill: {prompt}"
+        );
+        assert!(
+            prompt.contains("/skills/python/SKILL.md"),
+            "system prompt should list python skill: {prompt}"
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn from_config_rejects_unknown_tools() {
         let root = unique_temp_dir("agent");
         fs::create_dir_all(root.join("agents").as_str()).unwrap();
@@ -1953,6 +1601,44 @@ mod tests {
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn two_agents_with_different_workspace_roots_have_no_crosstalk() {
+        let root_a = temp_config_root("agent-a");
+        let root_b = temp_config_root("agent-b");
+        write_builtin_config(&root_a, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        write_builtin_config(&root_b, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_a = Path::try_from(
+            fs::canonicalize(root_a.as_str()).expect("canonicalize root_a should succeed"),
+        )
+        .expect("canonical root_a path should be valid UTF-8")
+        .into_owned();
+        let canonical_b = Path::try_from(
+            fs::canonicalize(root_b.as_str()).expect("canonicalize root_b should succeed"),
+        )
+        .expect("canonical root_b path should be valid UTF-8")
+        .into_owned();
+
+        let config_a = Config::load(&root_a).unwrap();
+        let agent_a = SidAgent::from_config(&config_a, "build", root_a.clone()).unwrap();
+        let config_b = Config::load(&root_b).unwrap();
+        let agent_b = SidAgent::from_config(&config_b, "build", root_b.clone()).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pwd_a = runtime.block_on(agent_a.bash("pwd", true)).unwrap();
+        let pwd_b = runtime.block_on(agent_b.bash("pwd", true)).unwrap();
+
+        assert_eq!(pwd_a.trim_end(), canonical_a.as_str());
+        assert_eq!(pwd_b.trim_end(), canonical_b.as_str());
+        assert_ne!(
+            canonical_a.as_str(),
+            canonical_b.as_str(),
+            "the two workspace roots must be distinct"
+        );
+
+        fs::remove_dir_all(root_a.as_str()).unwrap();
+        fs::remove_dir_all(root_b.as_str()).unwrap();
     }
 
     #[test]

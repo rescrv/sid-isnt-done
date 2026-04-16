@@ -2,49 +2,16 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::process::Output;
 
 use claudius::FileSystem;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
-use tokio::process::Command;
 use utf8path::Path;
 
 use crate::config::TOOL_PROTOCOL_VERSION;
-use crate::initialize_sid_workspace_root_env;
-
-#[derive(Debug, Deserialize)]
-struct ToolRequestEnvelope {
-    protocol_version: u32,
-    request_id: String,
-    invocation: ToolRequestInvocation,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolRequestInvocation {
-    input: Map<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolResultEnvelope {
-    protocol_version: u32,
-    request_id: String,
-    ok: bool,
-    output: Option<ToolResultOutput>,
-    error: Option<ToolResultError>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolResultOutput {
-    kind: String,
-    text: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolResultError {
-    code: Option<String>,
-    message: Option<String>,
-}
+use crate::tool_protocol::{
+    ToolRequestEnvelope, ToolResultEnvelope, ToolResultError, ToolResultOutput,
+};
 
 #[derive(Debug)]
 struct ToolInvocation {
@@ -59,7 +26,6 @@ impl ToolInvocation {
         let result_file = PathBuf::from(required_env_var("RESULT_FILE")?);
         let workspace_root = required_env_var("WORKSPACE_ROOT")?;
         let workspace_root = Path::new(&workspace_root).into_owned();
-        initialize_sid_workspace_root_env(&workspace_root);
         Ok(Self {
             request_file,
             result_file,
@@ -118,92 +84,6 @@ impl ToolFailure {
             code,
             message: message.into(),
         }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct BashRequest {
-    command: String,
-    #[serde(default)]
-    restart: bool,
-}
-
-pub async fn run_sid_bash_tool() -> io::Result<()> {
-    let invocation = ToolInvocation::from_env()?;
-    let request = invocation.read_request()?;
-    if request.protocol_version != TOOL_PROTOCOL_VERSION {
-        return invocation.write_failure(
-            &request.request_id,
-            ToolFailure::new(
-                "unsupported_tool_protocol_version",
-                format!(
-                    "unsupported request protocol version {}",
-                    request.protocol_version
-                ),
-            ),
-        );
-    }
-
-    match parse_request_input::<BashRequest>(&request.invocation.input) {
-        Ok(command) => {
-            let _ = command.restart;
-            match execute_bash_command(&invocation.workspace_root, &command.command).await {
-                Ok(output) => invocation.write_success(&request.request_id, output),
-                Err(failure) => invocation.write_failure(&request.request_id, failure),
-            }
-        }
-        Err(failure) => invocation.write_failure(&request.request_id, failure),
-    }
-}
-
-async fn execute_bash_command(
-    workspace_root: &Path<'_>,
-    command: &str,
-) -> Result<String, ToolFailure> {
-    let shell = "/bin/bash";
-    let output = Command::new(shell)
-        .arg("-lc")
-        .arg(command)
-        .current_dir(workspace_root.as_str())
-        .output()
-        .await
-        .map_err(|err| {
-            ToolFailure::new(
-                "bash_launch_failed",
-                format!("failed to launch shell command via {shell}: {err}"),
-            )
-        })?;
-
-    render_bash_output(output)
-}
-
-fn render_bash_output(output: Output) -> Result<String, ToolFailure> {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let mut rendered = String::new();
-    if !stdout.is_empty() {
-        rendered.push_str(&stdout);
-        if !stdout.ends_with('\n') {
-            rendered.push('\n');
-        }
-    }
-    if !stderr.is_empty() {
-        rendered.push_str("stderr:\n");
-        rendered.push_str(&stderr);
-        if !stderr.ends_with('\n') {
-            rendered.push('\n');
-        }
-    }
-
-    if output.status.success() {
-        if rendered.is_empty() {
-            rendered.push_str("success\n");
-        }
-        Ok(rendered)
-    } else {
-        rendered.push_str(&format!("exit status: {}\n", output.status));
-        Err(ToolFailure::new("bash_exit_status", rendered))
     }
 }
 
@@ -346,38 +226,6 @@ mod tests {
 
     use super::*;
     use crate::test_support::unique_temp_dir;
-
-    #[test]
-    fn bash_tool_runs_in_workspace() {
-        let root = unique_temp_dir("bash-tool");
-        fs::create_dir_all(root.as_str()).unwrap();
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let output = runtime
-            .block_on(execute_bash_command(&root, "pwd"))
-            .expect("bash command should succeed");
-        let canonical = std::fs::canonicalize(root.as_str()).unwrap();
-        let canonical = Path::try_from(canonical).unwrap().into_owned();
-        assert_eq!(output, format!("{}\n", canonical.as_str()));
-
-        fs::remove_dir_all(root.as_str()).unwrap();
-    }
-
-    #[test]
-    fn bash_tool_reports_exit_status() {
-        let root = unique_temp_dir("bash-tool");
-        fs::create_dir_all(root.as_str()).unwrap();
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let failure = runtime
-            .block_on(execute_bash_command(&root, "printf nope; exit 7"))
-            .expect_err("bash command should fail");
-        assert_eq!(failure.code, "bash_exit_status");
-        assert!(failure.message.contains("nope"));
-        assert!(failure.message.contains("exit status"));
-
-        fs::remove_dir_all(root.as_str()).unwrap();
-    }
 
     #[test]
     fn editor_tool_replaces_text_in_workspace() {

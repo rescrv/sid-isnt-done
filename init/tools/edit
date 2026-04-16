@@ -33,7 +33,7 @@ run)
     export TOOL_PROTOCOL="$(lookup "${PREFIX}_TOOL_PROTOCOL")"
     export RC_CONF_PATH="$(lookup "${PREFIX}_RC_CONF_PATH")"
     export RC_D_PATH="$(lookup "${PREFIX}_RC_D_PATH")"
-    exec cargo run --quiet --bin sid-editor-tool -- "$@"
+    exec sid-editor-tool "$@"
     ;;
 *)
     echo "usage: $0 [rcvar|run]" >&2

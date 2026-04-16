@@ -15,7 +15,7 @@ use claudius::chat::{
 };
 use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
 
-use sid_isnt_done::{SidAgent, initialize_sid_workspace_root_env};
+use sid_isnt_done::SidAgent;
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "You are sid, a concise coding agent with access to the current workspace mounted at /.\n",
@@ -57,7 +57,11 @@ async fn try_main() -> Result<(), SError> {
     })?
     .into_owned();
     let config_root = resolve_sid_home(&workspace_root)?;
-    initialize_sid_workspace_root_env(&workspace_root);
+    // Set SID_WORKSPACE_ROOT for child processes spawned by tools. This is the
+    // outer binary entrypoint, so process-global mutation is acceptable here.
+    unsafe {
+        std::env::set_var("SID_WORKSPACE_ROOT", workspace_root.as_str());
+    }
     let workspace_display = workspace_root.as_str().to_string();
 
     let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?;

@@ -24,9 +24,5 @@ name = "sid"
 path = "src/bin/sid.rs"
 
 [[bin]]
-name = "sid-bash-tool"
-path = "src/bin/sid-bash-tool.rs"
-
-[[bin]]
 name = "sid-editor-tool"
 path = "src/bin/sid-editor-tool.rs"

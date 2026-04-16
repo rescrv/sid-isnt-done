@@ -23,6 +23,7 @@ pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct Config {
     pub root: Path<'static>,
+    pub default_agent: Option<String>,
     pub agents: BTreeMap<String, AgentConfig>,
     pub tools: BTreeMap<String, ToolConfig>,
     pub skills: BTreeMap<String, SkillConfig>,
@@ -65,6 +66,8 @@ impl Config {
         let agents_dir = root.join(AGENTS_DIR).into_owned();
         let tools_dir = root.join(TOOLS_DIR).into_owned();
 
+        let default_agent = resolve_default_agent(&agents_rc_conf, agent_names)?;
+
         let mut agents = BTreeMap::new();
         for agent_name in agent_names {
             let agent = AgentConfig::from_rc_conf(&agents_dir, &agents_rc_conf, agent_name)?;
@@ -75,6 +78,7 @@ impl Config {
 
         Ok(Self {
             root,
+            default_agent,
             agents,
             tools,
             skills,
@@ -492,6 +496,29 @@ fn apply_chat_config_overrides(
     }
 
     Ok(())
+}
+
+/// Read the explicit `DEFAULT_AGENT` global variable from agents.conf when present.
+///
+/// If the variable is set, its value must name one of the defined agents.
+fn resolve_default_agent(
+    agents_rc_conf: &RcConf,
+    agent_names: &[String],
+) -> Result<Option<String>, SError> {
+    let Some(value) = agents_rc_conf.lookup("DEFAULT_AGENT") else {
+        return Ok(None);
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !agent_names.contains(&value) {
+        return Err(SError::new("config")
+            .with_code("invalid_default_agent")
+            .with_message("DEFAULT_AGENT names an undefined agent")
+            .with_string_field("default_agent", &value));
+    }
+    Ok(Some(value))
 }
 
 fn collect_names_from_rc_conf(rc_conf: &RcConf) -> Result<Vec<String>, SError> {
