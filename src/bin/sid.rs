@@ -8,11 +8,11 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use utf8path::Path;
 
-use claudius::Renderer;
 use claudius::chat::{
     ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, help_text,
     parse_command,
 };
+use claudius::{Agent, Renderer};
 use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
 
 use sid_isnt_done::SidAgent;
@@ -23,6 +23,19 @@ const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "Ground your answers in the files and tool results you can access, explain changes you make, and do not claim to have run commands or changed files unless you actually did."
 );
 
+#[derive(arrrg_derive::CommandLine, Debug, Default, PartialEq, Eq)]
+struct SidArgs {
+    #[arrrg(nested)]
+    param: ChatArgs,
+
+    #[arrrg(
+        optional,
+        "Run COMMAND through the builtin bash tool and exit",
+        "COMMAND"
+    )]
+    bash_debug: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = try_main().await {
@@ -32,8 +45,8 @@ async fn main() {
 }
 
 async fn try_main() -> Result<(), SError> {
-    let (args, _) = ChatArgs::from_command_line_relaxed("sid [OPTIONS]");
-    let mut config = ChatConfig::try_from(args).map_err(|err| {
+    let SidArgs { param, bash_debug } = parse_sid_args()?;
+    let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
             .with_string_field("cause", &err.to_string())
     })?;
@@ -70,6 +83,11 @@ async fn try_main() -> Result<(), SError> {
         println!("Aborted.");
         return Ok(());
     }
+
+    if let Some(command) = bash_debug {
+        return run_bash_debug(&agent, &agent_id, &workspace_display, &command).await;
+    }
+
     let use_color = agent.config().use_color;
 
     let client = Anthropic::new(None).map_err(|err| {
@@ -306,6 +324,53 @@ async fn try_main() -> Result<(), SError> {
     Ok(())
 }
 
+fn parse_sid_args() -> Result<SidArgs, SError> {
+    let (args, free) = SidArgs::from_command_line_relaxed("sid [OPTIONS]");
+    validate_no_free_args(&free)?;
+    Ok(args)
+}
+
+fn validate_no_free_args(free: &[String]) -> Result<(), SError> {
+    if free.is_empty() {
+        return Ok(());
+    }
+    Err(
+        cli_error("invalid_cli_args", "unexpected positional arguments")
+            .with_string_field("args", &free.join(" ")),
+    )
+}
+
+async fn run_bash_debug(
+    agent: &SidAgent,
+    agent_id: &str,
+    workspace_display: &str,
+    command: &str,
+) -> Result<(), SError> {
+    eprintln!("sid bash debug (agent: {agent_id})");
+    eprintln!("workspace: {workspace_display}");
+
+    match agent.bash(command, false).await {
+        Ok(output) => {
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            io::stdout().flush().map_err(|err| {
+                cli_error("io_error", "failed to flush bash debug output")
+                    .with_string_field("cause", &err.to_string())
+            })?;
+            Ok(())
+        }
+        Err(err) => {
+            let mut message = err.to_string();
+            if err.kind() == io::ErrorKind::Unsupported {
+                message.push_str("\nhint: configure bash in tools.conf or set SID_HOME=init");
+            }
+            Err(cli_error("bash_debug_failed", &message))
+        }
+    }
+}
+
 fn cli_error(code: &str, message: &str) -> SError {
     SError::new("sid-cli").with_code(code).with_message(message)
 }
@@ -480,7 +545,15 @@ fn describe_top_k(value: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_confirmation;
+    use super::{SidArgs, parse_confirmation, validate_no_free_args};
+    use arrrg::{CommandLine, NoExitCommandLine};
+
+    fn parse_args(argv: &[&str]) -> (SidArgs, Vec<String>, i32, Vec<String>) {
+        let (parsed, free) =
+            NoExitCommandLine::<SidArgs>::from_arguments_relaxed("sid [OPTIONS]", argv);
+        let (args, messages, status) = parsed.into_parts();
+        (args, free, status, messages)
+    }
 
     #[test]
     fn parse_confirmation_accepts_yes_values() {
@@ -498,5 +571,85 @@ mod tests {
     fn parse_confirmation_rejects_other_values() {
         assert_eq!(parse_confirmation(""), None);
         assert_eq!(parse_confirmation("maybe"), None);
+    }
+
+    #[test]
+    fn sid_args_parse_prefixed_temperature_param() {
+        let (args, free, status, messages) = parse_args(&["--param-temperature", "0.5"]);
+
+        assert_eq!(status, 0);
+        assert!(
+            messages.is_empty(),
+            "unexpected parser messages: {messages:?}"
+        );
+        assert!(free.is_empty(), "unexpected free args: {free:?}");
+        assert_eq!(args.param.temperature.as_deref(), Some("0.5"));
+    }
+
+    #[test]
+    fn sid_args_parse_prefixed_param_and_bash_debug() {
+        let (args, free, status, messages) =
+            parse_args(&["--param-model", "claude-haiku-4-5", "--bash-debug", "pwd"]);
+
+        assert_eq!(status, 0);
+        assert!(
+            messages.is_empty(),
+            "unexpected parser messages: {messages:?}"
+        );
+        assert!(free.is_empty(), "unexpected free args: {free:?}");
+        assert_eq!(args.param.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(args.bash_debug.as_deref(), Some("pwd"));
+    }
+
+    #[test]
+    fn sid_args_reject_unprefixed_chat_params() {
+        let (_args, _free, status, messages) = parse_args(&["--temperature", "0.5"]);
+
+        assert_eq!(status, 64);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Unrecognized option: 'temperature'")),
+            "expected unrecognized option message, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn sid_args_reject_debug_alias() {
+        let (_args, _free, status, messages) = parse_args(&["--debug", "pwd"]);
+
+        assert_eq!(status, 64);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Unrecognized option: 'debug'")),
+            "expected unrecognized option message, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn sid_args_reject_free_positional_args() {
+        let (_args, free, status, messages) = parse_args(&["hello"]);
+
+        assert_eq!(status, 0);
+        assert!(
+            messages.is_empty(),
+            "unexpected parser messages: {messages:?}"
+        );
+        assert_eq!(free, vec!["hello".to_string()]);
+        assert!(validate_no_free_args(&free).is_err());
+    }
+
+    #[test]
+    fn sid_args_reject_missing_bash_debug_command() {
+        let (_args, _free, status, messages) = parse_args(&["--bash-debug"]);
+
+        assert_eq!(status, 64);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Argument to option 'bash-debug' missing")),
+            "expected missing argument message, got {messages:?}"
+        );
     }
 }

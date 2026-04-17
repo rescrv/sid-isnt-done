@@ -276,4 +276,26 @@ mod tests {
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
+
+    #[test]
+    fn editor_tool_absolute_path_is_workspace_rooted() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("foo").as_str(), "workspace foo\n").unwrap();
+
+        let input = json!({
+            "command": "view",
+            "path": "/foo"
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let output = runtime
+            .block_on(execute_editor_command(
+                &root,
+                input.as_object().expect("input must be an object"),
+            ))
+            .expect("editor command should succeed");
+        assert_eq!(output, "workspace foo\n\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
 }

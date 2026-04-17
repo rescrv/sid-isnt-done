@@ -31,6 +31,7 @@ use crate::config::{
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
 use crate::seatbelt::WritableRoots;
 use crate::tool_runtime::ToolRuntimeContext;
+
 const DEFAULT_AGENT_ID: &str = "sid";
 
 /// Top-level agent combining chat configuration, tool bindings, and sandbox policy.
@@ -167,6 +168,7 @@ impl SidAgent {
         let skills = resolve_agent_skills(config, agent_config)?;
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
         let writable_roots = default_writable_roots(&workspace_root);
+        append_system_description(&mut chat_config, &workspace_root);
         if !skills.is_empty() {
             append_skill_index_to_system_prompt(&mut chat_config, &skills);
         }
@@ -917,10 +919,38 @@ fn merged_chat_config(agent_config: &AgentConfig, fallback: Option<&ChatConfig>)
     merged
 }
 
+fn append_system_description(chat_config: &mut ChatConfig, workspace_root: &Path) {
+    let existing = chat_config.system_prompt_text().unwrap_or("").to_string();
+    let addendum = format!(
+        r#"# Environment
+
+You are operating in the sid-isn't-done environment.  Tools:
+- edit: The Anthropic Text Editor tool:
+    - Uses sid's virtual filesystem.
+    - The virtual filesystem maps / to the workspace root.
+    - It is not an operating-system chroot.
+    - Absolute editor paths are workspace-rooted; /foo means {workspace_root}/foo.
+- bash: A genuine bash shell:
+    - Connected via PTY.
+    - Without support for cursor positioning.
+    - With state persistence between invocations.
+    - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
+    - `restart: true` throws the session away and starts fresh.
+    - Initial CWD is {workspace_root}.
+    - Runs in the host filesystem namespace, not a chroot.
+    - Host / remains visible subject to OS permissions and sandbox policy.
+    - Bash cannot see sid's virtual /skills mount.
+    - Use the index to browse skills if you need specialized knowledge.
+"#,
+    );
+
+    chat_config.set_system_prompt(Some(format!("{existing}{addendum}")));
+}
+
 /// Append a skill index to the system prompt so the model knows what skills are
 /// available and where they are mounted.
 fn append_skill_index_to_system_prompt(chat_config: &mut ChatConfig, skills: &[&SkillConfig]) {
-    let mut index = String::from("\n\nAvailable skills (mounted read-only under /skills/):\n");
+    let mut index = String::from("\n\n# Available skills (mounted read-only under /skills/):\n");
     for skill in skills {
         index.push_str(&format!("  - /skills/{}/SKILL.md\n", skill.id));
     }
@@ -980,7 +1010,7 @@ mod tests {
         assert_eq!(agent.stream_label(), "build".to_string());
         assert_eq!(
             agent.config.system_prompt_text(),
-            Some("# Build\n\nYou are an expert builder.\n")
+            Some(expected_build_system_prompt(&root).as_str())
         );
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1009,7 +1039,7 @@ mod tests {
         assert_eq!(agent.id(), "build");
         assert_eq!(
             agent.config.system_prompt_text(),
-            Some("# Build\n\nYou are an expert builder.\n")
+            Some(expected_build_system_prompt(&root).as_str())
         );
         assert_eq!(
             agent.config.model(),
@@ -1052,7 +1082,7 @@ mod tests {
         assert_eq!(agent.id(), "build");
         assert_eq!(
             agent.config.system_prompt_text(),
-            Some("# Build\n\nYou are an expert builder.\n")
+            Some(expected_build_system_prompt(&workspace_root).as_str())
         );
         assert_eq!(agent.config.max_tokens(), 2048);
 
@@ -1973,6 +2003,35 @@ mod tests {
         assert!(error.contains("tool input must be a JSON object"));
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    fn expected_build_system_prompt(workspace_root: &Path) -> String {
+        format!(
+            r#"# Build
+
+You are an expert builder.
+# Environment
+
+You are operating in the sid-isn't-done environment.  Tools:
+- edit: The Anthropic Text Editor tool:
+    - Uses sid's virtual filesystem.
+    - The virtual filesystem maps / to the workspace root.
+    - It is not an operating-system chroot.
+    - Absolute editor paths are workspace-rooted; /foo means {}/foo.
+- bash: A genuine bash shell:
+    - Connected via PTY.
+    - Without support for cursor positioning.
+    - With state persistence between invocations.
+    - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
+    - Without /skills/ mounted.
+    - `restart` throws the session away and starts fresh.
+    - Initial CWD is {}.
+    - Runs in the host filesystem namespace, not a chroot.
+    - Host / remains visible subject to OS permissions and sandbox policy.
+    - Bash cannot see sid's virtual /skills mount.
+"#,
+            workspace_root, workspace_root
+        )
     }
 
     fn write_sample_config(root: &Path) {
