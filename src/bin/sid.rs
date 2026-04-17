@@ -15,12 +15,18 @@ use claudius::chat::{
 use claudius::{Agent, Renderer};
 use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
 
-use sid_isnt_done::SidAgent;
+use sid_isnt_done::{SidAgent, seatbelt};
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "You are sid, a concise coding agent with access to the current workspace mounted at /.\n",
     "Use configured tools when they help accomplish the user's request.\n",
     "Ground your answers in the files and tool results you can access, explain changes you make, and do not claim to have run commands or changed files unless you actually did."
+);
+const SANDBOX_UNAVAILABLE_WARNING: &str = concat!(
+    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+    "!! WARNING: /usr/bin/sandbox-exec is unavailable.\n",
+    "!! WARNING: sid will run bash and external tools UNSANDBOXED.\n",
+    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
 );
 
 #[derive(arrrg_derive::CommandLine, Debug, Default, PartialEq, Eq)]
@@ -76,6 +82,8 @@ async fn try_main() -> Result<(), SError> {
         std::env::set_var("SID_WORKSPACE_ROOT", workspace_root.as_str());
     }
     let workspace_display = workspace_root.as_str().to_string();
+
+    warn_if_sandbox_unavailable();
 
     let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?;
     let agent_id = agent.id().to_string();
@@ -375,6 +383,14 @@ fn cli_error(code: &str, message: &str) -> SError {
     SError::new("sid-cli").with_code(code).with_message(message)
 }
 
+fn warn_if_sandbox_unavailable() {
+    if seatbelt::sandbox_available() {
+        return;
+    }
+
+    eprint!("{SANDBOX_UNAVAILABLE_WARNING}");
+}
+
 fn resolve_sid_home(workspace_root: &Path) -> Result<Path<'static>, SError> {
     match std::env::var("SID_HOME") {
         Ok(path) if !path.is_empty() => Ok(Path::new(&path).into_owned()),
@@ -545,7 +561,7 @@ fn describe_top_k(value: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SidArgs, parse_confirmation, validate_no_free_args};
+    use super::{SANDBOX_UNAVAILABLE_WARNING, SidArgs, parse_confirmation, validate_no_free_args};
     use arrrg::{CommandLine, NoExitCommandLine};
 
     fn parse_args(argv: &[&str]) -> (SidArgs, Vec<String>, i32, Vec<String>) {
@@ -651,5 +667,12 @@ mod tests {
                 .any(|message| message.contains("Argument to option 'bash-debug' missing")),
             "expected missing argument message, got {messages:?}"
         );
+    }
+
+    #[test]
+    fn sandbox_warning_is_loud_and_explicit() {
+        assert!(SANDBOX_UNAVAILABLE_WARNING.contains("WARNING"));
+        assert!(SANDBOX_UNAVAILABLE_WARNING.contains("/usr/bin/sandbox-exec is unavailable"));
+        assert!(SANDBOX_UNAVAILABLE_WARNING.contains("UNSANDBOXED"));
     }
 }

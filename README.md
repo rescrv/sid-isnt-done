@@ -33,6 +33,55 @@ The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for chat commands such as changing the model,
 saving or loading transcripts, clearing context, and printing session stats.
 
+## QUICKSTART
+
+Build the binaries from a checkout:
+
+```sh
+cargo build
+```
+
+Run with the bundled starter configuration:
+
+```sh
+export CLAUDIUS_API_KEY="..."
+SID_HOME=init cargo run --bin sid
+```
+
+Run one bash command through the configured bash tool and exit:
+
+```sh
+SID_HOME=init cargo run --bin sid -- --bash-debug 'pwd && ls'
+```
+
+After installing the binaries, the same examples can be run as:
+
+```sh
+SID_HOME=init sid
+SID_HOME=init sid --bash-debug 'pwd && ls'
+```
+
+## BUILDING
+
+`sid` is a Rust project using the 2024 edition.  Use Rust 1.94 or newer and the
+normal Cargo workflow:
+
+```sh
+cargo build
+cargo test
+cargo install --path .
+```
+
+Interactive sessions use the Anthropic client from `claudius`.  Set
+`CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`.  Values that
+begin with `file://` are treated by `claudius` as paths to files containing the
+API key.
+
+macOS is the only platform where `sid` can use `/usr/bin/sandbox-exec`.  On
+other systems, or on macOS systems where that program is unavailable, `sid`
+runs bash and external tools without the Seatbelt wrapper and prints a startup
+warning.
+
 ## OPTIONS
 
 `--param-model MODEL`
@@ -67,6 +116,17 @@ saving or loading transcripts, clearing context, and printing session stats.
 
 `--help`
 : Print the command-line help.
+
+## MODEL SELECTION
+
+The model can be selected at startup with `--param-model MODEL`, configured per
+agent with `<agent>_MODEL`, or changed during a session with `/model MODEL`.
+Run `sid --help` to see the compiled default model.  Use `/help` inside a
+session to see the current chat commands.
+
+`sid` passes model names through to `claudius`; it does not maintain a separate
+registry of available model names.  Prefer provider documentation or the
+Anthropic models API for the current model list.
 
 ## CONFIGURATION
 
@@ -155,6 +215,37 @@ by `<agent>_SYSTEM`.
 If `DEFAULT_AGENT` is unset, `sid` starts the first enabled agent.  If no agent
 is enabled, it starts the first manual agent after confirmation.
 
+## SKILLS
+
+Skills are markdown documents mounted read-only into the model-visible virtual
+filesystem.  By default, `sid` scans:
+
+```text
+skills/<skill>/SKILL.md
+```
+
+Set `SID_SKILLS_PATH` to a colon-separated list of directories to load skills
+from somewhere else.  Each directory in the path is scanned for immediate
+children containing `SKILL.md`.  If two directories provide the same skill id,
+the earlier directory wins.
+
+Expose skills to an agent with `<agent>_SKILLS`:
+
+```sh
+build_SKILLS="rust-style release-checklist"
+```
+
+Use `*` to expose every loaded skill:
+
+```sh
+build_SKILLS="*"
+```
+
+A skill should be self-contained markdown that tells the model when to use it
+and what procedure to follow.  Keep skill ids stable and filesystem-friendly;
+the document is mounted for the model at `/skills/<skill>/SKILL.md`.  Bash and
+external tools do not see this virtual `/skills` mount.
+
 ## TOOLS
 
 Tools are rc-conf services in `tools.conf`.  There are no implicit external
@@ -192,6 +283,9 @@ format_ALIASES="fmt"
   script execs `sid-editor-tool`.  The helper process is not chrooted, but the
   editor protocol resolves file paths under `WORKSPACE_ROOT`; `/etc/passwd` in
   an editor request means `$WORKSPACE_ROOT/etc/passwd`, not host `/etc/passwd`.
+  `tools/edit` must exist and be executable when `edit` is configured.  A
+  `tools/edit.json` manifest is optional because the model-visible schema comes
+  from the built-in Anthropic text-editor tool definition.
 
 External tools must provide both files below for the canonical tool id:
 
@@ -427,6 +521,41 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 : Per-call scratch directories on typical Unix systems.  The exact parent is
   the platform's system temporary directory.
 
+## TROUBLESHOOTING
+
+`API key not provided and ANTHROPIC_API_KEY environment variable not set`
+: Set `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`.
+
+`agent references an undefined tool`
+: The agent listed a name in `<agent>_TOOLS` that does not have a matching
+  service in `tools.conf`.  Add the tool service or remove it from the agent.
+
+`required tool executable does not exist`
+: External tools need an executable at `tools/<id>`.  The configured `edit`
+  tool also needs an executable `tools/edit` bridge, normally copied from
+  `init/tools/edit`.
+
+`required tool manifest does not exist`
+: External tools need `tools/<id>.json`.  The built-in `bash` and `edit` tools
+  do not require manifests.
+
+`tool must be executable`
+: Mark the tool script executable, for example `chmod +x tools/fmt`.
+
+`edit is disabled`, `bash is disabled`, or `edit call denied by operator`
+: Check `<tool>_ENABLED` in `tools.conf`.  `YES` allows the tool, `MANUAL`
+  prompts before each use, and `NO` disables it.
+
+Startup warning that `sid will run bash and external tools UNSANDBOXED`
+: `/usr/bin/sandbox-exec` is unavailable, so `sid` cannot apply the macOS
+  Seatbelt wrapper.  Bash and external tools still run, but without that
+  sandbox policy.
+
+`sandbox-exec: sandbox_apply: Operation not permitted`
+: `sandbox-exec` exists, but the current host or parent sandbox refused to
+  apply the policy.  Run `sid` outside the enclosing sandbox or on a macOS
+  environment that permits Seatbelt policy application.
+
 ## EXIT STATUS
 
 `0`
@@ -533,6 +662,63 @@ by `sid-editor-tool`, then execs `sid-editor-tool`.
 
 `create`
 : Create a new file.  Input fields are `path` and `file_text`.
+
+## COMMAND INPUT EXAMPLES
+
+These examples show the `invocation.input` object inside the sid tool request
+envelope.  The helper normally receives that envelope through `REQUEST_FILE`
+when `tools/edit run` is invoked by `sid`.
+
+View a file:
+
+```json
+{
+  "command": "view",
+  "path": "src/lib.rs"
+}
+```
+
+View a line range:
+
+```json
+{
+  "command": "view",
+  "path": "src/lib.rs",
+  "view_range": [10, 40]
+}
+```
+
+Replace one exact string:
+
+```json
+{
+  "command": "str_replace",
+  "path": "README.md",
+  "old_str": "old text",
+  "new_str": "new text"
+}
+```
+
+Insert text at a line:
+
+```json
+{
+  "command": "insert",
+  "path": "README.md",
+  "insert_line": 12,
+  "insert_text": "Inserted text\n"
+}
+```
+
+Create a file:
+
+```json
+{
+  "command": "create",
+  "path": "notes/todo.md",
+  "file_text": "# Todo\n"
+}
+```
 
 ## ENVIRONMENT
 
