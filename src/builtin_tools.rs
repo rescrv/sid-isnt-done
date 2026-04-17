@@ -135,9 +135,72 @@ pub async fn run_sid_editor_tool() -> io::Result<()> {
         );
     }
 
+    let mode = env::args().nth(1).unwrap_or_else(|| "run".to_string());
+    if mode == "confirm" {
+        let preview = preview_editor_command(&request.invocation.input)
+            .map_err(|failure| io::Error::new(io::ErrorKind::InvalidInput, failure.message))?;
+        println!("{preview}");
+        return Ok(());
+    }
+    if mode != "run" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported sid-editor-tool mode: {mode}"),
+        ));
+    }
+
     match execute_editor_command(&invocation.workspace_root, &request.invocation.input).await {
         Ok(output) => invocation.write_success(&request.request_id, output),
         Err(failure) => invocation.write_failure(&request.request_id, failure),
+    }
+}
+
+fn preview_editor_command(input: &Map<String, Value>) -> Result<String, ToolFailure> {
+    let command = parse_request_input::<EditorCommand>(input)?;
+    match command.command.as_str() {
+        "view" => {
+            let request = parse_request_input::<ViewRequest>(input)?;
+            let range = request
+                .view_range
+                .map(|(start, end)| format!(" lines {start}-{end}"))
+                .unwrap_or_default();
+            Ok(format!("View workspace file: {}{}", request.path, range))
+        }
+        "str_replace" => {
+            let request = parse_request_input::<StrReplaceRequest>(input)?;
+            let new_str = request.new_str.as_deref().unwrap_or("");
+            Ok(format!(
+                "Replace text in workspace file: {}\nold bytes: {}\nnew bytes: {}",
+                request.path,
+                request.old_str.len(),
+                new_str.len()
+            ))
+        }
+        "insert" => {
+            let request = parse_request_input::<InsertRequest>(input)?;
+            let text = request
+                .insert_text
+                .or(request.new_str)
+                .ok_or_else(|| ToolFailure::new("invalid_input", "missing insert_text field"))?;
+            Ok(format!(
+                "Insert text into workspace file: {}\nafter line: {}\nbytes: {}",
+                request.path,
+                request.insert_line,
+                text.len()
+            ))
+        }
+        "create" => {
+            let request = parse_request_input::<CreateRequest>(input)?;
+            Ok(format!(
+                "Create workspace file: {}\nbytes: {}",
+                request.path,
+                request.file_text.len()
+            ))
+        }
+        _ => Err(ToolFailure::new(
+            "unsupported_command",
+            format!("{} is not a supported editor command", command.command),
+        )),
     }
 }
 
@@ -297,5 +360,51 @@ mod tests {
         assert_eq!(output, "workspace foo\n\n");
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_previews_mutating_commands() {
+        let create = json!({
+            "command": "create",
+            "path": "new.txt",
+            "file_text": "hello"
+        });
+        let create_preview = preview_editor_command(create.as_object().unwrap()).unwrap();
+        assert_eq!(create_preview, "Create workspace file: new.txt\nbytes: 5");
+
+        let replace = json!({
+            "command": "str_replace",
+            "path": "file.txt",
+            "old_str": "old",
+            "new_str": "new text"
+        });
+        let replace_preview = preview_editor_command(replace.as_object().unwrap()).unwrap();
+        assert_eq!(
+            replace_preview,
+            "Replace text in workspace file: file.txt\nold bytes: 3\nnew bytes: 8"
+        );
+
+        let insert = json!({
+            "command": "insert",
+            "path": "file.txt",
+            "insert_line": 7,
+            "insert_text": "abc"
+        });
+        let insert_preview = preview_editor_command(insert.as_object().unwrap()).unwrap();
+        assert_eq!(
+            insert_preview,
+            "Insert text into workspace file: file.txt\nafter line: 7\nbytes: 3"
+        );
+    }
+
+    #[test]
+    fn editor_tool_previews_view_range() {
+        let input = json!({
+            "command": "view",
+            "path": "file.txt",
+            "view_range": [2, 4]
+        });
+        let preview = preview_editor_command(input.as_object().unwrap()).unwrap();
+        assert_eq!(preview, "View workspace file: file.txt lines 2-4");
     }
 }

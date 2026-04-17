@@ -239,8 +239,10 @@ impl SidAgent {
                 let input_value = serde_json::json!({
                     "command": command,
                     "restart": restart,
+                    "cwd": self.workspace_root.as_str(),
+                    "writable_roots": self.writable_roots.as_slice(),
                 });
-                match confirm_manual_tool_call("bash", &input_value) {
+                match confirm_manual_tool_call("bash", &input_value, None) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(std::io::Error::new(
@@ -289,18 +291,41 @@ impl SidAgent {
         }
     }
 
+    fn tool_runtime_context(&self) -> ToolRuntimeContext<'_> {
+        ToolRuntimeContext {
+            agent_id: &self.id,
+            config_root: &self.config_root,
+            workspace_root: &self.workspace_root,
+            writable_roots: &self.writable_roots,
+        }
+    }
+
+    fn prepare_rc_tool(
+        &self,
+        display_name: &str,
+        binding: &RcToolBinding,
+        tool_use_id: &str,
+        input: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<tool_runtime::PreparedRcToolInvocation, String> {
+        let context = self.tool_runtime_context();
+        tool_runtime::prepare_rc_tool_invocation(
+            display_name,
+            &binding.service_name,
+            &binding.canonical_id,
+            &binding.executable_path,
+            &context,
+            tool_use_id,
+            input,
+        )
+    }
+
     async fn invoke_rc_tool(
         &self,
         binding: &RcToolBinding,
         tool_use_id: &str,
         input: serde_json::Map<String, serde_json::Value>,
     ) -> Result<String, std::io::Error> {
-        let context = ToolRuntimeContext {
-            agent_id: &self.id,
-            config_root: &self.config_root,
-            workspace_root: &self.workspace_root,
-            writable_roots: &self.writable_roots,
-        };
+        let context = self.tool_runtime_context();
         tool_runtime::invoke_rc_tool_text(
             &binding.service_name,
             &binding.service_name,
@@ -441,25 +466,22 @@ impl Agent for SidAgent {
             return self.default_text_editor(tool_use).await;
         };
         match binding.enabled {
-            SwitchPosition::Yes => {}
+            SwitchPosition::Yes => {
+                let input = tool_use.input.as_object().cloned().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "text editor input must be a JSON object",
+                    )
+                })?;
+                return self.invoke_rc_tool(binding, &tool_use.id, input).await;
+            }
             SwitchPosition::No => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "edit is disabled",
                 ));
             }
-            SwitchPosition::Manual => match confirm_manual_tool_call("edit", &tool_use.input) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "edit call denied by operator",
-                    ));
-                }
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            },
+            SwitchPosition::Manual => {}
         }
         let input = tool_use.input.as_object().cloned().ok_or_else(|| {
             std::io::Error::new(
@@ -467,7 +489,31 @@ impl Agent for SidAgent {
                 "text editor input must be a JSON object",
             )
         })?;
-        self.invoke_rc_tool(binding, &tool_use.id, input).await
+        let prepared = self
+            .prepare_rc_tool("edit", binding, &tool_use.id, input)
+            .map_err(std::io::Error::other)?;
+        match confirm_manual_prepared_tool_call(
+            "edit",
+            &tool_use.input,
+            binding.confirm_preview,
+            &prepared,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "edit call denied by operator",
+                ));
+            }
+            Err(err) => {
+                return Err(std::io::Error::other(err));
+            }
+        }
+        tool_runtime::run_prepared_rc_tool_text(&prepared, &self.writable_roots)
+            .await
+            .map_err(std::io::Error::other)
     }
 
     async fn bash(&self, command: &str, restart: bool) -> Result<String, std::io::Error> {
@@ -539,6 +585,7 @@ struct RcToolBinding {
     service_name: String,
     canonical_id: String,
     enabled: SwitchPosition,
+    confirm_preview: bool,
     executable_path: Path<'static>,
 }
 
@@ -575,6 +622,7 @@ struct ExternalTool {
     name: String,
     canonical_id: String,
     enabled: SwitchPosition,
+    confirm_preview: bool,
     executable_path: Path<'static>,
     description: String,
     input_schema: serde_json::Value,
@@ -594,6 +642,7 @@ impl ExternalTool {
             name,
             canonical_id,
             enabled: tool.enabled,
+            confirm_preview: tool.confirm_preview,
             executable_path,
             description: manifest.description.clone(),
             input_schema: manifest.input_schema.clone(),
@@ -655,23 +704,8 @@ async fn invoke_external_tool(
     agent: &SidAgent,
     tool_use: &ToolUseBlock,
 ) -> ToolResult {
-    match tool.enabled {
-        SwitchPosition::Yes => {}
-        SwitchPosition::No => {
-            return tool_error_result(&tool_use.id, format!("tool '{}' is disabled", tool.name));
-        }
-        SwitchPosition::Manual => match confirm_manual_tool_call(&tool.name, &tool_use.input) {
-            Ok(true) => {}
-            Ok(false) => {
-                return tool_error_result(
-                    &tool_use.id,
-                    format!("tool '{}' call denied by operator", tool.name),
-                );
-            }
-            Err(err) => {
-                return tool_error_result(&tool_use.id, err);
-            }
-        },
+    if tool.enabled == SwitchPosition::No {
+        return tool_error_result(&tool_use.id, format!("tool '{}' is disabled", tool.name));
     }
 
     let input = match tool_use.input.as_object() {
@@ -686,6 +720,51 @@ async fn invoke_external_tool(
             );
         }
     };
+
+    match tool.enabled {
+        SwitchPosition::Yes => {}
+        SwitchPosition::No => unreachable!("disabled tools return before input validation"),
+        SwitchPosition::Manual => {
+            let context = agent.tool_runtime_context();
+            let prepared = match tool_runtime::prepare_rc_tool_invocation(
+                &tool.name,
+                &tool.name,
+                &tool.canonical_id,
+                &tool.executable_path,
+                &context,
+                &tool_use.id,
+                input,
+            ) {
+                Ok(prepared) => prepared,
+                Err(message) => return tool_error_result(&tool_use.id, message),
+            };
+            match confirm_manual_prepared_tool_call(
+                &tool.name,
+                &tool_use.input,
+                tool.confirm_preview,
+                &prepared,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return tool_error_result(
+                        &tool_use.id,
+                        format!("tool '{}' call denied by operator", tool.name),
+                    );
+                }
+                Err(err) => {
+                    return tool_error_result(&tool_use.id, err);
+                }
+            }
+            return match tool_runtime::run_prepared_rc_tool_text(&prepared, &agent.writable_roots)
+                .await
+            {
+                Ok(text) => tool_success_result(&tool_use.id, text),
+                Err(message) => tool_error_result(&tool_use.id, message),
+            };
+        }
+    }
 
     let context = ToolRuntimeContext {
         agent_id: &agent.id,
@@ -713,11 +792,32 @@ async fn invoke_external_tool(
 ///
 /// Returns `Ok(true)` when the operator approves, `Ok(false)` when denied or
 /// stdin reaches EOF, and `Err` on I/O failure.
-fn confirm_manual_tool_call(tool_name: &str, input: &serde_json::Value) -> Result<bool, String> {
+async fn confirm_manual_prepared_tool_call(
+    tool_name: &str,
+    input: &serde_json::Value,
+    confirm_preview: bool,
+    prepared: &tool_runtime::PreparedRcToolInvocation,
+) -> Result<bool, String> {
+    let preview = if confirm_preview {
+        tool_runtime::render_rc_tool_confirmation_preview(prepared)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    confirm_manual_tool_call(tool_name, input, preview.as_deref())
+}
+
+fn confirm_manual_tool_call(
+    tool_name: &str,
+    input: &serde_json::Value,
+    preview: Option<&str>,
+) -> Result<bool, String> {
     use std::io::{self, Write};
 
-    let input_display =
-        serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"));
+    let input_display = preview.map(str::to_string).unwrap_or_else(|| {
+        serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"))
+    });
 
     let mut buf = String::new();
     loop {
@@ -895,6 +995,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
                         service_name: tool_name.clone(),
                         canonical_id,
                         enabled: tool_config.enabled,
+                        confirm_preview: tool_config.confirm_preview,
                         executable_path: tool_config
                             .executable_path
                             .clone()
@@ -1927,6 +2028,53 @@ mod tests {
     }
 
     #[test]
+    fn tool_confirmation_preview_uses_prepared_invocation_env() {
+        if sandbox_exec_refuses_children() {
+            return;
+        }
+
+        let root = temp_config_root("agent");
+        write_sample_config_with_fmt_script(&root, &confirmation_preview_tool_script());
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let tool_config = config.tools.get("format").unwrap();
+        let exposed_name = exposed_tool_name("build", "format").unwrap();
+        let canonical_id = resolve_canonical_tool_id(&config.tools_rc_conf, "format").unwrap();
+        let tool = ExternalTool::from_config(exposed_name.clone(), canonical_id, tool_config);
+        let context = agent.tool_runtime_context();
+        let prepared = tool_runtime::prepare_rc_tool_invocation(
+            &tool.name,
+            &tool.name,
+            &tool.canonical_id,
+            &tool.executable_path,
+            &context,
+            "toolu_confirm_123",
+            serde_json::Map::from_iter([("paths".to_string(), json!(["src/lib.rs"]))]),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let preview = runtime
+            .block_on(tool_runtime::render_rc_tool_confirmation_preview(&prepared))
+            .unwrap();
+        assert!(preview.contains("mode=confirm"));
+        assert!(preview.contains("tool=format"));
+        assert!(preview.contains("id=fmt"));
+        assert!(preview.contains("request=request.json"));
+
+        let text = runtime
+            .block_on(tool_runtime::run_prepared_rc_tool_text(
+                &prepared,
+                &agent.writable_roots,
+            ))
+            .unwrap();
+        assert_eq!(text, "format ran");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn tool_invocation_returns_handled_model_visible_error() {
         let root = temp_config_root("agent");
         write_sample_config_with_fmt_script(
@@ -2268,6 +2416,28 @@ format_ALIASES="fmt"
         )
     }
 
+    fn confirmation_preview_tool_script() -> String {
+        "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\nif [ \"$TOOL_MODE\" = confirm ]; then\n    printf 'mode=%s tool=%s id=%s request=%s\\n' \"$TOOL_MODE\" \"$TOOL_NAME\" \"$TOOL_ID\" \"$(basename \"$REQUEST_FILE\")\"\n    exit 0\nfi\ncat >\"$RESULT_FILE\" <<EOF\n{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{\"kind\":\"text\",\"text\":\"format ran\"}}\nEOF\n".to_string()
+    }
+
+    fn sandbox_exec_refuses_children() -> bool {
+        if !seatbelt::sandbox_available() {
+            return false;
+        }
+        match std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg("(version 1)\n(allow default)\n")
+            .arg("/usr/bin/true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) => !status.success(),
+            Err(_) => true,
+        }
+    }
+
     fn nonzero_exit_tool_script() -> String {
         "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\ncat >\"$RESULT_FILE\" <<EOF\n{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{\"kind\":\"text\",\"text\":\"ignored\"}}\nEOF\nexit 9\n".to_string()
     }
@@ -2314,7 +2484,7 @@ format_ALIASES="fmt"
         fs::write(
             executable.as_str(),
             format!(
-                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nrun)\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|run]\" >&2\n    exit 129\n    ;;\nesac\n",
+                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nconfirm|run)\n    export TOOL_MODE=\"$1\"\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|confirm|run]\" >&2\n    exit 129\n    ;;\nesac\n",
                 shvar::quote_string(implementation.as_str())
             ),
         )

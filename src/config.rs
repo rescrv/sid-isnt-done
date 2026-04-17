@@ -147,6 +147,7 @@ impl AgentConfig {
 pub struct ToolConfig {
     pub id: String,
     pub enabled: SwitchPosition,
+    pub confirm_preview: bool,
     pub executable_path: Option<Path<'static>>,
     pub manifest_path: Path<'static>,
     pub manifest: Option<ToolManifest>,
@@ -223,6 +224,7 @@ fn resolve_tool_configs(
     let mut tools = BTreeMap::new();
     for tool_id in tool_names {
         let enabled = resolve_tool_switch(rc_conf, tool_id)?;
+        let confirm_preview = resolve_tool_confirm_preview(rc_conf, tool_id)?;
         let canonical_id = resolved_ids
             .get(tool_id)
             .expect("resolved tool id should exist")
@@ -235,6 +237,7 @@ fn resolve_tool_configs(
             ToolConfig {
                 id: tool_id.clone(),
                 enabled,
+                confirm_preview,
                 executable_path: executable_path.clone(),
                 manifest_path: manifest_path.clone(),
                 manifest: manifest.clone(),
@@ -261,6 +264,20 @@ pub(crate) fn resolve_canonical_tool_id(rc_conf: &RcConf, tool: &str) -> Result<
 
 fn resolve_tool_switch(rc_conf: &RcConf, tool: &str) -> Result<SwitchPosition, SError> {
     Ok(rc_conf.service_switch(tool))
+}
+
+fn resolve_tool_confirm_preview(rc_conf: &RcConf, tool: &str) -> Result<bool, SError> {
+    let provider = rc_conf.variable_provider_for(tool).map_err(|err| {
+        SError::new("config")
+            .with_code("rc_conf_error")
+            .with_message("failed to derive tool config from rc_conf")
+            .with_string_field("tool", tool)
+            .with_string_field("cause", &format!("{err:?}"))
+    })?;
+    let Some(value) = lookup_expanded(&provider, tool, "CONFIRM")? else {
+        return Ok(false);
+    };
+    parse_bool_field(tool, "CONFIRM", &value)
 }
 
 pub(crate) fn is_valid_anthropic_tool_name(name: &str) -> bool {
@@ -952,6 +969,7 @@ format_ALIASES="fmt"
 
         let fmt = config.tools.get("fmt").unwrap();
         assert_eq!(fmt.enabled, SwitchPosition::Yes);
+        assert!(!fmt.confirm_preview);
         assert_eq!(fmt.executable_path, Some(root.join("tools/fmt")));
         assert_eq!(fmt.manifest_path, root.join("tools/fmt.json"));
         let fmt_manifest = fmt.manifest.as_ref().unwrap();
@@ -969,7 +987,56 @@ format_ALIASES="fmt"
 
         let bash = config.tools.get("bash").unwrap();
         assert_eq!(bash.enabled, SwitchPosition::Yes);
+        assert!(!bash.confirm_preview);
         assert!(bash.executable_path.is_none());
+    }
+
+    #[test]
+    fn tool_confirm_preview_defaults_and_parses_bool() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='fmt plain'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            "fmt_ENABLED=YES\nfmt_CONFIRM=YES\nplain_ENABLED=YES\n",
+        )
+        .unwrap();
+        write_tool_contract(&root, "fmt", "Format files.");
+        write_tool_contract(&root, "plain", "Plain tool.");
+
+        let config = Config::load(&root).unwrap();
+        assert!(config.tools.get("fmt").unwrap().confirm_preview);
+        assert!(!config.tools.get("plain").unwrap().confirm_preview);
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn invalid_tool_confirm_preview_bool_is_an_error() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='fmt'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            "fmt_ENABLED=YES\nfmt_CONFIRM=maybe\n",
+        )
+        .unwrap();
+        write_tool_contract(&root, "fmt", "Format files.");
+
+        let err = Config::load(&root)
+            .expect_err("invalid CONFIRM value should fail")
+            .to_string();
+        assert!(err.contains("CONFIRM"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]

@@ -21,7 +21,8 @@ rcvar)
         "${PREFIX}_RC_CONF_PATH" \
         "${PREFIX}_RC_D_PATH"
     ;;
-run)
+confirm|run)
+    MODE="$1"
     shift
     export REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
     export RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
@@ -33,10 +34,10 @@ run)
     export TOOL_PROTOCOL="$(lookup "${PREFIX}_TOOL_PROTOCOL")"
     export RC_CONF_PATH="$(lookup "${PREFIX}_RC_CONF_PATH")"
     export RC_D_PATH="$(lookup "${PREFIX}_RC_D_PATH")"
-    exec sid-editor-tool "$@"
+    exec sid-editor-tool "$MODE" "$@"
     ;;
 *)
-    echo "usage: $0 [rcvar|run]" >&2
+    echo "usage: $0 [rcvar|confirm|run]" >&2
     exit 129
     ;;
 esac

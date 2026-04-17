@@ -5,8 +5,11 @@
 /// and reading back the result.
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path as StdPath;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use handled::SError;
 use rc_conf::{RcConf, var_name_from_service, var_prefix_from_service};
@@ -43,6 +46,17 @@ struct ToolRcRuntime {
     bindings: HashMap<String, String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedRcToolInvocation {
+    display_name: String,
+    rc_service_name: String,
+    executable_path: Path<'static>,
+    workspace_root: Path<'static>,
+    request_id: String,
+    result_file: PathBuf,
+    runtime: ToolRcRuntime,
+}
+
 struct ToolOverlayContext<'a> {
     request_file: &'a StdPath,
     result_file: &'a StdPath,
@@ -64,6 +78,27 @@ pub(crate) async fn invoke_rc_tool_text(
     tool_use_id: &str,
     input: serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, String> {
+    let prepared = prepare_rc_tool_invocation(
+        display_name,
+        rc_service_name,
+        canonical_id,
+        executable_path,
+        context,
+        tool_use_id,
+        input,
+    )?;
+    run_prepared_rc_tool_text(&prepared, context.writable_roots).await
+}
+
+pub(crate) fn prepare_rc_tool_invocation(
+    display_name: &str,
+    rc_service_name: &str,
+    canonical_id: &str,
+    executable_path: &Path<'_>,
+    context: &ToolRuntimeContext<'_>,
+    tool_use_id: &str,
+    input: serde_json::Map<String, serde_json::Value>,
+) -> Result<PreparedRcToolInvocation, String> {
     let request_id = next_request_id();
     let scratch_dir = create_tool_scratch_dir(&request_id).map_err(|err| {
         format!(
@@ -120,31 +155,121 @@ pub(crate) async fn invoke_rc_tool_text(
         )
     })?;
 
-    let mut cmd =
-        seatbelt::sandboxed_command(executable_path.as_str(), &["run"], context.writable_roots);
+    Ok(PreparedRcToolInvocation {
+        display_name: display_name.to_string(),
+        rc_service_name: rc_service_name.to_string(),
+        executable_path: executable_path.clone().into_owned(),
+        workspace_root: context.workspace_root.clone().into_owned(),
+        request_id,
+        result_file,
+        runtime,
+    })
+}
+
+pub(crate) async fn run_prepared_rc_tool_text(
+    prepared: &PreparedRcToolInvocation,
+    writable_roots: &WritableRoots,
+) -> Result<String, String> {
+    clear_stale_result_file(prepared)?;
+    let mut cmd = prepared_rc_tool_command(prepared, "run", writable_roots);
     let status = cmd
-        .current_dir(context.workspace_root.as_str())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .envs(&runtime.bindings)
-        .env("PAGER", "cat")
-        .env("RCVAR_ARGV0", var_name_from_service(rc_service_name))
-        .env("RC_CONF_PATH", &runtime.rc_conf_path)
-        .env("RC_D_PATH", &runtime.rc_d_path)
         .status()
         .await
-        .map_err(|err| format!("tool '{}' failed to launch: {}", display_name, err))?;
+        .map_err(|err| format!("tool '{}' failed to launch: {}", prepared.display_name, err))?;
     if !status.success() {
         return Err(format!(
             "tool '{}' exited with status {}",
-            display_name, status
+            prepared.display_name, status
         ));
     }
 
-    let result = read_tool_result(&result_file)
-        .map_err(|err| format!("tool '{}' protocol error: {}", display_name, err))?;
-    extract_tool_output(display_name, &request_id, result)
+    let result = read_tool_result(&prepared.result_file)
+        .map_err(|err| format!("tool '{}' protocol error: {}", prepared.display_name, err))?;
+    extract_tool_output(&prepared.display_name, &prepared.request_id, result)
+}
+
+pub(crate) async fn render_rc_tool_confirmation_preview(
+    prepared: &PreparedRcToolInvocation,
+) -> Result<String, String> {
+    const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let readonly_roots = WritableRoots::default();
+    let mut cmd = prepared_rc_tool_command(prepared, "confirm", &readonly_roots);
+    let output = tokio::time::timeout(
+        CONFIRM_TIMEOUT,
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "tool '{}' confirm timed out after {}s",
+            prepared.display_name,
+            CONFIRM_TIMEOUT.as_secs()
+        )
+    })?
+    .map_err(|err| {
+        format!(
+            "tool '{}' failed to launch confirm: {}",
+            prepared.display_name, err
+        )
+    })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "tool '{}' confirm exited with status {}",
+            prepared.display_name, output.status
+        ));
+    }
+
+    let preview = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    if preview.trim().is_empty() {
+        return Err(format!(
+            "tool '{}' confirm produced no preview",
+            prepared.display_name
+        ));
+    }
+    Ok(preview)
+}
+
+fn prepared_rc_tool_command(
+    prepared: &PreparedRcToolInvocation,
+    subcommand: &str,
+    writable_roots: &WritableRoots,
+) -> tokio::process::Command {
+    let mut cmd = seatbelt::sandboxed_command(
+        prepared.executable_path.as_str(),
+        &[subcommand],
+        writable_roots,
+    );
+    cmd.current_dir(prepared.workspace_root.as_str())
+        .envs(&prepared.runtime.bindings)
+        .env("PAGER", "cat")
+        .env(
+            "RCVAR_ARGV0",
+            var_name_from_service(&prepared.rc_service_name),
+        )
+        .env("RC_CONF_PATH", &prepared.runtime.rc_conf_path)
+        .env("RC_D_PATH", &prepared.runtime.rc_d_path);
+    cmd
+}
+
+fn clear_stale_result_file(prepared: &PreparedRcToolInvocation) -> Result<(), String> {
+    match fs::remove_file(&prepared.result_file) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "tool '{}' failed to clear stale result.json: {}",
+            prepared.display_name, err
+        )),
+    }
 }
 
 fn prepare_tool_rc_runtime(

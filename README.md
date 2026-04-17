@@ -256,7 +256,9 @@ letters, digits, underscores, or hyphens.
 ```sh
 bash_ENABLED="MANUAL"
 edit_ENABLED="MANUAL"
-fmt_ENABLED="YES"
+edit_CONFIRM="YES"
+fmt_ENABLED="MANUAL"
+fmt_CONFIRM="YES"
 
 format_INHERIT="YES"
 format_ALIASES="fmt"
@@ -269,6 +271,12 @@ format_ALIASES="fmt"
 `<tool>_ALIASES`
 : Defines aliases resolved before filesystem lookup.  In the example above,
   `format` resolves to canonical tool `fmt`.
+
+`<tool>_CONFIRM`
+: Optional boolean.  When `YES` and the tool is `MANUAL`, `sid` invokes
+  `tools/<id> confirm` before the host-owned yes/no prompt.  The confirm
+  subcommand renders a preview to standard output; it does not authorize the
+  call and must not perform the tool operation.
 
 `bash`
 : Built-in bash capability.  It is exposed to the model as Anthropic's bash
@@ -328,7 +336,7 @@ while still appearing to the model as `format`.
 ## TOOL PROTOCOL
 
 Tool executables are rc-style programs.  They must respond to `rcvar` and
-`run`.
+`run`; they may also respond to `confirm` for manual-call previews.
 
 ```sh
 #!/bin/sh
@@ -350,6 +358,11 @@ rcvar)
         "${PREFIX}_RC_CONF_PATH" \
         "${PREFIX}_RC_D_PATH"
     ;;
+confirm)
+    export REQUEST_FILE=$(printenv "${PREFIX}_REQUEST_FILE")
+    export WORKSPACE_ROOT=$(printenv "${PREFIX}_WORKSPACE_ROOT")
+    printf 'Format paths from %s under %s\n' "$REQUEST_FILE" "$WORKSPACE_ROOT"
+    ;;
 run)
     export REQUEST_FILE=$(printenv "${PREFIX}_REQUEST_FILE")
     export RESULT_FILE=$(printenv "${PREFIX}_RESULT_FILE")
@@ -357,7 +370,7 @@ run)
     exec ./tools/fmt.impl
     ;;
 *)
-    echo "usage: $0 [rcvar|run]" >&2
+    echo "usage: $0 [rcvar|confirm|run]" >&2
     exit 129
     ;;
 esac
@@ -370,6 +383,12 @@ workspace root as its current directory and inherits standard input, standard
 output, and standard error.  Tool processes are not chrooted; host `/` is still
 the process root unless the operating system or sandbox policy denies a
 particular operation.
+
+For `MANUAL` tools with `<tool>_CONFIRM=YES`, `sid` prepares the same request
+and overlay, invokes `tools/<id> confirm`, captures its stdout as preview text,
+then asks the operator for yes/no itself.  If preview rendering fails, `sid`
+falls back to showing the raw request JSON.  The real `run` subcommand is not
+invoked unless the operator approves.
 
 The request file has this shape:
 
@@ -430,8 +449,9 @@ A handled failure is:
 
 Protocol rules:
 
-- Standard output and standard error are for the human terminal.
-- `sid` only parses `result.json`.
+- During `confirm`, standard output is the human-readable preview.
+- During `run`, standard output and standard error are for the human terminal.
+- During `run`, `sid` only parses `result.json`.
 - Exit status `0` means process transport succeeded, so `result.json` must
   exist and be valid.
 - Nonzero exit status is treated as process failure; any partial result file is
