@@ -11,13 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
     Agent, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error, FileSystem,
-    IntermediateToolResult, Model, MountHierarchy, SystemPrompt, ThinkingConfig, Tool,
+    IntermediateToolResult, Message, Model, MountHierarchy, SystemPrompt, ThinkingConfig, Tool,
     ToolBash20250124, ToolCallback, ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728,
-    ToolUnionParam, ToolUseBlock,
+    ToolUnionParam, ToolUseBlock, Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -46,6 +47,7 @@ pub struct SidAgent {
     writable_roots: WritableRoots,
     filesystem: MountHierarchy,
     bash_session: Mutex<Option<BashPtySession>>,
+    token_usage_totals: StdMutex<TokenUsageTotals>,
 }
 
 impl SidAgent {
@@ -208,6 +210,7 @@ impl SidAgent {
             writable_roots,
             filesystem,
             bash_session: Mutex::new(None),
+            token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
         }
     }
 
@@ -423,6 +426,15 @@ impl Agent for SidAgent {
         Some(&self.filesystem)
     }
 
+    async fn hook_message(&self, resp: &Message) -> Result<(), Error> {
+        let totals = self.record_token_usage(resp.usage);
+        println!(
+            "[tokens: input={} cached_input={} output={}]",
+            totals.input, totals.cached_input, totals.output
+        );
+        Ok(())
+    }
+
     async fn text_editor(&self, tool_use: ToolUseBlock) -> Result<String, std::io::Error> {
         let Some(binding) = self.builtin_bindings.edit.as_ref() else {
             return self.default_text_editor(tool_use).await;
@@ -470,6 +482,44 @@ impl ChatAgent for SidAgent {
     fn config_mut(&mut self) -> &mut ChatConfig {
         &mut self.config
     }
+}
+
+impl SidAgent {
+    fn record_token_usage(&self, usage: Usage) -> TokenUsageTotals {
+        let mut totals = self
+            .token_usage_totals
+            .lock()
+            .expect("token usage totals lock poisoned");
+        totals.add(usage);
+        *totals
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TokenUsageTotals {
+    input: u64,
+    cached_input: u64,
+    output: u64,
+}
+
+impl TokenUsageTotals {
+    fn add(&mut self, usage: Usage) {
+        self.input = self.input.saturating_add(tokens_to_u64(usage.input_tokens));
+        self.cached_input = self
+            .cached_input
+            .saturating_add(optional_tokens_to_u64(usage.cache_read_input_tokens));
+        self.output = self
+            .output
+            .saturating_add(tokens_to_u64(usage.output_tokens));
+    }
+}
+
+fn tokens_to_u64(tokens: i32) -> u64 {
+    tokens.max(0) as u64
+}
+
+fn optional_tokens_to_u64(tokens: Option<i32>) -> u64 {
+    tokens.map(tokens_to_u64).unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1243,6 +1293,30 @@ mod tests {
         assert_eq!(parse_tool_confirmation("maybe"), None);
         assert_eq!(parse_tool_confirmation("yep"), None);
         assert_eq!(parse_tool_confirmation("nope"), None);
+    }
+
+    #[test]
+    fn token_usage_totals_accumulate_input_cached_input_and_output() {
+        let mut totals = TokenUsageTotals::default();
+        totals.add(Usage::new(10, 4).with_cache_read_input_tokens(6));
+        totals.add(Usage::new(20, 8).with_cache_read_input_tokens(7));
+
+        assert_eq!(
+            totals,
+            TokenUsageTotals {
+                input: 30,
+                cached_input: 13,
+                output: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn token_usage_totals_treat_negative_counts_as_zero() {
+        let mut totals = TokenUsageTotals::default();
+        totals.add(Usage::new(-10, -4).with_cache_read_input_tokens(-6));
+
+        assert_eq!(totals, TokenUsageTotals::default());
     }
 
     #[test]
@@ -2023,12 +2097,12 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Without support for cursor positioning.
     - With state persistence between invocations.
     - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
-    - Without /skills/ mounted.
-    - `restart` throws the session away and starts fresh.
+    - `restart: true` throws the session away and starts fresh.
     - Initial CWD is {}.
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
+    - Use the index to browse skills if you need specialized knowledge.
 "#,
             workspace_root, workspace_root
         )

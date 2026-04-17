@@ -72,17 +72,10 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "biometrics"
 version = "0.12.0"
-dependencies = [
- "sig_fig_histogram 0.6.0",
-]
-
-[[package]]
-name = "biometrics"
-version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45f7064e02662745f850952e2193fbb22ee2c9375b1e16b57978f46074f62473"
 dependencies = [
- "sig_fig_histogram 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sig_fig_histogram",
 ]
 
 [[package]]
@@ -144,13 +137,15 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "claudius"
-version = "0.19.0"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "892dc8421af802c388cddbff743ce3621b8653bb1a17a766a5288cd5fa544f5a"
 dependencies = [
  "arrrg",
  "arrrg_derive",
  "async-trait",
  "base64",
- "biometrics 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "biometrics",
  "bytes",
  "ctrlc",
  "futures",
@@ -529,9 +524,11 @@ dependencies = [
 
 [[package]]
 name = "handled"
-version = "0.5.0"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "862ed142dfca56613005423fd8ec8157086de057da3be5742948c7f39e084154"
 dependencies = [
- "biometrics 0.12.0",
+ "biometrics",
 ]
 
 [[package]]
@@ -1515,6 +1512,7 @@ dependencies = [
  "futures",
  "getopts",
  "handled",
+ "libc",
  "rc_conf",
  "rustyline",
  "serde",
@@ -1523,10 +1521,6 @@ dependencies = [
  "tokio",
  "utf8path",
 ]
-
-[[package]]
-name = "sig_fig_histogram"
-version = "0.6.0"
 
 [[package]]
 name = "sig_fig_histogram"

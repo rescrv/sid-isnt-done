@@ -128,6 +128,7 @@ pub(crate) async fn invoke_rc_tool_text(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .envs(&runtime.bindings)
+        .env("PAGER", "cat")
         .env("RCVAR_ARGV0", var_name_from_service(rc_service_name))
         .env("RC_CONF_PATH", &runtime.rc_conf_path)
         .env("RC_D_PATH", &runtime.rc_d_path)

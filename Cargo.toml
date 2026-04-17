@@ -6,9 +6,10 @@ edition = "2024"
 [dependencies]
 arrrg = "^0.8"
 async-trait = "0.1"
-claudius = { version = "0.19.0", path = "../claudius" }
+claudius = { version = "0.20.0" }
 ctrlc = { version = "3.5", features = ["termination"] }
-handled = { version = "0.5", path = "../blue/handled" }
+handled = { version = "0.6.0" }
+libc = "0.2"
 rc_conf = { version = "0.13.0", default-features = false }
 rustyline = "17.0"
 serde = { version = "1", features = ["derive"] }
