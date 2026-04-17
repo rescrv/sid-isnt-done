@@ -21,6 +21,10 @@ crossterm = { version = "0.27", features = ["event-stream"] }
 futures = "0.3"
 arrrg_derive = "0.8.0"
 getopts = "0.2.24"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-bash = "0.25"
 
 [[bin]]
 name = "sid"
@@ -33,3 +37,7 @@ path = "src/bin/sid-editor-tool.rs"
 [[bin]]
 name = "sid-seatbelt"
 path = "src/bin/sid-seatbelt.rs"
+
+[[bin]]
+name = "sidiff"
+path = "src/bin/sidiff.rs"

@@ -2,6 +2,7 @@ pub mod builtin_tools;
 pub mod config;
 mod filesystem;
 pub mod seatbelt;
+pub mod sidiff;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_protocol;
