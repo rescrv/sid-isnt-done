@@ -283,6 +283,7 @@ impl SidAgent {
             "SID_WORKSPACE_ROOT".to_string(),
             self.workspace_root.as_str().to_string(),
         );
+        env.insert("PAGER".to_string(), "cat".to_string());
         BashPtyConfig {
             cwd: PathBuf::from(self.workspace_root.as_str()),
             env,
