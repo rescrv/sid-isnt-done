@@ -1,14 +1,21 @@
 #!/bin/sh
 set -eu
 
+# This is a tool wrapper that implements the sid tool protocol.
+# It exports environment variables and delegates to sid-editor-tool.
+
 lookup() {
+    # Look up a variable in the environment, set by sid
     printenv "$1"
 }
 
+# RCVAR_ARGV0 is set by sid's tool runtime to create a unique prefix
+# for tool-specific environment variables
 PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
 
 case "${1:-}" in
 rcvar)
+    # Advertise which environment variables this tool needs from sid
     printf '%s\n' \
         "${PREFIX}_REQUEST_FILE" \
         "${PREFIX}_RESULT_FILE" \
@@ -22,8 +29,11 @@ rcvar)
         "${PREFIX}_RC_D_PATH"
     ;;
 confirm|run)
+    # confirm: Show a preview of the operation (for manual approval)
+    # run: Execute the operation and write result
     MODE="$1"
     shift
+    # Export all required variables in the sid tool protocol format
     export REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
     export RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
     export SCRATCH_DIR="$(lookup "${PREFIX}_SCRATCH_DIR")"
@@ -34,6 +44,7 @@ confirm|run)
     export TOOL_PROTOCOL="$(lookup "${PREFIX}_TOOL_PROTOCOL")"
     export RC_CONF_PATH="$(lookup "${PREFIX}_RC_CONF_PATH")"
     export RC_D_PATH="$(lookup "${PREFIX}_RC_D_PATH")"
+    # Delegate to the Rust implementation
     exec sid-editor-tool "$MODE" "$@"
     ;;
 *)
