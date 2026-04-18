@@ -2,6 +2,11 @@
 name = "sid-isnt-done"
 version = "0.1.0"
 edition = "2024"
+description = "sid is a UNIX-inspired coding agent for Anthropic-compatible APIs"
+license = "Apache-2.0"
+repository = "https://github.com/rescrv/sid-isnt-done"
+keywords = ["ai", "agent", "coding-assistant", "claude", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 arrrg = "^0.8"
