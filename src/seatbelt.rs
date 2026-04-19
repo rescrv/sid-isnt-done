@@ -5,7 +5,9 @@
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 /// Colon-separated list of directories that a sandboxed process may write to.
 ///
@@ -438,7 +440,24 @@ const POLICY_AFTER_WRITE_RULES: &str = r#"
 
 /// Returns `true` when macOS `sandbox-exec` is available.
 pub fn sandbox_available() -> bool {
-    Path::new(SANDBOX_EXEC).is_file()
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(sandbox_exec_accepts_policy)
+}
+
+fn sandbox_exec_accepts_policy() -> bool {
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return false;
+    }
+    Command::new(SANDBOX_EXEC)
+        .arg("-p")
+        .arg("(version 1)\n(allow default)\n")
+        .arg("/usr/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Resolve `DARWIN_USER_CACHE_DIR` for the current user.

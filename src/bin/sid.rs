@@ -15,7 +15,7 @@ use claudius::chat::{
 use claudius::{Agent, Renderer};
 use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
 
-use sid_isnt_done::{SidAgent, seatbelt};
+use sid_isnt_done::{SidAgent, seatbelt, session, session::SidSession};
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "You are sid, a concise coding agent with access to the current workspace mounted at /.\n",
@@ -76,16 +76,22 @@ async fn try_main() -> Result<(), SError> {
     })?
     .into_owned();
     let config_root = resolve_sid_home(&workspace_root)?;
+    let sid_session = Arc::new(SidSession::create(&config_root)?);
     // Set SID_WORKSPACE_ROOT for child processes spawned by tools. This is the
     // outer binary entrypoint, so process-global mutation is acceptable here.
     unsafe {
         std::env::set_var("SID_WORKSPACE_ROOT", workspace_root.as_str());
+        std::env::set_var(session::SID_SESSION_ID_ENV, sid_session.id());
+        std::env::set_var(session::SID_SESSION_DIR_ENV, sid_session.root());
+        std::env::set_var(session::SID_SESSIONS_ENV, sid_session.sessions_root());
     }
     let workspace_display = workspace_root.as_str().to_string();
+    let session_display = sid_session.root().display().to_string();
 
     warn_if_sandbox_unavailable();
 
-    let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?;
+    let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?
+        .with_session(sid_session);
     let agent_id = agent.id().to_string();
     if agent.requires_confirmation() && !confirm_manual_agent(&agent_id)? {
         println!("Aborted.");
@@ -135,6 +141,7 @@ async fn try_main() -> Result<(), SError> {
         session.config().model()
     );
     println!("workspace: {workspace_display}");
+    println!("session: {session_display}");
     println!("Type /help for commands, /quit to exit\n");
 
     loop {

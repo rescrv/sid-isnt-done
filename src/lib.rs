@@ -2,6 +2,7 @@ pub mod builtin_tools;
 pub mod config;
 mod filesystem;
 pub mod seatbelt;
+pub mod session;
 pub mod sidiff;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -32,6 +33,7 @@ use crate::config::{
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
 use crate::seatbelt::WritableRoots;
+use crate::session::SidSession;
 use crate::tool_runtime::ToolRuntimeContext;
 
 const DEFAULT_AGENT_ID: &str = "sid";
@@ -47,6 +49,7 @@ pub struct SidAgent {
     workspace_root: Path<'static>,
     writable_roots: WritableRoots,
     filesystem: MountHierarchy,
+    session: Option<Arc<SidSession>>,
     bash_session: Mutex<Option<BashPtySession>>,
     token_usage_totals: StdMutex<TokenUsageTotals>,
 }
@@ -73,6 +76,7 @@ impl SidAgent {
             workspace_root,
             writable_roots,
             filesystem,
+            None,
         )
     }
 
@@ -185,6 +189,7 @@ impl SidAgent {
             workspace_root,
             writable_roots,
             filesystem,
+            None,
         ))
     }
 
@@ -199,6 +204,7 @@ impl SidAgent {
         workspace_root: Path<'static>,
         writable_roots: WritableRoots,
         filesystem: MountHierarchy,
+        session: Option<Arc<SidSession>>,
     ) -> Self {
         Self {
             id,
@@ -210,9 +216,17 @@ impl SidAgent {
             workspace_root,
             writable_roots,
             filesystem,
+            session,
             bash_session: Mutex::new(None),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
         }
+    }
+
+    pub fn with_session(mut self, session: Arc<SidSession>) -> Self {
+        self.config.transcript_path = Some(session.transcript_path());
+        append_writable_root(&mut self.writable_roots, session.root());
+        self.session = Some(session);
+        self
     }
 
     async fn run_bash_command(
@@ -283,6 +297,28 @@ impl SidAgent {
             "SID_WORKSPACE_ROOT".to_string(),
             self.workspace_root.as_str().to_string(),
         );
+        if let Some(session) = self.session.as_ref() {
+            env.insert(
+                session::SID_SESSION_ID_ENV.to_string(),
+                session.id().to_string(),
+            );
+            env.insert(
+                session::SID_SESSION_DIR_ENV.to_string(),
+                session.root().to_string_lossy().into_owned(),
+            );
+            env.insert(
+                session::SID_SESSIONS_ENV.to_string(),
+                session.sessions_root().to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "TMPDIR".to_string(),
+                session
+                    .root()
+                    .join("bash-tmp")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         env.insert("PAGER".to_string(), "cat".to_string());
         BashPtyConfig {
             cwd: PathBuf::from(self.workspace_root.as_str()),
@@ -298,6 +334,7 @@ impl SidAgent {
             config_root: &self.config_root,
             workspace_root: &self.workspace_root,
             writable_roots: &self.writable_roots,
+            session: self.session.as_deref(),
         }
     }
 
@@ -454,11 +491,28 @@ impl Agent for SidAgent {
     }
 
     async fn hook_message(&self, resp: &Message) -> Result<(), Error> {
+        if let Some(session) = self.session.as_ref() {
+            session
+                .log_api_response(resp)
+                .map_err(|err| Error::unknown(format!("failed to log API response: {err}")))?;
+        }
         let totals = self.record_token_usage(resp.usage);
         println!(
             "[tokens: input={} cached_input={} output={}]",
             totals.input, totals.cached_input, totals.output
         );
+        Ok(())
+    }
+
+    async fn hook_message_create_params(
+        &self,
+        req: &claudius::MessageCreateParams,
+    ) -> Result<(), Error> {
+        if let Some(session) = self.session.as_ref() {
+            session
+                .log_api_request(req)
+                .map_err(|err| Error::unknown(format!("failed to log API request: {err}")))?;
+        }
         Ok(())
     }
 
@@ -772,6 +826,7 @@ async fn invoke_external_tool(
         config_root: &agent.config_root,
         workspace_root: &agent.workspace_root,
         writable_roots: &agent.writable_roots,
+        session: agent.session.as_deref(),
     };
     match tool_runtime::invoke_rc_tool_text(
         &tool.name,
@@ -903,6 +958,18 @@ fn default_writable_roots(workspace_root: &Path) -> WritableRoots {
         roots.push(s.to_string());
     }
     roots
+}
+
+fn append_writable_root(roots: &mut WritableRoots, root: &std::path::Path) {
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        if let Some(s) = canonical.to_str() {
+            roots.push(s.to_string());
+            return;
+        }
+    }
+    if let Some(s) = root.to_str() {
+        roots.push(s.to_string());
+    }
 }
 
 fn workspace_has_config(root: &Path) -> bool {
@@ -2002,6 +2069,14 @@ mod tests {
         assert_eq!(env["rc_d_path"], json!(root.join("tools").as_str()));
         let scratch_dir = env["scratch_dir"].as_str().unwrap();
         assert!(scratch_dir.starts_with('/'));
+        assert_eq!(
+            fs::read_to_string(PathBuf::from(scratch_dir).join("stdout.log")).unwrap(),
+            "stdout from tool\n"
+        );
+        assert_eq!(
+            fs::read_to_string(PathBuf::from(scratch_dir).join("stderr.log")).unwrap(),
+            "stderr from tool\n"
+        );
         assert!(
             env["request_file"]
                 .as_str()
@@ -2026,6 +2101,80 @@ mod tests {
         assert!(overlay.contains("format_TOOL_ID=fmt"));
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn tool_invocation_uses_ordered_session_dirs() {
+        let root = temp_config_root("agent");
+        write_sample_config_with_fmt_script(
+            &root,
+            &capturing_tool_script(
+                "tool result only",
+                "request-capture.json",
+                "env-capture.json",
+            ),
+        );
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+        let sid_session = Arc::new(SidSession::create_in(sessions_root.clone()).unwrap());
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(sid_session.clone());
+        let tool_config = config.tools.get("format").unwrap();
+        let exposed_name = exposed_tool_name("build", "format").unwrap();
+        let canonical_id = resolve_canonical_tool_id(&config.tools_rc_conf, "format").unwrap();
+        let tool = ExternalTool::from_config(exposed_name.clone(), canonical_id, tool_config);
+        let tool_use = ToolUseBlock::new(
+            "toolu_123",
+            exposed_name,
+            json!({ "paths": ["src/lib.rs"] }),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use));
+        assert_eq!(unwrap_success_text(result), "tool result only");
+
+        let request: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("request-capture.json").as_str()).unwrap(),
+        )
+        .unwrap();
+        let env: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("env-capture.json").as_str()).unwrap(),
+        )
+        .unwrap();
+        let scratch_dir = PathBuf::from(request["files"]["scratch_dir"].as_str().unwrap());
+        let temp_dir = PathBuf::from(request["files"]["temp_dir"].as_str().unwrap());
+        let tool_root = sid_session.root().join("tools").join(format!(
+            "000001-{}",
+            request["request_id"].as_str().unwrap()
+        ));
+
+        assert_eq!(scratch_dir, tool_root.join("scratch"));
+        assert_eq!(temp_dir, tool_root.join("tmp"));
+        assert_eq!(
+            request["files"]["result_file"],
+            json!(scratch_dir.join("result.json").to_string_lossy())
+        );
+        assert_eq!(env["scratch_dir"], json!(scratch_dir.to_string_lossy()));
+        assert_eq!(env["temp_dir"], json!(temp_dir.to_string_lossy()));
+        assert_eq!(env["tmpdir"], json!(temp_dir.to_string_lossy()));
+        assert_eq!(env["session_id"], json!(sid_session.id()));
+        assert_eq!(
+            env["session_dir"],
+            json!(sid_session.root().to_string_lossy())
+        );
+        assert_eq!(
+            fs::read_to_string(tool_root.join("stdout.log")).unwrap(),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(tool_root.join("stderr.log")).unwrap(),
+            ""
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
     }
 
     #[test]
@@ -2413,7 +2562,7 @@ format_ALIASES="fmt"
 
     fn capturing_tool_script(text: &str, request_capture: &str, env_capture: &str) -> String {
         format!(
-            "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\ncp \"$REQUEST_FILE\" \"$WORKSPACE_ROOT/{request_capture}\"\ncat >\"$WORKSPACE_ROOT/{env_capture}\" <<EOF\n{{\"protocol\":\"$TOOL_PROTOCOL\",\"request_file\":\"$REQUEST_FILE\",\"result_file\":\"$RESULT_FILE\",\"scratch_dir\":\"$SCRATCH_DIR\",\"workspace_root\":\"$WORKSPACE_ROOT\",\"agent_id\":\"$AGENT_ID\",\"tool_id\":\"$TOOL_ID\",\"tool_name\":\"$TOOL_NAME\",\"rc_conf_path\":\"$RC_CONF_PATH\",\"rc_d_path\":\"$RC_D_PATH\"}}\nEOF\ncat >\"$RESULT_FILE\" <<EOF\n{{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{{\"kind\":\"text\",\"text\":\"{text}\"}}}}\nEOF\n"
+            "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\ncp \"$REQUEST_FILE\" \"$WORKSPACE_ROOT/{request_capture}\"\ncat >\"$WORKSPACE_ROOT/{env_capture}\" <<EOF\n{{\"protocol\":\"$TOOL_PROTOCOL\",\"request_file\":\"$REQUEST_FILE\",\"result_file\":\"$RESULT_FILE\",\"scratch_dir\":\"$SCRATCH_DIR\",\"temp_dir\":\"$TEMP_DIR\",\"tmpdir\":\"$TMPDIR\",\"workspace_root\":\"$WORKSPACE_ROOT\",\"agent_id\":\"$AGENT_ID\",\"session_id\":\"$SESSION_ID\",\"session_dir\":\"$SESSION_DIR\",\"tool_id\":\"$TOOL_ID\",\"tool_name\":\"$TOOL_NAME\",\"rc_conf_path\":\"$RC_CONF_PATH\",\"rc_d_path\":\"$RC_D_PATH\"}}\nEOF\ncat >\"$RESULT_FILE\" <<EOF\n{{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{{\"kind\":\"text\",\"text\":\"{text}\"}}}}\nEOF\n"
         )
     }
 
@@ -2485,7 +2634,7 @@ format_ALIASES="fmt"
         fs::write(
             executable.as_str(),
             format!(
-                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nconfirm|run)\n    export TOOL_MODE=\"$1\"\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|confirm|run]\" >&2\n    exit 129\n    ;;\nesac\n",
+                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_TEMP_DIR\" \\\n        \"${{PREFIX}}_TMPDIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_SESSION_ID\" \\\n        \"${{PREFIX}}_SESSION_DIR\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nconfirm|run)\n    export TOOL_MODE=\"$1\"\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export TEMP_DIR=\"$(lookup \"${{PREFIX}}_TEMP_DIR\")\"\n    export TMPDIR=\"$(lookup \"${{PREFIX}}_TMPDIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export SESSION_ID=\"$(lookup \"${{PREFIX}}_SESSION_ID\")\"\n    export SESSION_DIR=\"$(lookup \"${{PREFIX}}_SESSION_DIR\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|confirm|run]\" >&2\n    exit 129\n    ;;\nesac\n",
                 shvar::quote_string(implementation.as_str())
             ),
         )

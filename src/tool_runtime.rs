@@ -5,6 +5,7 @@
 /// and reading back the result.
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::io::ErrorKind;
 use std::path::Path as StdPath;
 use std::path::PathBuf;
@@ -13,11 +14,13 @@ use std::time::Duration;
 
 use handled::SError;
 use rc_conf::{RcConf, var_name_from_service, var_prefix_from_service};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use utf8path::Path;
 
 use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
 use crate::seatbelt;
 use crate::seatbelt::WritableRoots;
+use crate::session::SidSession;
 use crate::tool_protocol::{
     ToolRequestAgent, ToolRequestEnvelope, ToolRequestFiles, ToolRequestInvocation,
     ToolRequestTool, ToolRequestWorkspace, create_tool_scratch_dir, extract_tool_output,
@@ -37,6 +40,8 @@ pub(crate) struct ToolRuntimeContext<'a> {
     pub(crate) workspace_root: &'a Path<'a>,
     /// Directories the sandboxed tool may write to.
     pub(crate) writable_roots: &'a WritableRoots,
+    /// Session artifact root for logs and ordered tool directories.
+    pub(crate) session: Option<&'a SidSession>,
 }
 
 #[derive(Debug)]
@@ -53,7 +58,12 @@ pub(crate) struct PreparedRcToolInvocation {
     executable_path: Path<'static>,
     workspace_root: Path<'static>,
     request_id: String,
+    tool_dir: PathBuf,
     result_file: PathBuf,
+    temp_dir: PathBuf,
+    session_id: Option<String>,
+    session_dir: Option<PathBuf>,
+    sessions_root: Option<PathBuf>,
     runtime: ToolRcRuntime,
 }
 
@@ -61,6 +71,7 @@ struct ToolOverlayContext<'a> {
     request_file: &'a StdPath,
     result_file: &'a StdPath,
     scratch_dir: &'a StdPath,
+    temp_dir: &'a StdPath,
     rc_conf_path: &'a str,
     rc_d_path: &'a str,
 }
@@ -100,12 +111,14 @@ pub(crate) fn prepare_rc_tool_invocation(
     input: serde_json::Map<String, serde_json::Value>,
 ) -> Result<PreparedRcToolInvocation, String> {
     let request_id = next_request_id();
-    let scratch_dir = create_tool_scratch_dir(&request_id).map_err(|err| {
+    let invocation_dirs = create_tool_invocation_dirs(context, &request_id).map_err(|err| {
         format!(
-            "tool '{}' failed to create scratch directory: {}",
+            "tool '{}' failed to create invocation directories: {}",
             display_name, err
         )
     })?;
+    let scratch_dir = invocation_dirs.scratch_dir;
+    let temp_dir = invocation_dirs.temp_dir;
     let request_file = scratch_dir.join("request.json");
     let result_file = scratch_dir.join("result.json");
 
@@ -128,6 +141,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         },
         files: ToolRequestFiles {
             scratch_dir: scratch_dir.to_string_lossy().into_owned(),
+            temp_dir: temp_dir.to_string_lossy().into_owned(),
             result_file: result_file.to_string_lossy().into_owned(),
         },
     };
@@ -147,6 +161,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         &request_file,
         &result_file,
         &scratch_dir,
+        &temp_dir,
     )
     .map_err(|err| {
         format!(
@@ -161,8 +176,41 @@ pub(crate) fn prepare_rc_tool_invocation(
         executable_path: executable_path.clone().into_owned(),
         workspace_root: context.workspace_root.clone().into_owned(),
         request_id,
+        tool_dir: invocation_dirs.root,
         result_file,
+        temp_dir,
+        session_id: context.session.map(|session| session.id().to_string()),
+        session_dir: context.session.map(|session| session.root().clone()),
+        sessions_root: context
+            .session
+            .map(|session| session.sessions_root().clone()),
         runtime,
+    })
+}
+
+fn create_tool_invocation_dirs(
+    context: &ToolRuntimeContext<'_>,
+    request_id: &str,
+) -> Result<crate::session::ToolInvocationDirs, SError> {
+    if let Some(session) = context.session {
+        return session.create_tool_invocation_dirs(request_id);
+    }
+
+    let scratch_dir = create_tool_scratch_dir(request_id)?;
+    let temp_dir = scratch_dir.join("tmp");
+    fs::create_dir_all(&temp_dir).map_err(|err| {
+        SError::new("tool-protocol")
+            .with_code("io_error")
+            .with_message("failed to create tool temporary directory")
+            .with_string_field("path", temp_dir.to_string_lossy().as_ref())
+            .with_string_field("request_id", request_id)
+            .with_string_field("cause", &err.to_string())
+    })?;
+    Ok(crate::session::ToolInvocationDirs {
+        sequence: 1,
+        root: scratch_dir.clone(),
+        scratch_dir,
+        temp_dir,
     })
 }
 
@@ -172,13 +220,37 @@ pub(crate) async fn run_prepared_rc_tool_text(
 ) -> Result<String, String> {
     clear_stale_result_file(prepared)?;
     let mut cmd = prepared_rc_tool_command(prepared, "run", writable_roots);
-    let status = cmd
+    let mut child = cmd
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| format!("tool '{}' failed to launch: {}", prepared.display_name, err))?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout should be piped before spawn");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr should be piped before spawn");
+    let stdout_task = tokio::spawn(tee_child_output(
+        stdout,
+        tokio::io::stdout(),
+        prepared.tool_dir.join("stdout.log"),
+    ));
+    let stderr_task = tokio::spawn(tee_child_output(
+        stderr,
+        tokio::io::stderr(),
+        prepared.tool_dir.join("stderr.log"),
+    ));
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| format!("tool '{}' failed to wait: {}", prepared.display_name, err))?;
+    await_output_log(prepared, "stdout", stdout_task).await?;
+    await_output_log(prepared, "stderr", stderr_task).await?;
     if !status.success() {
         return Err(format!(
             "tool '{}' exited with status {}",
@@ -220,6 +292,8 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
         )
     })?;
 
+    write_confirmation_log(prepared, "confirm.stdout.log", &output.stdout)?;
+    write_confirmation_log(prepared, "confirm.stderr.log", &output.stderr)?;
     if !output.status.success() {
         return Err(format!(
             "tool '{}' confirm exited with status {}",
@@ -239,6 +313,60 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
     Ok(preview)
 }
 
+async fn tee_child_output<R, W>(mut reader: R, mut terminal: W, log_path: PathBuf) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut log = tokio::fs::File::create(log_path).await?;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        log.write_all(&buffer[..read]).await?;
+        terminal.write_all(&buffer[..read]).await?;
+        terminal.flush().await?;
+    }
+    log.flush().await?;
+    Ok(())
+}
+
+async fn await_output_log(
+    prepared: &PreparedRcToolInvocation,
+    stream: &str,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+) -> Result<(), String> {
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!(
+            "tool '{}' failed to log {}: {}",
+            prepared.display_name, stream, err
+        )),
+        Err(err) => Err(format!(
+            "tool '{}' failed to join {} logger: {}",
+            prepared.display_name, stream, err
+        )),
+    }
+}
+
+fn write_confirmation_log(
+    prepared: &PreparedRcToolInvocation,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let path = prepared.tool_dir.join(filename);
+    fs::write(&path, bytes).map_err(|err| {
+        format!(
+            "tool '{}' failed to write {}: {}",
+            prepared.display_name,
+            path.display(),
+            err
+        )
+    })
+}
+
 fn prepared_rc_tool_command(
     prepared: &PreparedRcToolInvocation,
     subcommand: &str,
@@ -251,6 +379,9 @@ fn prepared_rc_tool_command(
     );
     cmd.current_dir(prepared.workspace_root.as_str())
         .envs(&prepared.runtime.bindings)
+        .env("TMPDIR", &prepared.temp_dir)
+        .env("TEMP", &prepared.temp_dir)
+        .env("TMP", &prepared.temp_dir)
         .env("PAGER", "cat")
         .env(
             "RCVAR_ARGV0",
@@ -258,6 +389,15 @@ fn prepared_rc_tool_command(
         )
         .env("RC_CONF_PATH", &prepared.runtime.rc_conf_path)
         .env("RC_D_PATH", &prepared.runtime.rc_d_path);
+    if let Some(session_id) = prepared.session_id.as_ref() {
+        cmd.env(crate::session::SID_SESSION_ID_ENV, session_id);
+    }
+    if let Some(session_dir) = prepared.session_dir.as_ref() {
+        cmd.env(crate::session::SID_SESSION_DIR_ENV, session_dir);
+    }
+    if let Some(sessions_root) = prepared.sessions_root.as_ref() {
+        cmd.env(crate::session::SID_SESSIONS_ENV, sessions_root);
+    }
     cmd
 }
 
@@ -280,6 +420,7 @@ fn prepare_tool_rc_runtime(
     request_file: &StdPath,
     result_file: &StdPath,
     scratch_dir: &StdPath,
+    temp_dir: &StdPath,
 ) -> Result<ToolRcRuntime, SError> {
     let tools_conf_path = context.config_root.join(TOOLS_CONF_FILE);
     let rc_d_path = context.config_root.join(TOOLS_DIR);
@@ -305,6 +446,7 @@ fn prepare_tool_rc_runtime(
         request_file,
         result_file,
         scratch_dir,
+        temp_dir,
         rc_conf_path: &rc_conf_path,
         rc_d_path: &rc_d_path,
     };
@@ -351,8 +493,13 @@ fn render_tool_rc_overlay(
     let request_file = overlay_context.request_file.to_string_lossy().into_owned();
     let result_file = overlay_context.result_file.to_string_lossy().into_owned();
     let scratch_dir = overlay_context.scratch_dir.to_string_lossy().into_owned();
+    let temp_dir = overlay_context.temp_dir.to_string_lossy().into_owned();
     let workspace_root = context.workspace_root.as_str().to_string();
     let tool_protocol = TOOL_PROTOCOL_VERSION.to_string();
+    let session_id = context.session.map(SidSession::id);
+    let session_dir = context
+        .session
+        .map(|session| session.root().to_string_lossy().into_owned());
     let mut overlay = String::new();
 
     for service in services {
@@ -364,11 +511,19 @@ fn render_tool_rc_overlay(
         );
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}RESULT_FILE"), &result_file);
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}SCRATCH_DIR"), &scratch_dir);
+        append_rc_conf_assignment(&mut overlay, &format!("{prefix}TEMP_DIR"), &temp_dir);
+        append_rc_conf_assignment(&mut overlay, &format!("{prefix}TMPDIR"), &temp_dir);
         append_rc_conf_assignment(
             &mut overlay,
             &format!("{prefix}WORKSPACE_ROOT"),
             &workspace_root,
         );
+        if let Some(session_id) = session_id {
+            append_rc_conf_assignment(&mut overlay, &format!("{prefix}SESSION_ID"), session_id);
+        }
+        if let Some(session_dir) = session_dir.as_ref() {
+            append_rc_conf_assignment(&mut overlay, &format!("{prefix}SESSION_DIR"), session_dir);
+        }
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}AGENT_ID"), context.agent_id);
         append_rc_conf_assignment(
             &mut overlay,

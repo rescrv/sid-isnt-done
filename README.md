@@ -376,13 +376,15 @@ run)
 esac
 ```
 
-For each tool call, `sid` creates a fresh scratch directory under the system
-temporary directory, writes `request.json`, writes an rc-conf overlay, invokes
-`tools/<id> run`, then reads `result.json`.  The tool process runs with the
-workspace root as its current directory and inherits standard input, standard
-output, and standard error.  Tool processes are not chrooted; host `/` is still
-the process root unless the operating system or sandbox policy denies a
-particular operation.
+Each `sid` process creates a UUID-named session directory under
+`${SID_SESSIONS:-${SID_HOME}/sessions}`.  For each tool call, `sid` creates a
+fresh ordered directory under `<session>/tools/`, writes `request.json`, writes
+an rc-conf overlay, invokes `tools/<id> run`, then reads `result.json`.  The
+tool process runs with the workspace root as its current directory, receives a
+per-invocation `TMPDIR`, and inherits standard input, standard output, and
+standard error.  Tool processes are not chrooted; host `/` is still the process
+root unless the operating system or sandbox policy denies a particular
+operation.
 
 For `MANUAL` tools with `<tool>_CONFIRM=YES`, `sid` prepares the same request
 and overlay, invokes `tools/<id> confirm`, captures its stdout as preview text,
@@ -413,8 +415,9 @@ The request file has this shape:
     "cwd": "/abs/workspace"
   },
   "files": {
-    "scratch_dir": "/tmp/sid-tool/sidreq_123",
-    "result_file": "/tmp/sid-tool/sidreq_123/result.json"
+    "scratch_dir": "/sid/sessions/uuid/tools/000001-sidreq_123/scratch",
+    "temp_dir": "/sid/sessions/uuid/tools/000001-sidreq_123/tmp",
+    "result_file": "/sid/sessions/uuid/tools/000001-sidreq_123/scratch/result.json"
   }
 }
 ```
@@ -465,6 +468,17 @@ Protocol rules:
 : Configuration root.  If unset or empty, the current working directory is
   used.
 
+`SID_SESSIONS`
+: Session directory root.  If unset or empty, `sid` stores sessions under
+  `${SID_HOME}/sessions`.
+
+`SID_SESSION_ID`
+: UUID for the current `sid` process.  Set by `sid` for child processes.
+
+`SID_SESSION_DIR`
+: Absolute or configured path to the current session directory.  Set by `sid`
+  for child processes.
+
 `SID_SKILLS_PATH`
 : Colon-separated list of directories to scan for `*/SKILL.md`.  If unset,
   `sid` scans `skills/` under the configuration root.
@@ -489,7 +503,11 @@ service's prefix:
 <tool>_REQUEST_FILE
 <tool>_RESULT_FILE
 <tool>_SCRATCH_DIR
+<tool>_TEMP_DIR
+<tool>_TMPDIR
 <tool>_WORKSPACE_ROOT
+<tool>_SESSION_ID
+<tool>_SESSION_DIR
 <tool>_AGENT_ID
 <tool>_TOOL_ID
 <tool>_TOOL_NAME
@@ -506,9 +524,9 @@ Aliases get their own prefix.  If the model invokes `format`, the tool reads
 On macOS, `sid` wraps bash and external tool processes with
 `/usr/bin/sandbox-exec` when it is available.  This is a sandbox wrapper, not a
 chroot: processes still see host `/`.  The generated policy allows full
-filesystem reads, writes to the workspace and the system temporary directory,
-and loopback networking.  On systems without `sandbox-exec`, commands run
-without this wrapper.
+filesystem reads, writes to the workspace, session directory, and system
+temporary directory, and loopback networking.  On systems without
+`sandbox-exec`, commands run without this wrapper.
 
 `sid-seatbelt` is a helper for running an arbitrary command under the same
 macOS Seatbelt policy:
@@ -537,9 +555,19 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 `skills/<skill>/SKILL.md`
 : Optional skill document mounted read-only under `/skills/<skill>/`.
 
-`/tmp/sid-tool/sidreq_*`
-: Per-call scratch directories on typical Unix systems.  The exact parent is
-  the platform's system temporary directory.
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/session.json`
+: Session metadata.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/transcript.json`
+: Auto-saved chat transcript.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/api/`
+: Ordered API request and response JSON logs.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tools/000001-*/`
+: Per-call tool directories.  Each directory contains `scratch/` for protocol
+  files, `tmp/` as that tool process's `TMPDIR`, and stdout/stderr logs for
+  the tool process.
 
 ## TROUBLESHOOTING
 

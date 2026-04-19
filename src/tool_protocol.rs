@@ -71,6 +71,8 @@ pub struct ToolRequestWorkspace {
 pub struct ToolRequestFiles {
     /// Temporary directory for this invocation.
     pub scratch_dir: String,
+    /// Process temporary directory for this invocation.
+    pub temp_dir: String,
     /// Path where the tool must write its result JSON.
     pub result_file: String,
 }
