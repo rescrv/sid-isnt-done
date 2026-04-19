@@ -18,9 +18,9 @@ use std::sync::Mutex as StdMutex;
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
     Agent, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error, FileSystem,
-    IntermediateToolResult, Message, Model, MountHierarchy, SystemPrompt, ThinkingConfig, Tool,
-    ToolBash20250124, ToolCallback, ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728,
-    ToolUnionParam, ToolUseBlock, Usage,
+    IntermediateToolResult, Message, Metadata, Model, MountHierarchy, SystemPrompt, ThinkingConfig,
+    Tool, ToolBash20250124, ToolCallback, ToolChoice, ToolParam, ToolResult, ToolResultBlock,
+    ToolTextEditor20250728, ToolUnionParam, ToolUseBlock, Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -452,6 +452,10 @@ impl Agent for SidAgent {
         self.config.model()
     }
 
+    async fn metadata(&self) -> Option<Metadata> {
+        self.config.template.metadata.clone()
+    }
+
     async fn stop_sequences(&self) -> Option<Vec<String>> {
         let sequences = self.config.stop_sequences();
         if sequences.is_empty() {
@@ -466,12 +470,20 @@ impl Agent for SidAgent {
         Some(prompt.clone())
     }
 
+    fn caching_enabled(&self) -> bool {
+        self.config.caching_enabled
+    }
+
     async fn temperature(&self) -> Option<f32> {
         self.config.template.temperature
     }
 
     async fn thinking(&self) -> Option<ThinkingConfig> {
         self.config.template.thinking
+    }
+
+    async fn tool_choice(&self) -> Option<ToolChoice> {
+        self.config.template.tool_choice.clone()
     }
 
     async fn tools(&self) -> Vec<Arc<dyn Tool<Self>>> {
@@ -501,6 +513,7 @@ impl Agent for SidAgent {
             "[tokens: input={} cached_input={} output={}]",
             totals.input, totals.cached_input, totals.output
         );
+        println!("[usage: {:?}]", resp.usage);
         Ok(())
     }
 
@@ -1421,6 +1434,26 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         assert!(runtime.block_on(agent.tools()).is_empty());
         assert!(!agent.requires_confirmation());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn agent_create_request_forwards_chat_config_request_fields() {
+        let root = unique_temp_dir("agent-request");
+        fs::create_dir_all(root.as_str()).unwrap();
+
+        let mut config = ChatConfig::new();
+        config.template.metadata = Some(Metadata::with_user_id("opaque-user"));
+        config.template.tool_choice = Some(ToolChoice::none());
+        let agent = SidAgent::new(config, root.clone());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let req = runtime.block_on(agent.create_request(123, vec![], false));
+
+        assert!(req.cache_control.is_some());
+        assert_eq!(req.metadata, Some(Metadata::with_user_id("opaque-user")));
+        assert_eq!(req.tool_choice, Some(ToolChoice::none()));
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
