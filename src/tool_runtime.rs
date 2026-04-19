@@ -412,6 +412,7 @@ fn clear_stale_result_file(prepared: &PreparedRcToolInvocation) -> Result<(), St
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_tool_rc_runtime(
     display_name: &str,
     rc_service_name: &str,

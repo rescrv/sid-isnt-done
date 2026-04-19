@@ -10,6 +10,8 @@ mod tool_protocol;
 mod tool_runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -974,11 +976,11 @@ fn default_writable_roots(workspace_root: &Path) -> WritableRoots {
 }
 
 fn append_writable_root(roots: &mut WritableRoots, root: &std::path::Path) {
-    if let Ok(canonical) = std::fs::canonicalize(root) {
-        if let Some(s) = canonical.to_str() {
-            roots.push(s.to_string());
-            return;
-        }
+    if let Ok(canonical) = std::fs::canonicalize(root)
+        && let Some(s) = canonical.to_str()
+    {
+        roots.push(s.to_string());
+        return;
     }
     if let Some(s) = root.to_str() {
         roots.push(s.to_string());
@@ -1174,6 +1176,17 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
     - Use the index to browse skills if you need specialized knowledge.
+
+CRITICAL — the edit tool and bash tool use different path namespaces:
+- The edit tool's / is the workspace root ({workspace_root}).
+  To edit a file at the workspace root, use /filename (e.g., /src/lib.rs).
+  NEVER pass a full host path to the edit tool.
+- Bash sees the real host filesystem.  `pwd` prints {workspace_root}, not /.
+  To convert a bash path to an edit path, strip the {workspace_root} prefix.
+  To convert an edit path to a bash path, prepend {workspace_root}.
+  If bash `pwd` is a subdirectory, a relative path like ./foo.rs in bash
+  corresponds to stripping the workspace prefix from the absolute bash path.
+- Example: the bash path {workspace_root}/src/lib.rs is the edit path /src/lib.rs.
 "#,
     );
 
@@ -2435,8 +2448,25 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
     - Use the index to browse skills if you need specialized knowledge.
+
+CRITICAL — the edit tool and bash tool use different path namespaces:
+- The edit tool's / is the workspace root ({}).
+  To edit a file at the workspace root, use /filename (e.g., /src/lib.rs).
+  NEVER pass a full host path to the edit tool.
+- Bash sees the real host filesystem.  `pwd` prints {}, not /.
+  To convert a bash path to an edit path, strip the {} prefix.
+  To convert an edit path to a bash path, prepend {}.
+  If bash `pwd` is a subdirectory, a relative path like ./foo.rs in bash
+  corresponds to stripping the workspace prefix from the absolute bash path.
+- Example: the bash path {}/src/lib.rs is the edit path /src/lib.rs.
 "#,
-            workspace_root, workspace_root
+            workspace_root,
+            workspace_root,
+            workspace_root,
+            workspace_root,
+            workspace_root,
+            workspace_root,
+            workspace_root
         )
     }
 
