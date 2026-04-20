@@ -270,6 +270,7 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
 
     let readonly_roots = WritableRoots::default();
     let mut cmd = prepared_rc_tool_command(prepared, "confirm", &readonly_roots);
+    cmd.kill_on_drop(true);
     let output = tokio::time::timeout(
         CONFIRM_TIMEOUT,
         cmd.stdin(Stdio::null())
