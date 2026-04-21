@@ -2297,6 +2297,96 @@ mod tests {
     }
 
     #[test]
+    fn builtin_bash_tool_restart_resets_shell_state() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_root = Path::try_from(
+            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
+        )
+        .expect("canonical root path should be valid UTF-8")
+        .into_owned();
+        let canonical_agents = Path::try_from(
+            fs::canonicalize(root.join("agents").as_str())
+                .expect("canonicalize agents directory should succeed"),
+        )
+        .expect("canonical agents path should be valid UTF-8")
+        .into_owned();
+
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let initialized = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_1",
+            json!({
+                "command": "export FOO=bar\ncd agents",
+                "restart": true
+            }),
+        );
+        assert_eq!(
+            unwrap_success_block(initialized),
+            ToolResultBlock {
+                tool_use_id: "toolu_bash_1".to_string(),
+                cache_control: None,
+                content: Some(ToolResultBlockContent::String("success\n".to_string())),
+                is_error: None,
+            }
+        );
+
+        let persisted = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_2",
+            json!({
+                "command": "printf '%s:%s' \"$FOO\" \"$PWD\"",
+                "restart": false
+            }),
+        );
+        assert_eq!(
+            unwrap_success_block(persisted),
+            ToolResultBlock {
+                tool_use_id: "toolu_bash_2".to_string(),
+                cache_control: None,
+                content: Some(ToolResultBlockContent::String(format!(
+                    "bar:{}",
+                    canonical_agents.as_str()
+                ))),
+                is_error: None,
+            }
+        );
+
+        let restarted = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_3",
+            json!({
+                "command": "printf '%s:%s' \"${FOO-unset}\" \"$PWD\"",
+                "restart": true
+            }),
+        );
+        assert_eq!(
+            unwrap_success_block(restarted),
+            ToolResultBlock {
+                tool_use_id: "toolu_bash_3".to_string(),
+                cache_control: None,
+                content: Some(ToolResultBlockContent::String(format!(
+                    "unset:{}",
+                    canonical_root.as_str()
+                ))),
+                is_error: None,
+            }
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn two_agents_with_different_workspace_roots_have_no_crosstalk() {
         let root_a = temp_config_root("agent-a");
         let root_b = temp_config_root("agent-b");
@@ -2907,9 +2997,34 @@ format_ALIASES="fmt"
         runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use, None))
     }
 
+    fn invoke_bash_tool(
+        runtime: &tokio::runtime::Runtime,
+        client: &Anthropic,
+        agent: &mut SidAgent,
+        tool_use_id: &str,
+        input: serde_json::Value,
+    ) -> ToolResult {
+        let tool = runtime
+            .block_on(agent.tools())
+            .into_iter()
+            .find(|tool| tool.name() == "bash")
+            .expect("agent should expose the builtin bash tool");
+        let tool_use = ToolUseBlock::new(tool_use_id, "bash", input);
+        let callback = tool.callback();
+        let intermediate = runtime.block_on(callback.compute_tool_result(client, agent, &tool_use));
+        runtime.block_on(callback.apply_tool_result(client, agent, &tool_use, intermediate))
+    }
+
     fn unwrap_success_text(result: ToolResult) -> String {
         match result {
             ControlFlow::Continue(Ok(block)) => tool_block_text(block),
+            other => panic!("expected successful tool result, got {other:?}"),
+        }
+    }
+
+    fn unwrap_success_block(result: ToolResult) -> ToolResultBlock {
+        match result {
+            ControlFlow::Continue(Ok(block)) => block,
             other => panic!("expected successful tool result, got {other:?}"),
         }
     }
