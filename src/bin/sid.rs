@@ -12,8 +12,8 @@ use claudius::chat::{
     ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, help_text,
     parse_command,
 };
-use claudius::{Agent, Renderer};
 use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
+use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::{SidAgent, seatbelt, session, session::SidSession};
 
@@ -28,6 +28,112 @@ const SANDBOX_UNAVAILABLE_WARNING: &str = concat!(
     "!! WARNING: sid will run bash and external tools UNSANDBOXED.\n",
     "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
 );
+
+struct SidTerminal {
+    editor: DefaultEditor,
+    renderer: PlainTextRenderer,
+}
+
+impl SidTerminal {
+    fn new(use_color: bool, interrupted: Arc<AtomicBool>) -> Result<Self, SError> {
+        let editor = DefaultEditor::new().map_err(|err| {
+            cli_error(
+                "readline_init_failed",
+                "failed to initialize the terminal editor",
+            )
+            .with_string_field("cause", &err.to_string())
+        })?;
+        Ok(Self {
+            editor,
+            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+        })
+    }
+
+    fn read_line(&mut self, prompt: &str) -> io::Result<OperatorLine> {
+        match self.editor.readline(prompt) {
+            Ok(line) => Ok(OperatorLine::Line(line)),
+            Err(ReadlineError::Interrupted) => Ok(OperatorLine::Interrupted),
+            Err(ReadlineError::Eof) => Ok(OperatorLine::Eof),
+            Err(err) => Err(io::Error::other(err.to_string())),
+        }
+    }
+
+    fn add_history_entry(&mut self, line: &str) {
+        let _ = self.editor.add_history_entry(line);
+    }
+}
+
+impl Renderer for SidTerminal {
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.renderer.start_agent(context);
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.renderer.finish_agent(context, stop_reason);
+    }
+
+    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_text(context, text);
+    }
+
+    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_thinking(context, text);
+    }
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.renderer.print_error(context, error);
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.renderer.print_info(context, info);
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.renderer.start_tool_use(context, name, id);
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.renderer.print_tool_input(context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_use(context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.renderer
+            .start_tool_result(context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_tool_result_text(context, text);
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_result(context);
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_response(context);
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.renderer.print_interrupted(context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.renderer.should_interrupt()
+    }
+
+    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
+        self.read_line(prompt).map(Some)
+    }
+}
 
 #[derive(arrrg_derive::CommandLine, Debug, Default, PartialEq, Eq)]
 struct SidArgs {
@@ -93,16 +199,27 @@ async fn try_main() -> Result<(), SError> {
     let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?
         .with_session(sid_session);
     let agent_id = agent.id().to_string();
-    if agent.requires_confirmation() && !confirm_manual_agent(&agent_id)? {
+    let use_color = agent.config().use_color;
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut terminal = SidTerminal::new(use_color, interrupted.clone())?;
+    let context = ();
+
+    if agent.requires_confirmation() && !confirm_manual_agent(&mut terminal, &agent_id)? {
         println!("Aborted.");
         return Ok(());
     }
 
     if let Some(command) = bash_debug {
-        return run_bash_debug(&agent, &agent_id, &workspace_display, &command).await;
+        return run_bash_debug(
+            &agent,
+            &agent_id,
+            &workspace_display,
+            &command,
+            &mut terminal,
+        )
+        .await;
     }
-
-    let use_color = agent.config().use_color;
 
     let client = Anthropic::new(None).map_err(|err| {
         cli_error(
@@ -112,17 +229,6 @@ async fn try_main() -> Result<(), SError> {
         .with_string_field("cause", &err.to_string())
     })?;
     let mut session = ChatSession::with_agent(client, agent);
-    let mut rl = DefaultEditor::new().map_err(|err| {
-        cli_error(
-            "readline_init_failed",
-            "failed to initialize the terminal editor",
-        )
-        .with_string_field("cause", &err.to_string())
-    })?;
-
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let mut renderer = PlainTextRenderer::with_color_and_interrupt(use_color, interrupted.clone());
-    let context = ();
 
     let interrupted_clone = interrupted.clone();
     ctrlc::set_handler(move || {
@@ -147,16 +253,14 @@ async fn try_main() -> Result<(), SError> {
     loop {
         interrupted.store(false, Ordering::Relaxed);
 
-        let readline = rl.readline("You: ");
-
-        match readline {
-            Ok(line) => {
+        match terminal.read_line("You: ") {
+            Ok(OperatorLine::Line(line)) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
 
-                let _ = rl.add_history_entry(line);
+                terminal.add_history_entry(line);
 
                 if let Some(cmd) = parse_command(line) {
                     match cmd {
@@ -166,7 +270,7 @@ async fn try_main() -> Result<(), SError> {
                         }
                         ChatCommand::Clear => {
                             session.clear();
-                            renderer.print_info(&context, "Conversation cleared.");
+                            terminal.print_info(&context, "Conversation cleared.");
                         }
                         ChatCommand::Help => {
                             for line in help_text().lines() {
@@ -178,47 +282,47 @@ async fn try_main() -> Result<(), SError> {
                                 .parse()
                                 .unwrap_or_else(|_| Model::Custom(model_name.clone()));
                             session.template_mut().model = Some(model);
-                            renderer
+                            terminal
                                 .print_info(&context, &format!("Model changed to: {model_name}"));
                         }
                         ChatCommand::System(prompt) => {
                             session.template_mut().system = prompt.clone().map(SystemPrompt::from);
                             match prompt {
-                                Some(prompt) => renderer.print_info(
+                                Some(prompt) => terminal.print_info(
                                     &context,
                                     &format!("System prompt set to: {prompt}"),
                                 ),
-                                None => renderer.print_info(&context, "System prompt cleared."),
+                                None => terminal.print_info(&context, "System prompt cleared."),
                             }
                         }
                         ChatCommand::MaxTokens(value) => {
                             session.template_mut().max_tokens = Some(value);
-                            renderer.print_info(&context, &format!("max_tokens set to {value}"));
+                            terminal.print_info(&context, &format!("max_tokens set to {value}"));
                         }
                         ChatCommand::Temperature(value) => {
                             session.template_mut().temperature = Some(value);
-                            renderer
+                            terminal
                                 .print_info(&context, &format!("temperature set to {value:.2}"));
                         }
                         ChatCommand::ClearTemperature => {
                             session.template_mut().temperature = None;
-                            renderer.print_info(&context, "temperature reset to model default");
+                            terminal.print_info(&context, "temperature reset to model default");
                         }
                         ChatCommand::TopP(value) => {
                             session.template_mut().top_p = Some(value);
-                            renderer.print_info(&context, &format!("top_p set to {value:.2}"));
+                            terminal.print_info(&context, &format!("top_p set to {value:.2}"));
                         }
                         ChatCommand::ClearTopP => {
                             session.template_mut().top_p = None;
-                            renderer.print_info(&context, "top_p reset to model default");
+                            terminal.print_info(&context, "top_p reset to model default");
                         }
                         ChatCommand::TopK(value) => {
                             session.template_mut().top_k = Some(value);
-                            renderer.print_info(&context, &format!("top_k set to {value}"));
+                            terminal.print_info(&context, &format!("top_k set to {value}"));
                         }
                         ChatCommand::ClearTopK => {
                             session.template_mut().top_k = None;
-                            renderer.print_info(&context, "top_k reset to model default");
+                            terminal.print_info(&context, "top_k reset to model default");
                         }
                         ChatCommand::AddStopSequence(sequence) => {
                             let stop_sequences = session
@@ -228,12 +332,12 @@ async fn try_main() -> Result<(), SError> {
                             if !stop_sequences.iter().any(|existing| existing == &sequence) {
                                 stop_sequences.push(sequence.clone());
                             }
-                            renderer
+                            terminal
                                 .print_info(&context, &format!("Added stop sequence: {sequence}"));
                         }
                         ChatCommand::ClearStopSequences => {
                             session.template_mut().stop_sequences = None;
-                            renderer.print_info(&context, "Stop sequences cleared.");
+                            terminal.print_info(&context, "Stop sequences cleared.");
                         }
                         ChatCommand::ListStopSequences => {
                             let sequences =
@@ -243,7 +347,7 @@ async fn try_main() -> Result<(), SError> {
                         ChatCommand::Thinking(budget) => {
                             session.template_mut().thinking = budget.map(ThinkingConfig::enabled);
                             match budget {
-                                Some(tokens) => renderer.print_info(
+                                Some(tokens) => terminal.print_info(
                                     &context,
                                     &format!(
                                         "Extended thinking enabled with {} token budget.",
@@ -251,41 +355,41 @@ async fn try_main() -> Result<(), SError> {
                                     ),
                                 ),
                                 None => {
-                                    renderer.print_info(&context, "Extended thinking disabled.");
+                                    terminal.print_info(&context, "Extended thinking disabled.");
                                 }
                             }
                         }
                         ChatCommand::Budget(_tokens) => {
-                            renderer.print_error(&context, "budget not supported");
+                            terminal.print_error(&context, "budget not supported");
                         }
                         ChatCommand::ClearBudget => {
                             session.config_mut().session_budget = None;
-                            renderer.print_info(&context, "Session budget cleared.");
+                            terminal.print_info(&context, "Session budget cleared.");
                         }
                         ChatCommand::Caching(enabled) => {
                             session.config_mut().caching_enabled = enabled;
                             if enabled {
-                                renderer.print_info(&context, "Prompt caching enabled.");
+                                terminal.print_info(&context, "Prompt caching enabled.");
                             } else {
-                                renderer.print_info(&context, "Prompt caching disabled.");
+                                terminal.print_info(&context, "Prompt caching disabled.");
                             }
                         }
                         ChatCommand::TranscriptPath(path) => {
                             session.config_mut().transcript_path = Some(path.clone().into());
-                            renderer.print_info(
+                            terminal.print_info(
                                 &context,
                                 &format!("Transcript auto-save set to {path}"),
                             );
                         }
                         ChatCommand::ClearTranscriptPath => {
                             session.config_mut().transcript_path = None;
-                            renderer.print_info(&context, "Transcript auto-save disabled.");
+                            terminal.print_info(&context, "Transcript auto-save disabled.");
                         }
                         ChatCommand::SaveTranscript(path) => {
                             match session.save_transcript_to(&path) {
-                                Ok(()) => renderer
+                                Ok(()) => terminal
                                     .print_info(&context, &format!("Transcript saved to {path}")),
-                                Err(err) => renderer.print_error(
+                                Err(err) => terminal.print_error(
                                     &context,
                                     &format!("Failed to save transcript: {err}"),
                                 ),
@@ -293,11 +397,11 @@ async fn try_main() -> Result<(), SError> {
                         }
                         ChatCommand::LoadTranscript(path) => {
                             match session.load_transcript_from(&path) {
-                                Ok(()) => renderer.print_info(
+                                Ok(()) => terminal.print_info(
                                     &context,
                                     &format!("Transcript loaded from {path}"),
                                 ),
-                                Err(err) => renderer.print_error(
+                                Err(err) => terminal.print_error(
                                     &context,
                                     &format!("Failed to load transcript: {err}"),
                                 ),
@@ -310,27 +414,27 @@ async fn try_main() -> Result<(), SError> {
                             print_config(&session);
                         }
                         ChatCommand::Invalid(message) => {
-                            renderer.print_error(&context, &message);
+                            terminal.print_error(&context, &message);
                         }
                     }
                     continue;
                 }
 
                 let message = claudius::MessageParam::user(line);
-                if let Err(err) = session.send_message(message, &mut renderer).await {
-                    renderer.print_error(&context, &err.to_string());
+                if let Err(err) = session.send_message(message, &mut terminal).await {
+                    terminal.print_error(&context, &err.to_string());
                 }
             }
-            Err(ReadlineError::Interrupted) => {
+            Ok(OperatorLine::Interrupted) => {
                 println!();
                 continue;
             }
-            Err(ReadlineError::Eof) => {
+            Ok(OperatorLine::Eof) => {
                 println!("\nGoodbye!");
                 break;
             }
             Err(err) => {
-                renderer.print_error(&context, &format!("Input error: {err}"));
+                terminal.print_error(&context, &format!("Input error: {err}"));
                 break;
             }
         }
@@ -360,11 +464,12 @@ async fn run_bash_debug(
     agent_id: &str,
     workspace_display: &str,
     command: &str,
+    terminal: &mut SidTerminal,
 ) -> Result<(), SError> {
     eprintln!("sid bash debug (agent: {agent_id})");
     eprintln!("workspace: {workspace_display}");
 
-    match agent.bash(command, false).await {
+    match agent.bash_with_renderer(command, false, terminal).await {
         Ok(output) => {
             print!("{output}");
             if !output.ends_with('\n') {
@@ -408,29 +513,20 @@ fn resolve_sid_home(workspace_root: &Path) -> Result<Path<'static>, SError> {
     }
 }
 
-fn confirm_manual_agent(agent_id: &str) -> Result<bool, SError> {
-    let mut input = String::new();
+fn confirm_manual_agent(terminal: &mut SidTerminal, agent_id: &str) -> Result<bool, SError> {
     loop {
-        print!("Agent '{agent_id}' is MANUAL. Continue? [yes/no]: ");
-        io::stdout().flush().map_err(|err| {
-            cli_error(
-                "io_error",
-                "failed to flush manual-agent confirmation prompt",
-            )
-            .with_string_field("agent", agent_id)
-            .with_string_field("cause", &err.to_string())
-        })?;
-
-        input.clear();
-        if io::stdin().read_line(&mut input).map_err(|err| {
+        let prompt = format!("Agent '{agent_id}' is MANUAL. Continue? [yes/no]: ");
+        let input = match terminal.read_line(&prompt).map_err(|err| {
             cli_error("io_error", "failed to read manual-agent confirmation input")
                 .with_string_field("agent", agent_id)
                 .with_string_field("cause", &err.to_string())
-        })? == 0
-        {
-            println!();
-            return Ok(false);
-        }
+        })? {
+            OperatorLine::Line(input) => input,
+            OperatorLine::Eof | OperatorLine::Interrupted => {
+                println!();
+                return Ok(false);
+            }
+        };
 
         match parse_confirmation(&input) {
             Some(answer) => return Ok(answer),

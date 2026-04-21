@@ -10,8 +10,6 @@ mod tool_protocol;
 mod tool_runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::io;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,10 +17,11 @@ use std::sync::Mutex as StdMutex;
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
-    Agent, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error, FileSystem,
-    IntermediateToolResult, Message, Metadata, Model, MountHierarchy, SystemPrompt, ThinkingConfig,
-    Tool, ToolBash20250124, ToolCallback, ToolChoice, ToolParam, ToolResult, ToolResultBlock,
-    ToolTextEditor20250728, ToolUnionParam, ToolUseBlock, Usage,
+    Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error,
+    FileSystem, IntermediateToolResult, Message, Metadata, Model, MountHierarchy, OperatorLine,
+    Renderer, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice,
+    ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728, ToolUnionParam, ToolUseBlock,
+    Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -236,6 +235,26 @@ impl SidAgent {
         command: &str,
         restart: bool,
     ) -> Result<String, std::io::Error> {
+        self.run_bash_command_with_renderer(command, restart, None)
+            .await
+    }
+
+    pub async fn bash_with_renderer(
+        &self,
+        command: &str,
+        restart: bool,
+        renderer: &mut dyn Renderer,
+    ) -> Result<String, std::io::Error> {
+        self.run_bash_command_with_renderer(command, restart, Some(renderer))
+            .await
+    }
+
+    async fn run_bash_command_with_renderer(
+        &self,
+        command: &str,
+        restart: bool,
+        renderer: Option<&mut dyn Renderer>,
+    ) -> Result<String, std::io::Error> {
         let Some(binding) = self.builtin_bindings.bash.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -258,7 +277,7 @@ impl SidAgent {
                     "cwd": self.workspace_root.as_str(),
                     "writable_roots": self.writable_roots.as_slice(),
                 });
-                match confirm_manual_tool_call("bash", &input_value, None) {
+                match confirm_manual_tool_call("bash", &input_value, None, renderer) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(std::io::Error::new(
@@ -379,13 +398,79 @@ impl SidAgent {
         .map_err(std::io::Error::other)
     }
 
-    async fn default_text_editor(&self, tool_use: ToolUseBlock) -> Result<String, std::io::Error> {
+    async fn run_text_editor_tool(
+        &self,
+        tool_use: ToolUseBlock,
+        renderer: Option<&mut dyn Renderer>,
+    ) -> Result<String, std::io::Error> {
         #[derive(serde::Deserialize)]
         struct Command {
             command: String,
         }
         let cmd: Command = serde_json::from_value(tool_use.input.clone())?;
-        match cmd.command.as_str() {
+        let Some(binding) = self.builtin_bindings.edit.as_ref() else {
+            return self
+                .default_text_editor_command(cmd.command.as_str(), tool_use)
+                .await;
+        };
+        match binding.enabled {
+            SwitchPosition::Yes => {
+                let input = tool_use.input.as_object().cloned().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "text editor input must be a JSON object",
+                    )
+                })?;
+                return self.invoke_rc_tool(binding, &tool_use.id, input).await;
+            }
+            SwitchPosition::No => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "edit is disabled",
+                ));
+            }
+            SwitchPosition::Manual => {}
+        }
+        let input = tool_use.input.as_object().cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "text editor input must be a JSON object",
+            )
+        })?;
+        let prepared = self
+            .prepare_rc_tool("edit", binding, &tool_use.id, input)
+            .map_err(std::io::Error::other)?;
+        match confirm_manual_prepared_tool_call(
+            "edit",
+            &tool_use.input,
+            binding.confirm_preview,
+            &prepared,
+            renderer,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "edit call denied by operator",
+                ));
+            }
+            Err(err) => {
+                return Err(std::io::Error::other(err));
+            }
+        }
+        tool_runtime::run_prepared_rc_tool_text(&prepared, &self.writable_roots)
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    async fn default_text_editor_command(
+        &self,
+        command: &str,
+        tool_use: ToolUseBlock,
+    ) -> Result<String, std::io::Error> {
+        match command {
             "view" => {
                 #[derive(serde::Deserialize)]
                 struct ViewTool {
@@ -532,58 +617,7 @@ impl Agent for SidAgent {
     }
 
     async fn text_editor(&self, tool_use: ToolUseBlock) -> Result<String, std::io::Error> {
-        let Some(binding) = self.builtin_bindings.edit.as_ref() else {
-            return self.default_text_editor(tool_use).await;
-        };
-        match binding.enabled {
-            SwitchPosition::Yes => {
-                let input = tool_use.input.as_object().cloned().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "text editor input must be a JSON object",
-                    )
-                })?;
-                return self.invoke_rc_tool(binding, &tool_use.id, input).await;
-            }
-            SwitchPosition::No => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "edit is disabled",
-                ));
-            }
-            SwitchPosition::Manual => {}
-        }
-        let input = tool_use.input.as_object().cloned().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "text editor input must be a JSON object",
-            )
-        })?;
-        let prepared = self
-            .prepare_rc_tool("edit", binding, &tool_use.id, input)
-            .map_err(std::io::Error::other)?;
-        match confirm_manual_prepared_tool_call(
-            "edit",
-            &tool_use.input,
-            binding.confirm_preview,
-            &prepared,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "edit call denied by operator",
-                ));
-            }
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        }
-        tool_runtime::run_prepared_rc_tool_text(&prepared, &self.writable_roots)
-            .await
-            .map_err(std::io::Error::other)
+        self.run_text_editor_tool(tool_use, None).await
     }
 
     async fn bash(&self, command: &str, restart: bool) -> Result<String, std::io::Error> {
@@ -681,10 +715,184 @@ impl BuiltinToolKind {
 
     fn tool(self) -> Arc<dyn Tool<SidAgent>> {
         match self {
-            Self::Bash => Arc::new(ToolBash20250124::new()) as Arc<dyn Tool<SidAgent>>,
-            Self::Edit => Arc::new(ToolTextEditor20250728::new()) as Arc<dyn Tool<SidAgent>>,
+            Self::Bash => Arc::new(SidBashTool::new()) as Arc<dyn Tool<SidAgent>>,
+            Self::Edit => Arc::new(SidTextEditorTool::new()) as Arc<dyn Tool<SidAgent>>,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SidBashTool {
+    param: ToolBash20250124,
+}
+
+impl SidBashTool {
+    fn new() -> Self {
+        Self {
+            param: ToolBash20250124::new(),
+        }
+    }
+}
+
+impl Tool<SidAgent> for SidBashTool {
+    fn name(&self) -> String {
+        self.param.name.clone()
+    }
+
+    fn callback(&self) -> Box<dyn ToolCallback<SidAgent> + '_> {
+        Box::new(SidBashCallback)
+    }
+
+    fn to_param(&self) -> ToolUnionParam {
+        ToolUnionParam::Bash20250124(self.param.clone())
+    }
+}
+
+struct SidBashCallback;
+
+impl SidBashCallback {
+    async fn compute(
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        renderer: Option<&mut dyn Renderer>,
+    ) -> ToolResult {
+        #[derive(serde::Deserialize)]
+        struct BashInput {
+            command: String,
+            #[serde(default)]
+            restart: bool,
+        }
+
+        let bash: BashInput = match serde_json::from_value(tool_use.input.clone()) {
+            Ok(input) => input,
+            Err(err) => return tool_error_result(&tool_use.id, err.to_string()),
+        };
+
+        match agent
+            .run_bash_command_with_renderer(&bash.command, bash.restart, renderer)
+            .await
+        {
+            Ok(output) => tool_success_result(&tool_use.id, output),
+            Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolCallback<SidAgent> for SidBashCallback {
+    async fn compute_tool_result(
+        &self,
+        _client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(Self::compute(agent, tool_use, None).await)
+    }
+
+    async fn compute_tool_result_streaming(
+        &self,
+        _client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        renderer: &mut dyn Renderer,
+        _context: &AgentStreamContext,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(Self::compute(agent, tool_use, Some(renderer)).await)
+    }
+
+    async fn apply_tool_result(
+        &self,
+        _client: &Anthropic,
+        _agent: &mut SidAgent,
+        _tool_use: &ToolUseBlock,
+        intermediate: Box<dyn IntermediateToolResult>,
+    ) -> ToolResult {
+        apply_computed_tool_result(intermediate)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SidTextEditorTool {
+    param: ToolTextEditor20250728,
+}
+
+impl SidTextEditorTool {
+    fn new() -> Self {
+        Self {
+            param: ToolTextEditor20250728::new(),
+        }
+    }
+}
+
+impl Tool<SidAgent> for SidTextEditorTool {
+    fn name(&self) -> String {
+        self.param.name.clone()
+    }
+
+    fn callback(&self) -> Box<dyn ToolCallback<SidAgent> + '_> {
+        Box::new(SidTextEditorCallback)
+    }
+
+    fn to_param(&self) -> ToolUnionParam {
+        ToolUnionParam::TextEditor20250728(self.param.clone())
+    }
+}
+
+struct SidTextEditorCallback;
+
+impl SidTextEditorCallback {
+    async fn compute(
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        renderer: Option<&mut dyn Renderer>,
+    ) -> ToolResult {
+        match agent.run_text_editor_tool(tool_use.clone(), renderer).await {
+            Ok(output) => tool_success_result(&tool_use.id, output),
+            Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolCallback<SidAgent> for SidTextEditorCallback {
+    async fn compute_tool_result(
+        &self,
+        _client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(Self::compute(agent, tool_use, None).await)
+    }
+
+    async fn compute_tool_result_streaming(
+        &self,
+        _client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        renderer: &mut dyn Renderer,
+        _context: &AgentStreamContext,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(Self::compute(agent, tool_use, Some(renderer)).await)
+    }
+
+    async fn apply_tool_result(
+        &self,
+        _client: &Anthropic,
+        _agent: &mut SidAgent,
+        _tool_use: &ToolUseBlock,
+        intermediate: Box<dyn IntermediateToolResult>,
+    ) -> ToolResult {
+        apply_computed_tool_result(intermediate)
+    }
+}
+
+fn apply_computed_tool_result(intermediate: Box<dyn IntermediateToolResult>) -> ToolResult {
+    let Some(intermediate) = intermediate.as_any().downcast_ref::<ToolResult>() else {
+        return ControlFlow::Break(Error::unknown(
+            "intermediate tool result fails to deserialize",
+        ));
+    };
+    intermediate.clone()
 }
 
 #[derive(Clone, Debug)]
@@ -750,7 +958,18 @@ impl ToolCallback<SidAgent> for ExternalToolCallback {
         agent: &SidAgent,
         tool_use: &ToolUseBlock,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(invoke_external_tool(&self.tool, agent, tool_use).await)
+        Box::new(invoke_external_tool(&self.tool, agent, tool_use, None).await)
+    }
+
+    async fn compute_tool_result_streaming(
+        &self,
+        _client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        renderer: &mut dyn Renderer,
+        _context: &AgentStreamContext,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(invoke_external_tool(&self.tool, agent, tool_use, Some(renderer)).await)
     }
 
     async fn apply_tool_result(
@@ -760,12 +979,7 @@ impl ToolCallback<SidAgent> for ExternalToolCallback {
         _tool_use: &ToolUseBlock,
         intermediate: Box<dyn IntermediateToolResult>,
     ) -> ToolResult {
-        let Some(intermediate) = intermediate.as_any().downcast_ref::<ToolResult>() else {
-            return ControlFlow::Break(Error::unknown(
-                "intermediate tool result fails to deserialize",
-            ));
-        };
-        intermediate.clone()
+        apply_computed_tool_result(intermediate)
     }
 }
 
@@ -773,6 +987,7 @@ async fn invoke_external_tool(
     tool: &ExternalTool,
     agent: &SidAgent,
     tool_use: &ToolUseBlock,
+    renderer: Option<&mut dyn Renderer>,
 ) -> ToolResult {
     if tool.enabled == SwitchPosition::No {
         return tool_error_result(&tool_use.id, format!("tool '{}' is disabled", tool.name));
@@ -813,6 +1028,7 @@ async fn invoke_external_tool(
                 &tool_use.input,
                 tool.confirm_preview,
                 &prepared,
+                renderer,
             )
             .await
             {
@@ -868,6 +1084,7 @@ async fn confirm_manual_prepared_tool_call(
     input: &serde_json::Value,
     confirm_preview: bool,
     prepared: &tool_runtime::PreparedRcToolInvocation,
+    renderer: Option<&mut dyn Renderer>,
 ) -> Result<bool, String> {
     let preview = if confirm_preview {
         tool_runtime::render_rc_tool_confirmation_preview(prepared)
@@ -876,42 +1093,66 @@ async fn confirm_manual_prepared_tool_call(
     } else {
         None
     };
-    confirm_manual_tool_call(tool_name, input, preview.as_deref())
+    confirm_manual_tool_call(tool_name, input, preview.as_deref(), renderer)
 }
 
 fn confirm_manual_tool_call(
     tool_name: &str,
     input: &serde_json::Value,
     preview: Option<&str>,
+    mut renderer: Option<&mut dyn Renderer>,
 ) -> Result<bool, String> {
-    use std::io::{self, Write};
-
     let input_display = preview.map(str::to_string).unwrap_or_else(|| {
         serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"))
     });
 
-    let mut buf = String::new();
     loop {
-        print!("Tool '{tool_name}' is MANUAL.\n{input_display}\nAllow this call? [yes/no]: ");
-        io::stdout()
-            .flush()
-            .map_err(|err| format!("failed to flush manual-tool confirmation prompt: {err}"))?;
-
-        buf.clear();
-        if io::stdin()
-            .read_line(&mut buf)
-            .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
-            == 0
-        {
-            println!();
-            return Ok(false);
-        }
+        let prompt =
+            format!("Tool '{tool_name}' is MANUAL.\n{input_display}\nAllow this call? [yes/no]: ");
+        let buf = read_operator_line(&mut renderer, &prompt)?;
 
         match parse_tool_confirmation(&buf) {
             Some(answer) => return Ok(answer),
             None => println!("Please answer yes or no."),
         }
     }
+}
+
+fn read_operator_line(
+    renderer: &mut Option<&mut dyn Renderer>,
+    prompt: &str,
+) -> Result<String, String> {
+    use std::io::{self, Write};
+
+    if let Some(renderer) = renderer.as_mut()
+        && let Some(line) = (*renderer)
+            .read_operator_line(prompt)
+            .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
+    {
+        return match line {
+            OperatorLine::Line(line) => Ok(line),
+            OperatorLine::Eof | OperatorLine::Interrupted => {
+                println!();
+                Ok("no".to_string())
+            }
+        };
+    }
+
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("failed to flush manual-tool confirmation prompt: {err}"))?;
+
+    let mut buf = String::new();
+    if io::stdin()
+        .read_line(&mut buf)
+        .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
+        == 0
+    {
+        println!();
+        return Ok("no".to_string());
+    }
+    Ok(buf)
 }
 
 fn parse_tool_confirmation(input: &str) -> Option<bool> {
@@ -1230,6 +1471,7 @@ fn disabled_tool_error(agent: &str, tool: &str, enabled: SwitchPosition) -> SErr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
 
     use claudius::{
@@ -1243,6 +1485,66 @@ mod tests {
     use crate::test_support::{
         make_executable, temp_config_root, unique_temp_dir, write_default_tool_manifest,
     };
+
+    struct ScriptedRenderer {
+        lines: VecDeque<OperatorLine>,
+        prompts: Vec<String>,
+    }
+
+    impl ScriptedRenderer {
+        fn new(lines: impl IntoIterator<Item = OperatorLine>) -> Self {
+            Self {
+                lines: lines.into_iter().collect(),
+                prompts: Vec::new(),
+            }
+        }
+    }
+
+    impl Renderer for ScriptedRenderer {
+        fn print_text(&mut self, _context: &dyn claudius::StreamContext, _text: &str) {}
+
+        fn print_thinking(&mut self, _context: &dyn claudius::StreamContext, _text: &str) {}
+
+        fn print_error(&mut self, _context: &dyn claudius::StreamContext, _error: &str) {}
+
+        fn print_info(&mut self, _context: &dyn claudius::StreamContext, _info: &str) {}
+
+        fn start_tool_use(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            _name: &str,
+            _id: &str,
+        ) {
+        }
+
+        fn print_tool_input(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            _partial_json: &str,
+        ) {
+        }
+
+        fn finish_tool_use(&mut self, _context: &dyn claudius::StreamContext) {}
+
+        fn start_tool_result(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            _tool_use_id: &str,
+            _is_error: bool,
+        ) {
+        }
+
+        fn print_tool_result_text(&mut self, _context: &dyn claudius::StreamContext, _text: &str) {}
+
+        fn finish_tool_result(&mut self, _context: &dyn claudius::StreamContext) {}
+
+        fn finish_response(&mut self, _context: &dyn claudius::StreamContext) {}
+
+        fn read_operator_line(&mut self, prompt: &str) -> std::io::Result<Option<OperatorLine>> {
+            self.prompts.push(prompt.to_string());
+            Ok(self.lines.pop_front())
+        }
+    }
 
     #[test]
     fn from_config_uses_agent_prompt_and_tools() {
@@ -1343,7 +1645,7 @@ mod tests {
             json!({ "paths": ["src/lib.rs"] }),
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use));
+        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use, None));
         assert_eq!(unwrap_success_text(result), "format via sid_home");
 
         let request: serde_json::Value = serde_json::from_str(
@@ -1509,6 +1811,28 @@ mod tests {
         assert_eq!(parse_tool_confirmation("maybe"), None);
         assert_eq!(parse_tool_confirmation("yep"), None);
         assert_eq!(parse_tool_confirmation("nope"), None);
+    }
+
+    #[test]
+    fn manual_tool_confirmation_reads_from_renderer() {
+        let input = json!({ "command": "pwd" });
+        let mut renderer = ScriptedRenderer::new([
+            OperatorLine::Line("maybe".to_string()),
+            OperatorLine::Line("yes".to_string()),
+        ]);
+
+        assert!(confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap());
+        assert_eq!(renderer.prompts.len(), 2);
+        assert!(renderer.prompts[0].contains("Tool 'bash' is MANUAL."));
+    }
+
+    #[test]
+    fn manual_tool_confirmation_interrupted_renderer_denies() {
+        let input = json!({ "command": "pwd" });
+        let mut renderer = ScriptedRenderer::new([OperatorLine::Interrupted]);
+
+        assert!(!confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap());
+        assert_eq!(renderer.prompts.len(), 1);
     }
 
     #[test]
@@ -2178,7 +2502,7 @@ mod tests {
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
 
-        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use));
+        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use, None));
         assert_eq!(unwrap_success_text(result), "tool result only");
 
         let request: serde_json::Value = serde_json::from_str(
@@ -2573,7 +2897,7 @@ format_ALIASES="fmt"
         let tool = ExternalTool::from_config(exposed_name.clone(), canonical_id, tool_config);
         let tool_use = ToolUseBlock::new("toolu_123", exposed_name, input);
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use))
+        runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use, None))
     }
 
     fn unwrap_success_text(result: ToolResult) -> String {
