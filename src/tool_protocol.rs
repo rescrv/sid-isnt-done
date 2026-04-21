@@ -6,7 +6,6 @@
 /// share the same types.
 use std::fs;
 use std::path::Path as StdPath;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -215,23 +214,4 @@ pub fn next_request_id() -> String {
         .as_nanos();
     let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     format!("sidreq_{timestamp}_{}_{}", std::process::id(), sequence)
-}
-
-/// Create a temporary scratch directory for a tool invocation.
-pub fn create_tool_scratch_dir(request_id: &str) -> Result<PathBuf, SError> {
-    let parent = std::env::temp_dir().join("sid-tool");
-    fs::create_dir_all(&parent).map_err(|err| {
-        protocol_error("io_error", "failed to create tool scratch root")
-            .with_string_field("path", parent.to_string_lossy().as_ref())
-            .with_string_field("request_id", request_id)
-            .with_string_field("cause", &err.to_string())
-    })?;
-    let scratch_dir = parent.join(request_id);
-    fs::create_dir(&scratch_dir).map_err(|err| {
-        protocol_error("io_error", "failed to create tool scratch directory")
-            .with_string_field("path", scratch_dir.to_string_lossy().as_ref())
-            .with_string_field("request_id", request_id)
-            .with_string_field("cause", &err.to_string())
-    })?;
-    Ok(scratch_dir)
 }

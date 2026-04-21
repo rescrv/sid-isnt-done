@@ -350,6 +350,8 @@ rcvar)
         "${PREFIX}_REQUEST_FILE" \
         "${PREFIX}_RESULT_FILE" \
         "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
         "${PREFIX}_WORKSPACE_ROOT" \
         "${PREFIX}_AGENT_ID" \
         "${PREFIX}_TOOL_ID" \
@@ -366,6 +368,7 @@ confirm)
 run)
     export REQUEST_FILE=$(printenv "${PREFIX}_REQUEST_FILE")
     export RESULT_FILE=$(printenv "${PREFIX}_RESULT_FILE")
+    export TMPDIR=$(printenv "${PREFIX}_TMPDIR")
     export WORKSPACE_ROOT=$(printenv "${PREFIX}_WORKSPACE_ROOT")
     exec ./tools/fmt.impl
     ;;
@@ -376,21 +379,35 @@ run)
 esac
 ```
 
-Each `sid` process creates a UUID-named session directory under
-`${SID_SESSIONS:-${SID_HOME}/sessions}`.  For each tool call, `sid` creates a
-fresh ordered directory under `<session>/tools/`, writes `request.json`, writes
-an rc-conf overlay, invokes `tools/<id> run`, then reads `result.json`.  The
-tool process runs with the workspace root as its current directory, receives a
-per-invocation `TMPDIR`, and inherits standard input, standard output, and
-standard error.  Tool processes are not chrooted; host `/` is still the process
-root unless the operating system or sandbox policy denies a particular
-operation.
+Each `sid` process creates a timestamp-named session directory under
+`${SID_SESSIONS:-${SID_HOME}/sessions}`, for example
+`2026-04-20T18-42-13.123456-0700`.  Durable session state is written to a small
+set of append-only journals:
+
+```text
+session.json
+transcript.json
+events.jsonl
+api.jsonl
+tool-streams.jsonl
+```
+
+For each tool call, `sid` creates a fresh ordered runtime directory under
+`<session>/tmp/tool-000001/`, writes `request.json`, writes an rc-conf overlay,
+invokes `tools/<id> run`, reads `result.json`, appends lifecycle and stream
+records to the session journals, then deletes the runtime directory by default.
+The tool process runs with the workspace root as its current directory,
+receives a per-invocation `TMPDIR`, and inherits standard input, standard
+output, and standard error.  Tool processes are not chrooted; host `/` is still
+the process root unless the operating system or sandbox policy denies a
+particular operation.
 
 For `MANUAL` tools with `<tool>_CONFIRM=YES`, `sid` prepares the same request
 and overlay, invokes `tools/<id> confirm`, captures its stdout as preview text,
-then asks the operator for yes/no itself.  If preview rendering fails, `sid`
-falls back to showing the raw request JSON.  The real `run` subcommand is not
-invoked unless the operator approves.
+appends confirmation output to `tool-streams.jsonl`, then asks the operator for
+yes/no itself.  If preview rendering fails, `sid` falls back to showing the raw
+request JSON.  The real `run` subcommand is not invoked unless the operator
+approves.
 
 The request file has this shape:
 
@@ -415,9 +432,9 @@ The request file has this shape:
     "cwd": "/abs/workspace"
   },
   "files": {
-    "scratch_dir": "/sid/sessions/uuid/tools/000001-sidreq_123/scratch",
-    "temp_dir": "/sid/sessions/uuid/tools/000001-sidreq_123/tmp",
-    "result_file": "/sid/sessions/uuid/tools/000001-sidreq_123/scratch/result.json"
+    "scratch_dir": "/sid/sessions/2026-04-20T18-42-13.123456-0700/tmp/tool-000001",
+    "temp_dir": "/sid/sessions/2026-04-20T18-42-13.123456-0700/tmp/tool-000001/tmp",
+    "result_file": "/sid/sessions/2026-04-20T18-42-13.123456-0700/tmp/tool-000001/result.json"
   }
 }
 ```
@@ -454,6 +471,8 @@ Protocol rules:
 
 - During `confirm`, standard output is the human-readable preview.
 - During `run`, standard output and standard error are for the human terminal.
+- When a session is active, `confirm`, `stdout`, and `stderr` bytes are copied
+  into `tool-streams.jsonl`.  Non-UTF-8 chunks are stored as base64.
 - During `run`, `sid` only parses `result.json`.
 - Exit status `0` means process transport succeeded, so `result.json` must
   exist and be valid.
@@ -461,6 +480,8 @@ Protocol rules:
   ignored.
 - `request_id` in the result must match the request.
 - Protocol v1 output is text-only.
+- Runtime tool scratch is deleted after the invocation unless a debug keep
+  environment variable is set.
 
 ## ENVIRONMENT
 
@@ -473,11 +494,20 @@ Protocol rules:
   `${SID_HOME}/sessions`.
 
 `SID_SESSION_ID`
-: UUID for the current `sid` process.  Set by `sid` for child processes.
+: Timestamp session id for the current `sid` process.  Set by `sid` for child
+  processes.
 
 `SID_SESSION_DIR`
 : Absolute or configured path to the current session directory.  Set by `sid`
   for child processes.
+
+`SID_KEEP_TOOL_SCRATCH`
+: Set to `1`, `true`, `yes`, or `on` to preserve per-tool runtime directories
+  under `<session>/tmp/` after invocations.
+
+`SID_KEEP_FAILED_TOOL_SCRATCH`
+: Set to `1`, `true`, `yes`, or `on` to preserve per-tool runtime directories
+  only for failed invocations.
 
 `SID_SKILLS_PATH`
 : Colon-separated list of directories to scan for `*/SKILL.md`.  If unset,
@@ -491,7 +521,8 @@ Protocol rules:
   variable prefix.
 
 `RC_CONF_PATH`
-: Set during tool invocation to `<config-root>/tools.conf:<scratch>/tool-invoke.conf`.
+: Set during tool invocation to
+  `<config-root>/tools.conf:<session>/tmp/tool-000001/tool-invoke.conf`.
 
 `RC_D_PATH`
 : Set during tool invocation to `<config-root>/tools`.
@@ -556,18 +587,24 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 : Optional skill document mounted read-only under `/skills/<skill>/`.
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/session.json`
-: Session metadata.
+: Session metadata with the timestamp id, ISO-like creation time,
+  microsecond Unix timestamp, and process id.
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/transcript.json`
 : Auto-saved chat transcript.
 
-`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/api/`
-: Ordered API request and response JSON logs.
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/events.jsonl`
+: Session and tool lifecycle journal.
 
-`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tools/000001-*/`
-: Per-call tool directories.  Each directory contains `scratch/` for protocol
-  files, `tmp/` as that tool process's `TMPDIR`, and stdout/stderr logs for
-  the tool process.
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/api.jsonl`
+: Ordered API request and response payload journal.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tool-streams.jsonl`
+: Tool confirmation, stdout, and stderr stream journal.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tmp/`
+: Runtime scratch.  Tool directories and bash temporary files live here while
+  needed and are cleaned by default.
 
 ## TROUBLESHOOTING
 

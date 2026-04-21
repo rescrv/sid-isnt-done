@@ -147,6 +147,8 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "claudius"
 version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e84ae81bb4a04d0eb17de0083129fc4e4095a67013183fb066d0f7ebffd30d5"
 dependencies = [
  "arrrg",
  "arrrg_derive",
@@ -931,6 +933,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
+name = "num_threads"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1504,6 +1515,7 @@ dependencies = [
  "arrrg",
  "arrrg_derive",
  "async-trait",
+ "base64",
  "claudius",
  "ctrlc",
  "getopts",
@@ -1513,6 +1525,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shvar",
+ "time",
  "tokio",
  "tree-sitter",
  "tree-sitter-bash",
@@ -1688,7 +1701,9 @@ checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",

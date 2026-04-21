@@ -20,11 +20,11 @@ use utf8path::Path;
 use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
 use crate::seatbelt;
 use crate::seatbelt::WritableRoots;
-use crate::session::SidSession;
+use crate::session::{self, SidSession, ToolFinishEvent, ToolStartEvent, ToolStreamJournal};
 use crate::tool_protocol::{
     ToolRequestAgent, ToolRequestEnvelope, ToolRequestFiles, ToolRequestInvocation,
-    ToolRequestTool, ToolRequestWorkspace, create_tool_scratch_dir, extract_tool_output,
-    next_request_id, read_tool_result, write_json_file,
+    ToolRequestTool, ToolRequestWorkspace, extract_tool_output, next_request_id, read_tool_result,
+    write_json_file,
 };
 
 /// Minimal context needed by the tool invocation runtime.
@@ -55,9 +55,13 @@ struct ToolRcRuntime {
 pub(crate) struct PreparedRcToolInvocation {
     display_name: String,
     rc_service_name: String,
+    canonical_id: String,
     executable_path: Path<'static>,
     workspace_root: Path<'static>,
+    agent_id: String,
+    tool_use_id: String,
     request_id: String,
+    sequence: u64,
     tool_dir: PathBuf,
     result_file: PathBuf,
     temp_dir: PathBuf,
@@ -98,7 +102,7 @@ pub(crate) async fn invoke_rc_tool_text(
         tool_use_id,
         input,
     )?;
-    run_prepared_rc_tool_text(&prepared, context.writable_roots).await
+    run_prepared_rc_tool_text(&prepared, context.writable_roots, context.session).await
 }
 
 pub(crate) fn prepare_rc_tool_invocation(
@@ -173,9 +177,13 @@ pub(crate) fn prepare_rc_tool_invocation(
     Ok(PreparedRcToolInvocation {
         display_name: display_name.to_string(),
         rc_service_name: rc_service_name.to_string(),
+        canonical_id: canonical_id.to_string(),
         executable_path: executable_path.clone().into_owned(),
         workspace_root: context.workspace_root.clone().into_owned(),
+        agent_id: context.agent_id.to_string(),
+        tool_use_id: tool_use_id.to_string(),
         request_id,
+        sequence: invocation_dirs.sequence,
         tool_dir: invocation_dirs.root,
         result_file,
         temp_dir,
@@ -196,7 +204,7 @@ fn create_tool_invocation_dirs(
         return session.create_tool_invocation_dirs(request_id);
     }
 
-    let scratch_dir = create_tool_scratch_dir(request_id)?;
+    let scratch_dir = create_standalone_tool_runtime_dir(request_id)?;
     let temp_dir = scratch_dir.join("tmp");
     fs::create_dir_all(&temp_dir).map_err(|err| {
         SError::new("tool-protocol")
@@ -217,15 +225,97 @@ fn create_tool_invocation_dirs(
 pub(crate) async fn run_prepared_rc_tool_text(
     prepared: &PreparedRcToolInvocation,
     writable_roots: &WritableRoots,
+    session: Option<&SidSession>,
 ) -> Result<String, String> {
-    clear_stale_result_file(prepared)?;
+    if let Some(session) = session {
+        if let Err(err) = session.log_tool_start(ToolStartEvent {
+            tool_seq: prepared.sequence,
+            request_id: &prepared.request_id,
+            tool: &prepared.display_name,
+            canonical_tool: &prepared.canonical_id,
+            tool_use_id: &prepared.tool_use_id,
+            agent: &prepared.agent_id,
+            scratch_dir: &prepared.tool_dir,
+        }) {
+            let _ = cleanup_prepared_rc_tool(prepared, true);
+            return Err(format!(
+                "tool '{}' failed to log start: {}",
+                prepared.display_name, err
+            ));
+        }
+    }
+
+    let (mut result, report) =
+        run_prepared_rc_tool_text_inner(prepared, writable_roots, session).await;
+    let failed = result.is_err();
+    let scratch_preserved = session::should_keep_tool_scratch(failed);
+    let cleanup_error = if scratch_preserved {
+        None
+    } else {
+        cleanup_prepared_rc_tool(prepared, failed).err()
+    };
+    if let Some(err) = cleanup_error.as_ref()
+        && result.is_ok()
+    {
+        result = Err(err.clone());
+    }
+    let success = result.is_ok();
+    let error = result.as_ref().err().map(String::as_str);
+
+    if let Some(session) = session {
+        session
+            .log_tool_finish(ToolFinishEvent {
+                tool_seq: prepared.sequence,
+                request_id: &prepared.request_id,
+                status: report.status.as_deref(),
+                exit_code: report.exit_code,
+                success,
+                result_ok: report.result_ok,
+                output_len: report.output_len,
+                error,
+                scratch_preserved,
+                scratch_dir: scratch_preserved.then_some(prepared.tool_dir.as_path()),
+                cleanup_error: cleanup_error.as_deref(),
+            })
+            .map_err(|err| {
+                format!(
+                    "tool '{}' failed to log finish: {}",
+                    prepared.display_name, err
+                )
+            })?;
+    }
+
+    result
+}
+
+async fn run_prepared_rc_tool_text_inner(
+    prepared: &PreparedRcToolInvocation,
+    writable_roots: &WritableRoots,
+    session: Option<&SidSession>,
+) -> (Result<String, String>, ToolRunReport) {
+    let mut report = ToolRunReport::default();
+
+    if let Err(err) = clear_stale_result_file(prepared) {
+        return (Err(err), report);
+    }
     let mut cmd = prepared_rc_tool_command(prepared, "run", writable_roots);
-    let mut child = cmd
+    let mut child = match cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("tool '{}' failed to launch: {}", prepared.display_name, err))?;
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return (
+                Err(format!(
+                    "tool '{}' failed to launch: {}",
+                    prepared.display_name, err
+                )),
+                report,
+            );
+        }
+    };
     let stdout = child
         .stdout
         .take()
@@ -234,37 +324,77 @@ pub(crate) async fn run_prepared_rc_tool_text(
         .stderr
         .take()
         .expect("child stderr should be piped before spawn");
+    let journal = session.map(SidSession::tool_stream_journal);
     let stdout_task = tokio::spawn(tee_child_output(
         stdout,
         tokio::io::stdout(),
-        prepared.tool_dir.join("stdout.log"),
+        journal.clone(),
+        prepared.sequence,
+        "stdout",
     ));
     let stderr_task = tokio::spawn(tee_child_output(
         stderr,
         tokio::io::stderr(),
-        prepared.tool_dir.join("stderr.log"),
+        journal,
+        prepared.sequence,
+        "stderr",
     ));
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|err| format!("tool '{}' failed to wait: {}", prepared.display_name, err))?;
-    await_output_log(prepared, "stdout", stdout_task).await?;
-    await_output_log(prepared, "stderr", stderr_task).await?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(err) => {
+            return (
+                Err(format!(
+                    "tool '{}' failed to wait: {}",
+                    prepared.display_name, err
+                )),
+                report,
+            );
+        }
+    };
+    report.status = Some(status.to_string());
+    report.exit_code = status.code();
+    if let Err(err) = await_output_log(prepared, "stdout", stdout_task).await {
+        return (Err(err), report);
+    }
+    if let Err(err) = await_output_log(prepared, "stderr", stderr_task).await {
+        return (Err(err), report);
+    }
     if !status.success() {
-        return Err(format!(
-            "tool '{}' exited with status {}",
-            prepared.display_name, status
-        ));
+        return (
+            Err(format!(
+                "tool '{}' exited with status {}",
+                prepared.display_name, status
+            )),
+            report,
+        );
     }
 
-    let result = read_tool_result(&prepared.result_file)
-        .map_err(|err| format!("tool '{}' protocol error: {}", prepared.display_name, err))?;
-    extract_tool_output(&prepared.display_name, &prepared.request_id, result)
+    let result = match read_tool_result(&prepared.result_file) {
+        Ok(result) => result,
+        Err(err) => {
+            return (
+                Err(format!(
+                    "tool '{}' protocol error: {}",
+                    prepared.display_name, err
+                )),
+                report,
+            );
+        }
+    };
+    report.result_ok = Some(result.ok);
+    match extract_tool_output(&prepared.display_name, &prepared.request_id, result) {
+        Ok(text) => {
+            report.output_len = Some(text.len());
+            (Ok(text), report)
+        }
+        Err(err) => (Err(err), report),
+    }
 }
 
 pub(crate) async fn render_rc_tool_confirmation_preview(
     prepared: &PreparedRcToolInvocation,
+    session: Option<&SidSession>,
 ) -> Result<String, String> {
     const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -293,8 +423,25 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
         )
     })?;
 
-    write_confirmation_log(prepared, "confirm.stdout.log", &output.stdout)?;
-    write_confirmation_log(prepared, "confirm.stderr.log", &output.stderr)?;
+    if let Some(session) = session {
+        let journal = session.tool_stream_journal();
+        journal
+            .append(prepared.sequence, "confirm_stdout", &output.stdout)
+            .map_err(|err| {
+                format!(
+                    "tool '{}' failed to log confirm stdout: {}",
+                    prepared.display_name, err
+                )
+            })?;
+        journal
+            .append(prepared.sequence, "confirm_stderr", &output.stderr)
+            .map_err(|err| {
+                format!(
+                    "tool '{}' failed to log confirm stderr: {}",
+                    prepared.display_name, err
+                )
+            })?;
+    }
     if !output.status.success() {
         return Err(format!(
             "tool '{}' confirm exited with status {}",
@@ -314,23 +461,58 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
     Ok(preview)
 }
 
-async fn tee_child_output<R, W>(mut reader: R, mut terminal: W, log_path: PathBuf) -> io::Result<()>
+pub(crate) fn cleanup_prepared_rc_tool(
+    prepared: &PreparedRcToolInvocation,
+    failed: bool,
+) -> Result<bool, String> {
+    if session::should_keep_tool_scratch(failed) {
+        return Ok(true);
+    }
+    match fs::remove_dir_all(&prepared.tool_dir) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!(
+            "tool '{}' failed to clean scratch directory {}: {}",
+            prepared.display_name,
+            prepared.tool_dir.display(),
+            err
+        )),
+    }
+}
+
+#[derive(Default)]
+struct ToolRunReport {
+    status: Option<String>,
+    exit_code: Option<i32>,
+    result_ok: Option<bool>,
+    output_len: Option<usize>,
+}
+
+async fn tee_child_output<R, W>(
+    mut reader: R,
+    mut terminal: W,
+    journal: Option<ToolStreamJournal>,
+    tool_seq: u64,
+    stream: &'static str,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut log = tokio::fs::File::create(log_path).await?;
     let mut buffer = [0u8; 8192];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        log.write_all(&buffer[..read]).await?;
         terminal.write_all(&buffer[..read]).await?;
         terminal.flush().await?;
+        if let Some(journal) = journal.as_ref() {
+            journal
+                .append(tool_seq, stream, &buffer[..read])
+                .map_err(|err| io::Error::other(err.to_string()))?;
+        }
     }
-    log.flush().await?;
     Ok(())
 }
 
@@ -350,22 +532,6 @@ async fn await_output_log(
             prepared.display_name, stream, err
         )),
     }
-}
-
-fn write_confirmation_log(
-    prepared: &PreparedRcToolInvocation,
-    filename: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let path = prepared.tool_dir.join(filename);
-    fs::write(&path, bytes).map_err(|err| {
-        format!(
-            "tool '{}' failed to write {}: {}",
-            prepared.display_name,
-            path.display(),
-            err
-        )
-    })
 }
 
 fn prepared_rc_tool_command(
@@ -558,6 +724,32 @@ fn append_rc_conf_assignment(output: &mut String, name: &str, value: &str) {
     output.push('=');
     output.push_str(&shvar::quote(vec![value.to_string()]));
     output.push('\n');
+}
+
+fn create_standalone_tool_runtime_dir(request_id: &str) -> Result<PathBuf, SError> {
+    let parent = std::env::temp_dir().join("sid-runtime-tools");
+    fs::create_dir_all(&parent).map_err(|err| {
+        tool_runtime_error(
+            "standalone",
+            "io_error",
+            "failed to create tool runtime root",
+        )
+        .with_string_field("path", parent.to_string_lossy().as_ref())
+        .with_string_field("request_id", request_id)
+        .with_string_field("cause", &err.to_string())
+    })?;
+    let scratch_dir = parent.join(request_id);
+    fs::create_dir(&scratch_dir).map_err(|err| {
+        tool_runtime_error(
+            "standalone",
+            "io_error",
+            "failed to create tool runtime directory",
+        )
+        .with_string_field("path", scratch_dir.to_string_lossy().as_ref())
+        .with_string_field("request_id", request_id)
+        .with_string_field("cause", &err.to_string())
+    })?;
+    Ok(scratch_dir)
 }
 
 fn tool_runtime_error(tool: &str, code: &str, message: &str) -> SError {

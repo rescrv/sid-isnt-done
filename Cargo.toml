@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 arrrg = "^0.8"
 async-trait = "0.1"
+base64 = "0.22"
 claudius = { version = "0.24.0" }
 ctrlc = { version = "3.5", features = ["termination"] }
 handled = { version = "0.6.0" }
@@ -19,6 +20,7 @@ rustyline = "17.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shvar = "^0.8"
+time = { version = "0.3", features = ["formatting", "local-offset"] }
 tokio = { version = "1.49", features = ["full"] }
 utf8path = "^0.9"
 arrrg_derive = "0.8.0"

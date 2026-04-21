@@ -333,11 +333,7 @@ impl SidAgent {
             );
             env.insert(
                 "TMPDIR".to_string(),
-                session
-                    .root()
-                    .join("bash-tmp")
-                    .to_string_lossy()
-                    .into_owned(),
+                session.bash_tmp_dir().to_string_lossy().into_owned(),
             );
         }
         env.insert("PAGER".to_string(), "cat".to_string());
@@ -445,24 +441,31 @@ impl SidAgent {
             &tool_use.input,
             binding.confirm_preview,
             &prepared,
+            self.session.as_deref(),
             renderer,
         )
         .await
         {
             Ok(true) => {}
             Ok(false) => {
+                let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "edit call denied by operator",
                 ));
             }
             Err(err) => {
+                let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, true);
                 return Err(std::io::Error::other(err));
             }
         }
-        tool_runtime::run_prepared_rc_tool_text(&prepared, &self.writable_roots)
-            .await
-            .map_err(std::io::Error::other)
+        tool_runtime::run_prepared_rc_tool_text(
+            &prepared,
+            &self.writable_roots,
+            self.session.as_deref(),
+        )
+        .await
+        .map_err(std::io::Error::other)
     }
 
     async fn default_text_editor_command(
@@ -1028,23 +1031,30 @@ async fn invoke_external_tool(
                 &tool_use.input,
                 tool.confirm_preview,
                 &prepared,
+                agent.session.as_deref(),
                 renderer,
             )
             .await
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
                     return tool_error_result(
                         &tool_use.id,
                         format!("tool '{}' call denied by operator", tool.name),
                     );
                 }
                 Err(err) => {
+                    let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, true);
                     return tool_error_result(&tool_use.id, err);
                 }
             }
-            return match tool_runtime::run_prepared_rc_tool_text(&prepared, &agent.writable_roots)
-                .await
+            return match tool_runtime::run_prepared_rc_tool_text(
+                &prepared,
+                &agent.writable_roots,
+                agent.session.as_deref(),
+            )
+            .await
             {
                 Ok(text) => tool_success_result(&tool_use.id, text),
                 Err(message) => tool_error_result(&tool_use.id, message),
@@ -1084,10 +1094,11 @@ async fn confirm_manual_prepared_tool_call(
     input: &serde_json::Value,
     confirm_preview: bool,
     prepared: &tool_runtime::PreparedRcToolInvocation,
+    session: Option<&SidSession>,
     renderer: Option<&mut dyn Renderer>,
 ) -> Result<bool, String> {
     let preview = if confirm_preview {
-        tool_runtime::render_rc_tool_confirmation_preview(prepared)
+        tool_runtime::render_rc_tool_confirmation_preview(prepared, session)
             .await
             .ok()
     } else {
@@ -2439,13 +2450,9 @@ mod tests {
         assert_eq!(env["rc_d_path"], json!(root.join("tools").as_str()));
         let scratch_dir = env["scratch_dir"].as_str().unwrap();
         assert!(scratch_dir.starts_with('/'));
-        assert_eq!(
-            fs::read_to_string(PathBuf::from(scratch_dir).join("stdout.log")).unwrap(),
-            "stdout from tool\n"
-        );
-        assert_eq!(
-            fs::read_to_string(PathBuf::from(scratch_dir).join("stderr.log")).unwrap(),
-            "stderr from tool\n"
+        assert!(
+            !PathBuf::from(scratch_dir).exists(),
+            "tool scratch should be cleaned by default"
         );
         assert!(
             env["request_file"]
@@ -2459,22 +2466,12 @@ mod tests {
                 .unwrap()
                 .ends_with("/result.json")
         );
-        let overlay_path = env["rc_conf_path"]
-            .as_str()
-            .unwrap()
-            .rsplit(':')
-            .next()
-            .unwrap();
-        let overlay = fs::read_to_string(overlay_path).unwrap();
-        assert!(overlay.contains("format_REQUEST_FILE="));
-        assert!(overlay.contains("fmt_REQUEST_FILE="));
-        assert!(overlay.contains("format_TOOL_ID=fmt"));
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]
-    fn tool_invocation_uses_ordered_session_dirs() {
+    fn tool_invocation_uses_ordered_session_tmp_and_journals() {
         let root = temp_config_root("agent");
         write_sample_config_with_fmt_script(
             &root,
@@ -2515,12 +2512,9 @@ mod tests {
         .unwrap();
         let scratch_dir = PathBuf::from(request["files"]["scratch_dir"].as_str().unwrap());
         let temp_dir = PathBuf::from(request["files"]["temp_dir"].as_str().unwrap());
-        let tool_root = sid_session.root().join("tools").join(format!(
-            "000001-{}",
-            request["request_id"].as_str().unwrap()
-        ));
+        let tool_root = sid_session.root().join("tmp").join("tool-000001");
 
-        assert_eq!(scratch_dir, tool_root.join("scratch"));
+        assert_eq!(scratch_dir, tool_root);
         assert_eq!(temp_dir, tool_root.join("tmp"));
         assert_eq!(
             request["files"]["result_file"],
@@ -2534,14 +2528,24 @@ mod tests {
             env["session_dir"],
             json!(sid_session.root().to_string_lossy())
         );
-        assert_eq!(
-            fs::read_to_string(tool_root.join("stdout.log")).unwrap(),
-            ""
+        assert!(
+            !tool_root.exists(),
+            "session tool scratch should be cleaned by default"
         );
-        assert_eq!(
-            fs::read_to_string(tool_root.join("stderr.log")).unwrap(),
-            ""
-        );
+
+        let events = fs::read_to_string(sid_session.root().join("events.jsonl")).unwrap();
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events[0]["kind"], json!("session_start"));
+        assert_eq!(events[1]["kind"], json!("tool_start"));
+        assert_eq!(events[1]["tool_seq"], json!(1));
+        assert_eq!(events[1]["request_id"], request["request_id"]);
+        assert_eq!(events[2]["kind"], json!("tool_finish"));
+        assert_eq!(events[2]["tool_seq"], json!(1));
+        assert_eq!(events[2]["success"], json!(true));
+        assert_eq!(events[2]["scratch_preserved"], json!(false));
 
         fs::remove_dir_all(root.as_str()).unwrap();
         fs::remove_dir_all(sessions_root).unwrap();
@@ -2576,7 +2580,9 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let preview = runtime
-            .block_on(tool_runtime::render_rc_tool_confirmation_preview(&prepared))
+            .block_on(tool_runtime::render_rc_tool_confirmation_preview(
+                &prepared, None,
+            ))
             .unwrap();
         assert!(preview.contains("mode=confirm"));
         assert!(preview.contains("tool=format"));
@@ -2587,6 +2593,7 @@ mod tests {
             .block_on(tool_runtime::run_prepared_rc_tool_text(
                 &prepared,
                 &agent.writable_roots,
+                None,
             ))
             .unwrap();
         assert_eq!(text, "format ran");
