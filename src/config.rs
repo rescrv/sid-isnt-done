@@ -505,9 +505,6 @@ fn apply_chat_config_overrides(
             &session_budget,
         )?));
     }
-    if let Some(transcript_path) = lookup_expanded(provider, agent, "TRANSCRIPT_PATH")? {
-        chat_config.transcript_path = Some(transcript_path.into());
-    }
     if let Some(caching_enabled) = lookup_expanded(provider, agent, "CACHING_ENABLED")? {
         chat_config.caching_enabled = parse_bool_field(agent, "CACHING_ENABLED", &caching_enabled)?;
     }
@@ -868,7 +865,6 @@ plan_STOP_SEQUENCES='END "two words"'
 plan_THINKING=on
 plan_NO_COLOR=yes
 plan_SESSION_BUDGET=50000
-plan_TRANSCRIPT_PATH='logs/${ROLE}.json'
 plan_CACHING_ENABLED=off
 "#,
         )
@@ -944,14 +940,6 @@ format_ALIASES="fmt"
         );
         assert!(!plan.chat_config.use_color);
         assert!(plan.chat_config.session_budget.is_some());
-        assert_eq!(
-            plan.chat_config
-                .transcript_path
-                .as_deref()
-                .and_then(|path| Path::try_from(path).ok())
-                .map(Path::into_owned),
-            Some(Path::new("logs/principal engineer.json").into_owned())
-        );
         assert!(!plan.chat_config.caching_enabled);
 
         let evil = config.agents.get("evil").unwrap();

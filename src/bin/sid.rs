@@ -148,15 +148,21 @@ struct SidArgs {
     bash_debug: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(err) = try_main().await {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }
+/// Data computed synchronously before the tokio runtime starts.
+struct PreRuntimeSetup {
+    config: ChatConfig,
+    workspace_root: Path<'static>,
+    config_root: Path<'static>,
+    sid_session: Arc<SidSession>,
+    workspace_display: String,
+    session_display: String,
+    bash_debug: Option<String>,
 }
 
-async fn try_main() -> Result<(), SError> {
+/// Parse arguments, resolve paths, create the session directory, and set
+/// environment variables for child processes.  Runs before the tokio runtime
+/// so that process-global `set_var` calls are single-threaded and safe.
+fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
     let SidArgs { param, bash_debug } = parse_sid_args()?;
     let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
@@ -183,8 +189,7 @@ async fn try_main() -> Result<(), SError> {
     .into_owned();
     let config_root = resolve_sid_home(&workspace_root)?;
     let sid_session = Arc::new(SidSession::create(&config_root)?);
-    // Set SID_WORKSPACE_ROOT for child processes spawned by tools. This is the
-    // outer binary entrypoint, so process-global mutation is acceptable here.
+    // Safe: no other threads are running yet.
     unsafe {
         std::env::set_var("SID_WORKSPACE_ROOT", workspace_root.as_str());
         std::env::set_var(session::SID_SESSION_ID_ENV, sid_session.id());
@@ -193,6 +198,43 @@ async fn try_main() -> Result<(), SError> {
     }
     let workspace_display = workspace_root.as_str().to_string();
     let session_display = sid_session.root().display().to_string();
+
+    Ok(PreRuntimeSetup {
+        config,
+        workspace_root,
+        config_root,
+        sid_session,
+        workspace_display,
+        session_display,
+        bash_debug,
+    })
+}
+
+fn main() {
+    let setup = match pre_runtime_setup() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    if let Err(err) = runtime.block_on(try_main(setup)) {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
+    let PreRuntimeSetup {
+        config,
+        workspace_root,
+        config_root,
+        sid_session,
+        workspace_display,
+        session_display,
+        bash_debug,
+    } = setup;
 
     warn_if_sandbox_unavailable();
 
@@ -374,16 +416,11 @@ async fn try_main() -> Result<(), SError> {
                                 terminal.print_info(&context, "Prompt caching disabled.");
                             }
                         }
-                        ChatCommand::TranscriptPath(path) => {
-                            session.config_mut().transcript_path = Some(path.clone().into());
+                        ChatCommand::TranscriptPath(_) | ChatCommand::ClearTranscriptPath => {
                             terminal.print_info(
                                 &context,
-                                &format!("Transcript auto-save set to {path}"),
+                                "Transcript auto-save is managed by the session system.",
                             );
-                        }
-                        ChatCommand::ClearTranscriptPath => {
-                            session.config_mut().transcript_path = None;
-                            terminal.print_info(&context, "Transcript auto-save disabled.");
                         }
                         ChatCommand::SaveTranscript(path) => {
                             match session.save_transcript_to(&path) {
@@ -588,15 +625,6 @@ fn print_stats<A: ChatAgent>(session: &ChatSession<A>) {
     } else {
         println!("      Budget: (not set)");
     }
-    match stats.transcript_path {
-        Some(ref path) => println!(
-            "      Transcript file: {}",
-            Path::try_from(path.as_path())
-                .map(|path| path.as_str().to_string())
-                .unwrap_or_else(|_| path.display().to_string())
-        ),
-        None => println!("      Transcript file: (disabled)"),
-    }
 }
 
 fn print_config<A: ChatAgent>(session: &ChatSession<A>) {
@@ -628,15 +656,6 @@ fn print_config<A: ChatAgent>(session: &ChatSession<A>) {
         println!("      System prompt: (none)");
     }
     print_stop_sequences(&stats.stop_sequences);
-    match stats.transcript_path {
-        Some(ref path) => println!(
-            "      Transcript file: {}",
-            Path::try_from(path.as_path())
-                .map(|path| path.as_str().to_string())
-                .unwrap_or_else(|_| path.display().to_string())
-        ),
-        None => println!("      Transcript file: (disabled)"),
-    }
 }
 
 fn print_stop_sequences(stop_sequences: &[String]) {

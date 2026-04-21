@@ -201,9 +201,6 @@ build_THINKING="on"
 `<agent>_SESSION_BUDGET`
 : Optional token budget for the session.
 
-`<agent>_TRANSCRIPT_PATH`
-: Optional path for transcript auto-save.
-
 `<agent>_CACHING_ENABLED`
 : Optional prompt-cache toggle.
 

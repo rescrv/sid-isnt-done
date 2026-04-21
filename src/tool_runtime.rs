@@ -227,8 +227,8 @@ pub(crate) async fn run_prepared_rc_tool_text(
     writable_roots: &WritableRoots,
     session: Option<&SidSession>,
 ) -> Result<String, String> {
-    if let Some(session) = session {
-        if let Err(err) = session.log_tool_start(ToolStartEvent {
+    if let Some(session) = session
+        && let Err(err) = session.log_tool_start(ToolStartEvent {
             tool_seq: prepared.sequence,
             request_id: &prepared.request_id,
             tool: &prepared.display_name,
@@ -236,13 +236,13 @@ pub(crate) async fn run_prepared_rc_tool_text(
             tool_use_id: &prepared.tool_use_id,
             agent: &prepared.agent_id,
             scratch_dir: &prepared.tool_dir,
-        }) {
-            let _ = cleanup_prepared_rc_tool(prepared, true);
-            return Err(format!(
-                "tool '{}' failed to log start: {}",
-                prepared.display_name, err
-            ));
-        }
+        })
+    {
+        let _ = cleanup_prepared_rc_tool(prepared, true);
+        return Err(format!(
+            "tool '{}' failed to log start: {}",
+            prepared.display_name, err
+        ));
     }
 
     let (mut result, report) =

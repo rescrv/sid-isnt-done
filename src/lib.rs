@@ -224,7 +224,6 @@ impl SidAgent {
     }
 
     pub fn with_session(mut self, session: Arc<SidSession>) -> Self {
-        self.config.transcript_path = Some(session.transcript_path());
         append_writable_root(&mut self.writable_roots, session.root());
         self.session = Some(session);
         self
@@ -1395,9 +1394,6 @@ fn merged_chat_config(agent_config: &AgentConfig, fallback: Option<&ChatConfig>)
     }
     if agent.session_budget.is_some() {
         merged.session_budget = agent.session_budget.clone();
-    }
-    if agent.transcript_path.is_some() {
-        merged.transcript_path = agent.transcript_path.clone();
     }
     if agent.caching_enabled != defaults.caching_enabled {
         merged.caching_enabled = agent.caching_enabled;

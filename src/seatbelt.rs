@@ -476,9 +476,33 @@ pub fn darwin_user_cache_dir() -> String {
     }
 }
 
+/// Escape a string for inclusion in an SBPL double-quoted literal.
+///
+/// SBPL uses Scheme-style string literals where backslash and double-quote
+/// must be escaped.  Control characters (newlines, tabs, etc.) are also
+/// escaped to prevent policy injection through crafted paths.
+fn escape_sbpl_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // Drop other control characters entirely.
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Build an SBPL policy string with the given writable roots inlined.
 ///
 /// Each entry becomes an `(allow file-write* (subpath "..."))` rule.
+/// Path strings are escaped to prevent SBPL injection.
 /// `DARWIN_USER_CACHE_DIR` remains a `sandbox-exec` parameter.
 pub fn build_policy(writable_roots: &WritableRoots) -> String {
     let roots = writable_roots.as_slice();
@@ -487,7 +511,8 @@ pub fn build_policy(writable_roots: &WritableRoots) -> String {
     );
     policy.push_str(POLICY_BEFORE_WRITE_RULES);
     for root in roots {
-        policy.push_str(&format!("(allow file-write* (subpath \"{root}\"))\n"));
+        let escaped = escape_sbpl_string(root);
+        policy.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
     }
     policy.push_str(POLICY_AFTER_WRITE_RULES);
     policy
@@ -620,5 +645,53 @@ mod tests {
         assert_eq!(wrapper[3], "-D");
         assert!(wrapper[4].starts_with("DARWIN_USER_CACHE_DIR="));
         assert_eq!(wrapper[5], "--");
+    }
+
+    #[test]
+    fn escape_sbpl_string_handles_plain_path() {
+        assert_eq!(escape_sbpl_string("/home/user/src"), "/home/user/src");
+    }
+
+    #[test]
+    fn escape_sbpl_string_escapes_backslash() {
+        assert_eq!(escape_sbpl_string(r"/path\to"), r"/path\\to");
+    }
+
+    #[test]
+    fn escape_sbpl_string_escapes_double_quote() {
+        assert_eq!(escape_sbpl_string(r#"/path "evil""#), r#"/path \"evil\""#);
+    }
+
+    #[test]
+    fn escape_sbpl_string_escapes_newline_and_tab() {
+        assert_eq!(escape_sbpl_string("/path\n/inject"), "/path\\n/inject");
+        assert_eq!(escape_sbpl_string("/path\t/tab"), "/path\\t/tab");
+    }
+
+    #[test]
+    fn escape_sbpl_string_drops_control_chars() {
+        assert_eq!(escape_sbpl_string("/path\x01\x7f/ctl"), "/path/ctl");
+    }
+
+    #[test]
+    fn build_policy_escapes_quote_in_writable_root() {
+        let policy = build_policy(&roots(&["/home/user/O'Brien\"s"]));
+        assert!(
+            policy.contains(r#"(subpath "/home/user/O'Brien\"s")"#),
+            "double-quote in path must be escaped: {policy}"
+        );
+    }
+
+    #[test]
+    fn build_policy_escapes_newline_in_writable_root() {
+        let policy = build_policy(&roots(&["/home/user/evil\n(deny default)"]));
+        assert!(
+            !policy.contains("\n(deny default)\")"),
+            "newline in path must not produce raw SBPL: {policy}"
+        );
+        assert!(
+            policy.contains(r#"(subpath "/home/user/evil\n(deny default)")"#),
+            "newline should be escaped to literal \\n: {policy}"
+        );
     }
 }
