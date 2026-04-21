@@ -45,3 +45,9 @@ path = "src/bin/sid-seatbelt.rs"
 [[bin]]
 name = "sidiff"
 path = "src/bin/sidiff.rs"
+
+[profile.release]
+debug = true
+lto = true
+opt-level = 2
+panic = "abort"
