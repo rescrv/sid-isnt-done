@@ -14,14 +14,16 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
-    Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Error,
-    FileSystem, IntermediateToolResult, Message, Metadata, Model, MountHierarchy, OperatorLine,
-    Renderer, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice,
-    ToolParam, ToolResult, ToolResultBlock, ToolTextEditor20250728, ToolUnionParam, ToolUseBlock,
-    Usage,
+    Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Budget,
+    Content, ContentBlock, Error, FileSystem, IntermediateToolResult, Message, MessageParam,
+    Metadata, Model, MountHierarchy, OperatorLine, Renderer, StopReason, StreamContext,
+    SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice, ToolParam,
+    ToolResult, ToolResultBlock, ToolResultBlockContent, ToolTextEditor20250728, ToolUnionParam,
+    ToolUseBlock, TurnOutcome, Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -38,6 +40,7 @@ use crate::session::SidSession;
 use crate::tool_runtime::ToolRuntimeContext;
 
 const DEFAULT_AGENT_ID: &str = "sid";
+const USER_CANCELLED_ACTION: &str = "user cancelled action";
 
 /// Top-level agent combining chat configuration, tool bindings, and sandbox policy.
 pub struct SidAgent {
@@ -52,6 +55,7 @@ pub struct SidAgent {
     filesystem: MountHierarchy,
     session: Option<Arc<SidSession>>,
     bash_session: Mutex<Option<BashPtySession>>,
+    tool_cancellation_pending: AtomicBool,
     token_usage_totals: StdMutex<TokenUsageTotals>,
 }
 
@@ -219,6 +223,7 @@ impl SidAgent {
             filesystem,
             session,
             bash_session: Mutex::new(None),
+            tool_cancellation_pending: AtomicBool::new(false),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
         }
     }
@@ -277,11 +282,17 @@ impl SidAgent {
                     "writable_roots": self.writable_roots.as_slice(),
                 });
                 match confirm_manual_tool_call("bash", &input_value, None, renderer) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(ManualToolConfirmation::Allow) => {}
+                    Ok(ManualToolConfirmation::Deny) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             "bash call denied by operator",
+                        ));
+                    }
+                    Ok(ManualToolConfirmation::Cancel) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            USER_CANCELLED_ACTION,
                         ));
                     }
                     Err(err) => {
@@ -445,12 +456,19 @@ impl SidAgent {
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(ManualToolConfirmation::Allow) => {}
+            Ok(ManualToolConfirmation::Deny) => {
                 let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "edit call denied by operator",
+                ));
+            }
+            Ok(ManualToolConfirmation::Cancel) => {
+                let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    USER_CANCELLED_ACTION,
                 ));
             }
             Err(err) => {
@@ -531,6 +549,141 @@ impl SidAgent {
 impl Agent for SidAgent {
     fn stream_label(&self) -> String {
         self.id.clone()
+    }
+
+    async fn take_turn(
+        &mut self,
+        client: &Anthropic,
+        messages: &mut Vec<MessageParam>,
+        budget: &Arc<Budget>,
+    ) -> Result<TurnOutcome, Error> {
+        self.tool_cancellation_pending
+            .store(false, Ordering::Relaxed);
+        let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
+            let stop_reason = self.handle_max_tokens().await?;
+            return Ok(TurnOutcome {
+                stop_reason,
+                usage: Usage::new(0, 0),
+                request_count: 0,
+            });
+        };
+
+        let mut usage_total = Usage::new(0, 0);
+        let mut request_count: u64 = 0;
+        while tokens_rem.remaining_tokens()
+            > self
+                .thinking()
+                .await
+                .map(|thinking| thinking.num_tokens())
+                .unwrap_or(0)
+        {
+            match self
+                .step_default_turn(client, messages, &mut tokens_rem)
+                .await
+            {
+                ControlFlow::Continue(step) => {
+                    usage_total = usage_total + step.usage;
+                    request_count = request_count.saturating_add(step.request_count);
+                    if self
+                        .tool_cancellation_pending
+                        .swap(false, Ordering::Relaxed)
+                    {
+                        return Ok(TurnOutcome {
+                            stop_reason: StopReason::EndTurn,
+                            usage: usage_total,
+                            request_count,
+                        });
+                    }
+                }
+                ControlFlow::Break(res) => {
+                    let mut outcome = res?;
+                    outcome.usage = outcome.usage + usage_total;
+                    outcome.request_count = outcome.request_count.saturating_add(request_count);
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        let stop_reason = self.handle_max_tokens().await?;
+        Ok(TurnOutcome {
+            stop_reason,
+            usage: usage_total,
+            request_count,
+        })
+    }
+
+    async fn take_turn_streaming(
+        &mut self,
+        client: &Anthropic,
+        messages: &mut Vec<MessageParam>,
+        budget: &Arc<Budget>,
+        renderer: &mut dyn Renderer,
+        context: AgentStreamContext,
+    ) -> Result<TurnOutcome, Error> {
+        self.tool_cancellation_pending
+            .store(false, Ordering::Relaxed);
+        renderer.start_agent(&context);
+        let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
+            let stop_reason = self.handle_max_tokens().await?;
+            renderer.finish_agent(&context, Some(&stop_reason));
+            return Ok(TurnOutcome {
+                stop_reason,
+                usage: Usage::new(0, 0),
+                request_count: 0,
+            });
+        };
+
+        let mut usage_total = Usage::new(0, 0);
+        let mut request_count: u64 = 0;
+        while tokens_rem.remaining_tokens()
+            > self
+                .thinking()
+                .await
+                .map(|thinking| thinking.num_tokens())
+                .unwrap_or(0)
+        {
+            match self
+                .step_default_turn_streaming(client, messages, &mut tokens_rem, renderer, &context)
+                .await
+            {
+                ControlFlow::Continue(step) => {
+                    usage_total = usage_total + step.usage;
+                    request_count = request_count.saturating_add(step.request_count);
+                    if self
+                        .tool_cancellation_pending
+                        .swap(false, Ordering::Relaxed)
+                    {
+                        let stop_reason = StopReason::EndTurn;
+                        renderer.finish_agent(&context, Some(&stop_reason));
+                        return Ok(TurnOutcome {
+                            stop_reason,
+                            usage: usage_total,
+                            request_count,
+                        });
+                    }
+                }
+                ControlFlow::Break(res) => match res {
+                    Ok(mut outcome) => {
+                        outcome.usage = outcome.usage + usage_total;
+                        outcome.request_count = outcome.request_count.saturating_add(request_count);
+                        renderer.finish_agent(&context, Some(&outcome.stop_reason));
+                        return Ok(outcome);
+                    }
+                    Err(err) => {
+                        renderer.finish_agent(&context, None);
+                        return Err(err);
+                    }
+                },
+            }
+        }
+
+        let stop_reason = self.handle_max_tokens().await?;
+        renderer.finish_agent(&context, Some(&stop_reason));
+        Ok(TurnOutcome {
+            stop_reason,
+            usage: usage_total,
+            request_count,
+        })
     }
 
     async fn max_tokens(&self) -> u32 {
@@ -625,6 +778,96 @@ impl Agent for SidAgent {
     async fn bash(&self, command: &str, restart: bool) -> Result<String, std::io::Error> {
         self.run_bash_command(command, restart).await
     }
+
+    async fn handle_tool_use(
+        &mut self,
+        client: &Anthropic,
+        resp: &Message,
+    ) -> ControlFlow<Result<StopReason, Error>, Vec<ContentBlock>> {
+        let requested_tools = collect_requested_tool_calls(self, resp).await;
+        let mut tool_results = Vec::new();
+        for (index, requested) in requested_tools.iter().enumerate() {
+            let result = match requested.tool.as_ref() {
+                Some(tool) => {
+                    let callback = tool.callback();
+                    let tool_use = requested.tool_use.clone();
+                    let this = &*self;
+                    let intermediate = callback.compute_tool_result(client, this, &tool_use).await;
+                    match callback
+                        .apply_tool_result(client, self, &tool_use, intermediate)
+                        .await
+                    {
+                        ControlFlow::Continue(result) => result,
+                        ControlFlow::Break(err) => return ControlFlow::Break(Err(err)),
+                    }
+                }
+                None => missing_tool_result(&requested.tool_use),
+            };
+            let cancelled = tool_result_is_user_cancelled(&result);
+            push_tool_result(&mut tool_results, None, result);
+            if cancelled {
+                self.tool_cancellation_pending
+                    .store(true, Ordering::Relaxed);
+                cancel_remaining_tool_calls(
+                    &mut tool_results,
+                    requested_tools.iter().skip(index + 1),
+                );
+                break;
+            }
+        }
+        ControlFlow::Continue(tool_results)
+    }
+
+    async fn handle_tool_use_streaming(
+        &mut self,
+        client: &Anthropic,
+        resp: &Message,
+        renderer: &mut dyn Renderer,
+        context: &AgentStreamContext,
+    ) -> ControlFlow<Result<StopReason, Error>, Vec<ContentBlock>> {
+        let requested_tools = collect_requested_tool_calls(self, resp).await;
+        let mut tool_results = Vec::new();
+        for (index, requested) in requested_tools.iter().enumerate() {
+            let tool_context = context.child(format!("tool:{}", requested.tool_use.name));
+            let result = match requested.tool.as_ref() {
+                Some(tool) => {
+                    let callback = tool.callback();
+                    let this = &*self;
+                    let intermediate = callback
+                        .compute_tool_result_streaming(
+                            client,
+                            this,
+                            &requested.tool_use,
+                            renderer,
+                            &tool_context,
+                        )
+                        .await;
+                    match callback
+                        .apply_tool_result(client, self, &requested.tool_use, intermediate)
+                        .await
+                    {
+                        ControlFlow::Continue(result) => result,
+                        ControlFlow::Break(err) => return ControlFlow::Break(Err(err)),
+                    }
+                }
+                None => missing_tool_result(&requested.tool_use),
+            };
+            let cancelled = tool_result_is_user_cancelled(&result);
+            push_tool_result(&mut tool_results, Some((renderer, &tool_context)), result);
+            if cancelled {
+                self.tool_cancellation_pending
+                    .store(true, Ordering::Relaxed);
+                cancel_remaining_tool_calls_streaming(
+                    &mut tool_results,
+                    renderer,
+                    context,
+                    requested_tools.iter().skip(index + 1),
+                );
+                break;
+            }
+        }
+        ControlFlow::Continue(tool_results)
+    }
 }
 
 impl ChatAgent for SidAgent {
@@ -645,6 +888,129 @@ impl SidAgent {
             .expect("token usage totals lock poisoned");
         totals.add(usage);
         *totals
+    }
+}
+
+struct RequestedToolCall {
+    tool_use: ToolUseBlock,
+    tool: Option<Arc<dyn Tool<SidAgent>>>,
+}
+
+async fn collect_requested_tool_calls(agent: &SidAgent, resp: &Message) -> Vec<RequestedToolCall> {
+    let tools = agent.tools().await;
+    resp.content
+        .iter()
+        .filter_map(|block| {
+            let ContentBlock::ToolUse(tool_use) = block else {
+                return None;
+            };
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name() == tool_use.name)
+                .cloned();
+            Some(RequestedToolCall {
+                tool_use: tool_use.clone(),
+                tool,
+            })
+        })
+        .collect()
+}
+
+fn missing_tool_result(tool_use: &ToolUseBlock) -> Result<ToolResultBlock, ToolResultBlock> {
+    Err(ToolResultBlock::new(tool_use.id.clone())
+        .with_string_content(format!("{} not found", tool_use.name))
+        .with_error(true))
+}
+
+fn cancel_remaining_tool_calls<'a>(
+    tool_results: &mut Vec<ContentBlock>,
+    remaining: impl Iterator<Item = &'a RequestedToolCall>,
+) {
+    for requested in remaining {
+        let result = user_cancelled_tool_result(&requested.tool_use.id);
+        push_tool_result(tool_results, None, result);
+    }
+}
+
+fn cancel_remaining_tool_calls_streaming<'a>(
+    tool_results: &mut Vec<ContentBlock>,
+    renderer: &mut dyn Renderer,
+    context: &AgentStreamContext,
+    remaining: impl Iterator<Item = &'a RequestedToolCall>,
+) {
+    for requested in remaining {
+        let result = user_cancelled_tool_result(&requested.tool_use.id);
+        let tool_context = context.child(format!("tool:{}", requested.tool_use.name));
+        push_tool_result(tool_results, Some((renderer, &tool_context)), result);
+    }
+}
+
+fn user_cancelled_tool_result(tool_use_id: &str) -> Result<ToolResultBlock, ToolResultBlock> {
+    Err(user_cancelled_tool_result_block(tool_use_id))
+}
+
+fn user_cancelled_tool_result_block(tool_use_id: &str) -> ToolResultBlock {
+    ToolResultBlock::new(tool_use_id.to_string())
+        .with_string_content(USER_CANCELLED_ACTION.to_string())
+        .with_error(true)
+}
+
+fn tool_result_is_user_cancelled(result: &Result<ToolResultBlock, ToolResultBlock>) -> bool {
+    let block = match result {
+        Ok(block) | Err(block) => block,
+    };
+    block.is_error.unwrap_or(false)
+        && matches!(
+            block.content.as_ref(),
+            Some(ToolResultBlockContent::String(text)) if text == USER_CANCELLED_ACTION
+        )
+}
+
+fn push_tool_result(
+    tool_results: &mut Vec<ContentBlock>,
+    renderer: Option<(&mut dyn Renderer, &dyn StreamContext)>,
+    result: Result<ToolResultBlock, ToolResultBlock>,
+) {
+    let block = match result {
+        Ok(block) => block,
+        Err(block) => block.with_error(true),
+    };
+    if let Some((renderer, context)) = renderer {
+        render_tool_result_block(renderer, context, &block);
+    }
+    tool_results.push(block.into());
+}
+
+fn render_tool_result_block(
+    renderer: &mut dyn Renderer,
+    context: &dyn StreamContext,
+    block: &ToolResultBlock,
+) {
+    renderer.start_tool_result(context, &block.tool_use_id, block.is_error.unwrap_or(false));
+    if let Some(content) = &block.content {
+        render_tool_result_content(renderer, context, content);
+    }
+    renderer.finish_tool_result(context);
+}
+
+fn render_tool_result_content(
+    renderer: &mut dyn Renderer,
+    context: &dyn StreamContext,
+    content: &ToolResultBlockContent,
+) {
+    match content {
+        ToolResultBlockContent::String(text) => renderer.print_tool_result_text(context, text),
+        ToolResultBlockContent::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    renderer.print_tool_result_text(context, "\n");
+                }
+                match item {
+                    Content::Text(text) => renderer.print_tool_result_text(context, &text.text),
+                    Content::Image(_) => renderer.print_tool_result_text(context, "[image]"),
+                }
+            }
+        }
     }
 }
 
@@ -1035,13 +1401,17 @@ async fn invoke_external_tool(
             )
             .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(ManualToolConfirmation::Allow) => {}
+                Ok(ManualToolConfirmation::Deny) => {
                     let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
                     return tool_error_result(
                         &tool_use.id,
                         format!("tool '{}' call denied by operator", tool.name),
                     );
+                }
+                Ok(ManualToolConfirmation::Cancel) => {
+                    let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, false);
+                    return tool_user_cancelled_result(&tool_use.id);
                 }
                 Err(err) => {
                     let _ = tool_runtime::cleanup_prepared_rc_tool(&prepared, true);
@@ -1084,10 +1454,24 @@ async fn invoke_external_tool(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManualToolConfirmation {
+    Allow,
+    Deny,
+    Cancel,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ManualToolInput {
+    Line(String),
+    Cancel,
+}
+
 /// Prompt the operator to confirm a manual tool call via stdin/stdout.
 ///
-/// Returns `Ok(true)` when the operator approves, `Ok(false)` when denied or
-/// stdin reaches EOF, and `Err` on I/O failure.
+/// Returns `Allow` when the operator approves, `Deny` when the operator answers
+/// no, `Cancel` when the prompt is interrupted or reaches EOF, and `Err` on I/O
+/// failure.
 async fn confirm_manual_prepared_tool_call(
     tool_name: &str,
     input: &serde_json::Value,
@@ -1095,7 +1479,7 @@ async fn confirm_manual_prepared_tool_call(
     prepared: &tool_runtime::PreparedRcToolInvocation,
     session: Option<&SidSession>,
     renderer: Option<&mut dyn Renderer>,
-) -> Result<bool, String> {
+) -> Result<ManualToolConfirmation, String> {
     let preview = if confirm_preview {
         tool_runtime::render_rc_tool_confirmation_preview(prepared, session)
             .await
@@ -1111,7 +1495,7 @@ fn confirm_manual_tool_call(
     input: &serde_json::Value,
     preview: Option<&str>,
     mut renderer: Option<&mut dyn Renderer>,
-) -> Result<bool, String> {
+) -> Result<ManualToolConfirmation, String> {
     let input_display = preview.map(str::to_string).unwrap_or_else(|| {
         serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"))
     });
@@ -1119,10 +1503,14 @@ fn confirm_manual_tool_call(
     loop {
         let prompt =
             format!("Tool '{tool_name}' is MANUAL.\n{input_display}\nAllow this call? [yes/no]: ");
-        let buf = read_operator_line(&mut renderer, &prompt)?;
+        let input = read_operator_line(&mut renderer, &prompt)?;
+        let ManualToolInput::Line(buf) = input else {
+            return Ok(ManualToolConfirmation::Cancel);
+        };
 
         match parse_tool_confirmation(&buf) {
-            Some(answer) => return Ok(answer),
+            Some(true) => return Ok(ManualToolConfirmation::Allow),
+            Some(false) => return Ok(ManualToolConfirmation::Deny),
             None => println!("Please answer yes or no."),
         }
     }
@@ -1131,7 +1519,7 @@ fn confirm_manual_tool_call(
 fn read_operator_line(
     renderer: &mut Option<&mut dyn Renderer>,
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<ManualToolInput, String> {
     use std::io::{self, Write};
 
     if let Some(renderer) = renderer.as_mut()
@@ -1140,10 +1528,10 @@ fn read_operator_line(
             .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
     {
         return match line {
-            OperatorLine::Line(line) => Ok(line),
+            OperatorLine::Line(line) => Ok(ManualToolInput::Line(line)),
             OperatorLine::Eof | OperatorLine::Interrupted => {
                 println!();
-                Ok("no".to_string())
+                Ok(ManualToolInput::Cancel)
             }
         };
     }
@@ -1154,15 +1542,20 @@ fn read_operator_line(
         .map_err(|err| format!("failed to flush manual-tool confirmation prompt: {err}"))?;
 
     let mut buf = String::new();
-    if io::stdin()
-        .read_line(&mut buf)
-        .map_err(|err| format!("failed to read manual-tool confirmation input: {err}"))?
-        == 0
-    {
-        println!();
-        return Ok("no".to_string());
+    match io::stdin().read_line(&mut buf) {
+        Ok(0) => {
+            println!();
+            Ok(ManualToolInput::Cancel)
+        }
+        Ok(_) => Ok(ManualToolInput::Line(buf)),
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+            println!();
+            Ok(ManualToolInput::Cancel)
+        }
+        Err(err) => Err(format!(
+            "failed to read manual-tool confirmation input: {err}"
+        )),
     }
-    Ok(buf)
 }
 
 fn parse_tool_confirmation(input: &str) -> Option<bool> {
@@ -1199,6 +1592,10 @@ fn tool_error_result(tool_use_id: &str, message: String) -> ToolResult {
     ControlFlow::Continue(Err(ToolResultBlock::new(tool_use_id.to_string())
         .with_string_content(message)
         .with_error(true)))
+}
+
+fn tool_user_cancelled_result(tool_use_id: &str) -> ToolResult {
+    ControlFlow::Continue(user_cancelled_tool_result(tool_use_id))
 }
 
 /// Build the default writable roots for a workspace.
@@ -1481,10 +1878,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
 
-    use claudius::{
-        KnownModel, ToolBash20250124, ToolResultBlockContent, ToolTextEditor20250728,
-        ToolUnionParam,
-    };
+    use claudius::{KnownModel, ToolBash20250124, ToolTextEditor20250728, ToolUnionParam};
     use serde_json::json;
 
     use super::*;
@@ -1828,18 +2222,98 @@ mod tests {
             OperatorLine::Line("yes".to_string()),
         ]);
 
-        assert!(confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap());
+        assert_eq!(
+            confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap(),
+            ManualToolConfirmation::Allow
+        );
         assert_eq!(renderer.prompts.len(), 2);
         assert!(renderer.prompts[0].contains("Tool 'bash' is MANUAL."));
     }
 
     #[test]
-    fn manual_tool_confirmation_interrupted_renderer_denies() {
+    fn manual_tool_confirmation_interrupted_renderer_cancels() {
         let input = json!({ "command": "pwd" });
         let mut renderer = ScriptedRenderer::new([OperatorLine::Interrupted]);
 
-        assert!(!confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap());
+        assert_eq!(
+            confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap(),
+            ManualToolConfirmation::Cancel
+        );
         assert_eq!(renderer.prompts.len(), 1);
+    }
+
+    #[test]
+    fn interrupted_manual_tool_cancels_remaining_tool_calls() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash edit'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            "bash_ENABLED=MANUAL\nedit_ENABLED=MANUAL\n",
+        )
+        .unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        write_tool_runtime(&root, "edit", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let response = Message::new(
+            "msg_test".to_string(),
+            vec![
+                ToolUseBlock::new(
+                    "toolu_bash",
+                    "bash",
+                    json!({
+                        "command": "pwd"
+                    }),
+                )
+                .into(),
+                ToolUseBlock::new(
+                    "toolu_edit",
+                    "str_replace_based_edit_tool",
+                    json!({
+                        "command": "view",
+                        "path": "/src/lib.rs"
+                    }),
+                )
+                .into(),
+            ],
+            Model::Known(KnownModel::ClaudeHaiku45),
+            Usage::new(0, 0),
+        )
+        .with_stop_reason(StopReason::ToolUse);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut renderer = ScriptedRenderer::new([OperatorLine::Interrupted]);
+        let context = AgentStreamContext::root("build");
+
+        let result = runtime.block_on(agent.handle_tool_use_streaming(
+            &client,
+            &response,
+            &mut renderer,
+            &context,
+        ));
+        let ControlFlow::Continue(blocks) = result else {
+            panic!("expected tool result blocks, got {result:?}");
+        };
+
+        assert_eq!(renderer.prompts.len(), 1);
+        assert_eq!(blocks.len(), 2);
+        let first = blocks[0].as_tool_result().unwrap().clone();
+        let second = blocks[1].as_tool_result().unwrap().clone();
+        assert_eq!(first.tool_use_id, "toolu_bash");
+        assert_eq!(second.tool_use_id, "toolu_edit");
+        assert_eq!(first.is_error, Some(true));
+        assert_eq!(second.is_error, Some(true));
+        assert_eq!(tool_block_text(first), USER_CANCELLED_ACTION);
+        assert_eq!(tool_block_text(second), USER_CANCELLED_ACTION);
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]
