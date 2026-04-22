@@ -204,6 +204,27 @@ build_THINKING="on"
 `<agent>_CACHING_ENABLED`
 : Optional prompt-cache toggle.
 
+`<agent>_USER_INSTRUCTIONS`
+: Optional boolean.  Defaults to `YES`.  Set to `NO` to disable automatic
+  hook-based user-instruction injection for this agent.
+
+`<agent>_AGENTS_MD`
+: Optional boolean.  Defaults to `YES`.  Set to `NO` to disable AGENTS.md file
+  injection.
+
+`<agent>_AGENTS_MD_PATH`
+: Optional colon-separated list of AGENTS.md files to read.  Relative paths are
+  resolved under the workspace root, `~/` expands from `HOME`, missing files are
+  skipped, and existing files are concatenated in path order.  Put global files
+  before local files so local instructions appear later in the injected
+  document with proper context.  If unset, `sid` uses `AGENTS_MD_PATH` from the
+  environment, then falls back to `./AGENTS.md`.
+
+`<agent>_USER_INSTRUCTIONS_HOOK`
+: Optional rc-conf service name.  `sid` invokes `agents/<service> run` for each
+  user turn and appends the hook's standard output to the injected user
+  instructions.  The executable must answer `rcvar` and `run`.
+
 The prompt file for an agent is `agents/<agent>.md`.  If the agent is an alias,
 `sid` follows the rc-conf alias lookup order and uses the first matching prompt
 file.  Prompt-file content becomes the agent's system prompt unless overridden
@@ -211,6 +232,60 @@ by `<agent>_SYSTEM`.
 
 If `DEFAULT_AGENT` is unset, `sid` starts the first enabled agent.  If no agent
 is enabled, it starts the first manual agent after confirmation.
+
+## USER INSTRUCTIONS
+
+User instructions are dynamically appended as a final text block on each user
+turn before `sid` sends the turn to the model.  The saved conversation history
+is remains after the turn, so that caching works and the agent always has proper
+context on the things to which they pay attention.
+
+Hook output is wrapped under `# User instructions from hook <name>`.  Direct
+system and operator instructions take precedence over these injected user
+instructions.
+
+A hook is an rc-style executable in `agents/`.  It uses `agents.conf` plus a
+per-invocation overlay and receives `RC_CONF_PATH`, `RC_D_PATH`, `RCVAR_ARGV0`,
+and any rcvars it advertises.  Common advertised variables are:
+
+```text
+<hook>_WORKSPACE_ROOT
+<hook>_CONFIG_ROOT
+<hook>_AGENT_ID
+<hook>_HOOK_NAME
+<hook>_AGENTS_MD_PATH
+<hook>_SCRATCH_DIR
+<hook>_TEMP_DIR
+<hook>_TMPDIR
+<hook>_RC_CONF_PATH
+<hook>_RC_D_PATH
+```
+
+Example hook:
+
+```sh
+#!/bin/sh
+set -eu
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_AGENT_ID"
+    ;;
+run)
+    WORKSPACE_ROOT=$(printenv "${PREFIX}_WORKSPACE_ROOT")
+    AGENT_ID=$(printenv "${PREFIX}_AGENT_ID")
+    printf 'Agent %s is working in %s\n' "$AGENT_ID" "$WORKSPACE_ROOT"
+    ;;
+*)
+    echo "usage: $0 [rcvar|run]" >&2
+    exit 129
+    ;;
+esac
+```
 
 ## SKILLS
 
@@ -509,6 +584,12 @@ Protocol rules:
 `SID_SKILLS_PATH`
 : Colon-separated list of directories to scan for `*/SKILL.md`.  If unset,
   `sid` scans `skills/` under the configuration root.
+
+`AGENTS_MD_PATH`
+: Colon-separated list of AGENTS.md files to inject when
+  `<agent>_AGENTS_MD_PATH` is unset.  Relative paths are resolved under the
+  workspace root.  Files are concatenated in order, so list global files before
+  local files if you desire that.  If both are unset, `sid` checks `./AGENTS.md`.
 
 `SID_WORKSPACE_ROOT`
 : Set by `sid` for child processes to the absolute workspace root.

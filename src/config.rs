@@ -18,6 +18,8 @@ pub const AGENTS_DIR: &str = "agents";
 pub const TOOLS_DIR: &str = "tools";
 pub const SKILLS_DIR: &str = "skills";
 pub const SKILL_FILE: &str = "SKILL.md";
+pub const AGENTS_MD_FILE: &str = "AGENTS.md";
+pub const AGENTS_MD_PATH_ENV: &str = "AGENTS_MD_PATH";
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -27,6 +29,7 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentConfig>,
     pub tools: BTreeMap<String, ToolConfig>,
     pub skills: BTreeMap<String, SkillConfig>,
+    pub(crate) agents_rc_conf: RcConf,
     pub(crate) tools_rc_conf: RcConf,
 }
 
@@ -82,6 +85,7 @@ impl Config {
             agents,
             tools,
             skills,
+            agents_rc_conf,
             tools_rc_conf,
         })
     }
@@ -98,6 +102,10 @@ pub struct AgentConfig {
     pub prompt_path: Path<'static>,
     pub prompt_markdown: Option<String>,
     pub chat_config: ChatConfig,
+    pub user_instructions_enabled: bool,
+    pub agents_md_enabled: bool,
+    pub agents_md_path: Option<String>,
+    pub user_instructions_hook: Option<String>,
 }
 
 impl AgentConfig {
@@ -115,6 +123,12 @@ impl AgentConfig {
         let description = lookup_expanded(&provider, agent, "DESC")?;
         let tools = lookup_split_field(&provider, agent, "TOOLS")?;
         let skills = lookup_split_field(&provider, agent, "SKILLS")?;
+        let user_instructions_enabled =
+            lookup_bool_field(&provider, agent, "USER_INSTRUCTIONS", true)?;
+        let agents_md_enabled = lookup_bool_field(&provider, agent, "AGENTS_MD", true)?;
+        let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
+        let user_instructions_hook =
+            lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
 
         let prompt_path = resolve_agent_prompt_path(agents_dir, rc_conf, agent);
         let prompt_markdown = if prompt_path.exists() {
@@ -139,6 +153,10 @@ impl AgentConfig {
             prompt_path,
             prompt_markdown,
             chat_config,
+            user_instructions_enabled,
+            agents_md_enabled,
+            agents_md_path,
+            user_instructions_hook,
         })
     }
 }
@@ -630,6 +648,29 @@ fn lookup_split_field(
         return Ok(vec![]);
     };
     shvar::split(&value).map_err(|err| invalid_config_field(scope, key, &value, format!("{err:?}")))
+}
+
+fn lookup_nonempty_field(
+    provider: &impl VariableProvider,
+    scope: &str,
+    key: &str,
+) -> Result<Option<String>, SError> {
+    Ok(lookup_expanded(provider, scope, key)?.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    }))
+}
+
+fn lookup_bool_field(
+    provider: &impl VariableProvider,
+    scope: &str,
+    key: &str,
+    default: bool,
+) -> Result<bool, SError> {
+    let Some(value) = lookup_expanded(provider, scope, key)? else {
+        return Ok(default);
+    };
+    parse_bool_field(scope, key, &value)
 }
 
 fn parse_u32_field(scope: &str, field: &str, value: &str) -> Result<u32, SError> {

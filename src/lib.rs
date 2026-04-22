@@ -8,6 +8,7 @@ pub mod sidiff;
 pub(crate) mod test_support;
 mod tool_protocol;
 mod tool_runtime;
+mod user_instructions;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -38,6 +39,10 @@ use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolv
 use crate::seatbelt::WritableRoots;
 use crate::session::SidSession;
 use crate::tool_runtime::ToolRuntimeContext;
+use crate::user_instructions::{
+    UserInstructionRuntimeContext, UserInstructionSettings, append_agents_md_to_system_prompt,
+    append_user_instruction_block, build_user_instruction_block, resolve_user_instruction_settings,
+};
 
 const DEFAULT_AGENT_ID: &str = "sid";
 const USER_CANCELLED_ACTION: &str = "user cancelled action";
@@ -51,6 +56,7 @@ pub struct SidAgent {
     builtin_bindings: BuiltinToolBindings,
     config_root: Path<'static>,
     workspace_root: Path<'static>,
+    user_instructions: UserInstructionSettings,
     writable_roots: WritableRoots,
     filesystem: MountHierarchy,
     session: Option<Arc<SidSession>>,
@@ -79,6 +85,7 @@ impl SidAgent {
             BuiltinToolBindings::default(),
             config_root,
             workspace_root,
+            UserInstructionSettings::default(),
             writable_roots,
             filesystem,
             None,
@@ -95,11 +102,13 @@ impl SidAgent {
         fallback: ChatConfig,
     ) -> Result<Self, SError> {
         if !workspace_has_config(config_root) {
-            return Ok(Self::new_with_roots(
+            let mut agent = Self::new_with_roots(
                 fallback,
                 config_root.clone().into_owned(),
                 workspace_root.clone().into_owned(),
-            ));
+            );
+            agent.append_agents_md_to_system_prompt()?;
+            return Ok(agent);
         }
         let config = Config::load(config_root)?;
         let agent = default_agent_id(&config)?;
@@ -127,11 +136,13 @@ impl SidAgent {
     ) -> Result<Self, SError> {
         if !workspace_has_config(config_root) {
             return if agent == DEFAULT_AGENT_ID {
-                Ok(Self::new_with_roots(
+                let mut agent = Self::new_with_roots(
                     fallback,
                     config_root.clone().into_owned(),
                     workspace_root.clone().into_owned(),
-                ))
+                );
+                agent.append_agents_md_to_system_prompt()?;
+                Ok(agent)
             } else {
                 Err(missing_agent_error(agent))
             };
@@ -161,6 +172,14 @@ impl SidAgent {
         self.enabled == SwitchPosition::Manual
     }
 
+    fn append_agents_md_to_system_prompt(&mut self) -> Result<(), SError> {
+        append_agents_md_to_system_prompt(
+            &mut self.config,
+            &self.user_instructions,
+            &self.workspace_root,
+        )
+    }
+
     fn from_loaded_config(
         config: &Config,
         agent: &str,
@@ -179,11 +198,13 @@ impl SidAgent {
         let mut chat_config = merged_chat_config(agent_config, fallback);
         let skills = resolve_agent_skills(config, agent_config)?;
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
+        let user_instructions = resolve_user_instruction_settings(config, agent_config)?;
         let writable_roots = default_writable_roots(&workspace_root);
         append_system_description(&mut chat_config, &workspace_root);
         if !skills.is_empty() {
             append_skill_index_to_system_prompt(&mut chat_config, &skills);
         }
+        append_agents_md_to_system_prompt(&mut chat_config, &user_instructions, &workspace_root)?;
         Ok(Self::with_parts(
             agent.to_string(),
             agent_config.enabled,
@@ -192,6 +213,7 @@ impl SidAgent {
             built_tools.builtin_bindings,
             config.root.clone(),
             workspace_root,
+            user_instructions,
             writable_roots,
             filesystem,
             None,
@@ -207,6 +229,7 @@ impl SidAgent {
         builtin_bindings: BuiltinToolBindings,
         config_root: Path<'static>,
         workspace_root: Path<'static>,
+        user_instructions: UserInstructionSettings,
         writable_roots: WritableRoots,
         filesystem: MountHierarchy,
         session: Option<Arc<SidSession>>,
@@ -219,6 +242,7 @@ impl SidAgent {
             builtin_bindings,
             config_root,
             workspace_root,
+            user_instructions,
             writable_roots,
             filesystem,
             session,
@@ -363,6 +387,32 @@ impl SidAgent {
             writable_roots: &self.writable_roots,
             session: self.session.as_deref(),
         }
+    }
+
+    fn user_instruction_runtime_context(&self) -> UserInstructionRuntimeContext<'_> {
+        UserInstructionRuntimeContext {
+            agent_id: &self.id,
+            config_root: &self.config_root,
+            workspace_root: &self.workspace_root,
+            session: self.session.as_deref(),
+        }
+    }
+
+    async fn inject_user_instructions_for_turn(
+        &self,
+        messages: &mut [MessageParam],
+    ) -> Result<(), Error> {
+        let Some(instructions) = build_user_instruction_block(
+            &self.user_instructions,
+            &self.user_instruction_runtime_context(),
+        )
+        .await
+        .map_err(|err| Error::unknown(format!("failed to build user instructions: {err}")))?
+        else {
+            return Ok(());
+        };
+        append_user_instruction_block(messages, instructions);
+        Ok(())
     }
 
     fn prepare_rc_tool(
@@ -559,6 +609,7 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        self.inject_user_instructions_for_turn(messages).await?;
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
             return Ok(TurnOutcome {
@@ -622,6 +673,7 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        self.inject_user_instructions_for_turn(messages).await?;
         renderer.start_agent(&context);
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
@@ -1878,7 +1930,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
 
-    use claudius::{KnownModel, ToolBash20250124, ToolTextEditor20250728, ToolUnionParam};
+    use claudius::{
+        KnownModel, MessageParamContent, ToolBash20250124, ToolTextEditor20250728, ToolUnionParam,
+    };
     use serde_json::json;
 
     use super::*;
@@ -2155,6 +2209,25 @@ mod tests {
     }
 
     #[test]
+    fn from_workspace_without_config_appends_agents_md_to_system_prompt() {
+        let root = unique_temp_dir("agent");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("AGENTS.md").as_str(), "Use workspace rules.\n").unwrap();
+
+        let fallback = ChatConfig::new()
+            .with_system_prompt("fallback system".to_string())
+            .with_max_tokens(2048);
+        let agent = SidAgent::from_workspace(&root, fallback).unwrap();
+        let prompt = agent.config.system_prompt_text().unwrap();
+
+        assert!(prompt.starts_with("fallback system"));
+        assert!(prompt.contains("# User instructions from AGENTS.md"));
+        assert!(prompt.contains("Use workspace rules."));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn agent_create_request_forwards_chat_config_request_fields() {
         let root = unique_temp_dir("agent-request");
         fs::create_dir_all(root.as_str()).unwrap();
@@ -2338,6 +2411,181 @@ mod tests {
         totals.add(Usage::new(-10, -4).with_cache_read_input_tokens(-6));
 
         assert_eq!(totals, TokenUsageTotals::default());
+    }
+
+    #[test]
+    fn agents_md_instructions_are_appended_to_system_prompt() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("AGENTS.md").as_str(), "Use local rules.\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let mut messages = vec![MessageParam::user("Do the work.")];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.inject_user_instructions_for_turn(&mut messages))
+            .unwrap();
+
+        assert_eq!(messages[0], MessageParam::user("Do the work."));
+        let prompt = agent.config.system_prompt_text().unwrap();
+        assert!(prompt.contains("# User instructions from AGENTS.md"));
+        assert!(prompt.contains("Use local rules."));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn agents_md_path_concatenates_existing_files_in_order() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("local").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_AGENTS_MD_PATH='global.md:missing.md:local/AGENTS.md'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("global.md").as_str(), "Global rules.\n").unwrap();
+        fs::write(root.join("local/AGENTS.md").as_str(), "Local rules.\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let prompt = agent.config.system_prompt_text().unwrap();
+        let global = prompt.find("Global rules.").unwrap();
+        let local = prompt.find("Local rules.").unwrap();
+        assert!(global < local);
+        assert!(!prompt.contains("missing.md"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn agents_md_injection_can_be_disabled() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_AGENTS_MD=NO\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("AGENTS.md").as_str(), "Use local rules.\n").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let mut messages = vec![MessageParam::user("Do the work.")];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.inject_user_instructions_for_turn(&mut messages))
+            .unwrap();
+
+        assert_eq!(messages[0], MessageParam::user("Do the work."));
+        assert!(
+            !agent
+                .config
+                .system_prompt_text()
+                .unwrap()
+                .contains("Use local rules.")
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn user_instruction_hook_runs_with_rc_overlay() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_USER_INSTRUCTIONS_HOOK=context\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("AGENTS.md").as_str(), "Use local rules.\n").unwrap();
+        write_agent_hook(
+            &root,
+            "context",
+            r#"#!/bin/sh
+set -eu
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_CONFIG_ROOT" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_HOOK_NAME" \
+        "${PREFIX}_AGENTS_MD_PATH" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+run)
+    printf 'workspace=%s\n' "$(printenv "${PREFIX}_WORKSPACE_ROOT")"
+    printf 'config=%s\n' "$(printenv "${PREFIX}_CONFIG_ROOT")"
+    printf 'agent=%s\n' "$(printenv "${PREFIX}_AGENT_ID")"
+    printf 'hook=%s\n' "$(printenv "${PREFIX}_HOOK_NAME")"
+    printf 'agents_md=%s\n' "$(printenv "${PREFIX}_AGENTS_MD_PATH")"
+    printf 'scratch=%s\n' "$(printenv "${PREFIX}_SCRATCH_DIR")"
+    printf 'temp=%s\n' "$(printenv "${PREFIX}_TEMP_DIR")"
+    printf 'tmpdir=%s\n' "$(printenv "${PREFIX}_TMPDIR")"
+    printf 'rc=%s\n' "$(printenv "${PREFIX}_RC_CONF_PATH")"
+    printf 'rcd=%s\n' "$(printenv "${PREFIX}_RC_D_PATH")"
+    ;;
+*)
+    exit 129
+    ;;
+esac
+"#,
+        );
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let mut messages = vec![MessageParam::user("Do the work.")];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.inject_user_instructions_for_turn(&mut messages))
+            .unwrap();
+        let injected = injected_user_instruction_text(&messages[0]);
+
+        assert!(injected.contains("# User instructions from hook context"));
+        assert!(!injected.contains("Use local rules."));
+        assert!(injected.contains(&format!("workspace={}", root.as_str())));
+        assert!(injected.contains(&format!("config={}", root.as_str())));
+        assert!(injected.contains("agent=build"));
+        assert!(injected.contains("hook=context"));
+        assert!(injected.contains(&format!("agents_md={}", root.join("AGENTS.md").as_str())));
+        assert!(injected.contains("scratch=/"));
+        assert!(injected.contains("temp=/"));
+        assert!(injected.contains("tmpdir=/"));
+        assert!(injected.contains(root.join("agents.conf").as_str()));
+        assert!(injected.contains(&format!("rcd={}", root.join("agents").as_str())));
+        assert!(
+            agent
+                .config
+                .system_prompt_text()
+                .unwrap()
+                .contains("Use local rules.")
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]
@@ -3516,6 +3764,17 @@ format_ALIASES="fmt"
         }
     }
 
+    fn injected_user_instruction_text(message: &MessageParam) -> &str {
+        let MessageParamContent::Array(blocks) = &message.content else {
+            panic!("expected content blocks, got {:?}", message.content);
+        };
+        blocks
+            .last()
+            .and_then(ContentBlock::as_text)
+            .map(|block| block.text.as_str())
+            .expect("last block should be injected text")
+    }
+
     fn success_tool_script(text: &str, capture_request: bool) -> String {
         let capture = if capture_request {
             "cp \"$REQUEST_FILE\" \"$WORKSPACE_ROOT/request-capture.json\"\n"
@@ -3618,6 +3877,13 @@ format_ALIASES="fmt"
             ),
         )
         .unwrap();
+        make_executable(&executable);
+    }
+
+    fn write_agent_hook(root: &Path, hook: &str, body: &str) {
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        let executable = root.join(format!("agents/{hook}")).into_owned();
+        fs::write(executable.as_str(), body).unwrap();
         make_executable(&executable);
     }
 }
