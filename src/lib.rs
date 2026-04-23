@@ -4,6 +4,7 @@ mod filesystem;
 pub mod seatbelt;
 pub mod session;
 pub mod sidiff;
+pub mod skill_inject;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_protocol;
@@ -21,10 +22,10 @@ use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
     Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Budget,
     Content, ContentBlock, Error, FileSystem, IntermediateToolResult, Message, MessageParam,
-    Metadata, Model, MountHierarchy, OperatorLine, Renderer, StopReason, StreamContext,
-    SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice, ToolParam,
-    ToolResult, ToolResultBlock, ToolResultBlockContent, ToolTextEditor20250728, ToolUnionParam,
-    ToolUseBlock, TurnOutcome, Usage,
+    MessageRole, Metadata, Model, MountHierarchy, OperatorLine, Renderer, StopReason,
+    StreamContext, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice,
+    ToolParam, ToolResult, ToolResultBlock, ToolResultBlockContent, ToolTextEditor20250728,
+    ToolUnionParam, ToolUseBlock, TurnOutcome, Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -54,6 +55,7 @@ pub struct SidAgent {
     config: ChatConfig,
     tools: Vec<Arc<dyn Tool<Self>>>,
     builtin_bindings: BuiltinToolBindings,
+    skills: Vec<SkillConfig>,
     config_root: Path<'static>,
     workspace_root: Path<'static>,
     user_instructions: UserInstructionSettings,
@@ -83,6 +85,7 @@ impl SidAgent {
             config,
             vec![],
             BuiltinToolBindings::default(),
+            Vec::new(),
             config_root,
             workspace_root,
             UserInstructionSettings::default(),
@@ -197,6 +200,7 @@ impl SidAgent {
         let built_tools = build_tools(config, agent_config)?;
         let mut chat_config = merged_chat_config(agent_config, fallback);
         let skills = resolve_agent_skills(config, agent_config)?;
+        let agent_skills = skills.iter().map(|skill| (*skill).clone()).collect();
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
         let user_instructions = resolve_user_instruction_settings(config, agent_config)?;
         let writable_roots = default_writable_roots(&workspace_root);
@@ -211,6 +215,7 @@ impl SidAgent {
             chat_config,
             built_tools.tools,
             built_tools.builtin_bindings,
+            agent_skills,
             config.root.clone(),
             workspace_root,
             user_instructions,
@@ -227,6 +232,7 @@ impl SidAgent {
         config: ChatConfig,
         tools: Vec<Arc<dyn Tool<Self>>>,
         builtin_bindings: BuiltinToolBindings,
+        skills: Vec<SkillConfig>,
         config_root: Path<'static>,
         workspace_root: Path<'static>,
         user_instructions: UserInstructionSettings,
@@ -240,6 +246,7 @@ impl SidAgent {
             config,
             tools,
             builtin_bindings,
+            skills,
             config_root,
             workspace_root,
             user_instructions,
@@ -389,25 +396,22 @@ impl SidAgent {
         }
     }
 
-    fn user_instruction_runtime_context(&self) -> UserInstructionRuntimeContext<'_> {
-        UserInstructionRuntimeContext {
-            agent_id: &self.id,
-            config_root: &self.config_root,
-            workspace_root: &self.workspace_root,
-            session: self.session.as_deref(),
-        }
-    }
-
     async fn inject_user_instructions_for_turn(
         &self,
         messages: &mut [MessageParam],
     ) -> Result<(), Error> {
-        let Some(instructions) = build_user_instruction_block(
-            &self.user_instructions,
-            &self.user_instruction_runtime_context(),
-        )
-        .await
-        .map_err(|err| Error::unknown(format!("failed to build user instructions: {err}")))?
+        let latest_user_message = latest_user_message_text(messages);
+        let context = UserInstructionRuntimeContext {
+            agent_id: &self.id,
+            config_root: &self.config_root,
+            workspace_root: &self.workspace_root,
+            session: self.session.as_deref(),
+            latest_user_message: latest_user_message.as_deref(),
+            skills: &self.skills,
+        };
+        let Some(instructions) = build_user_instruction_block(&self.user_instructions, &context)
+            .await
+            .map_err(|err| Error::unknown(format!("failed to build user instructions: {err}")))?
         else {
             return Ok(());
         };
@@ -1901,6 +1905,28 @@ fn append_skill_index_to_system_prompt(chat_config: &mut ChatConfig, skills: &[&
     chat_config.set_system_prompt(Some(format!("{existing}{index}")));
 }
 
+fn latest_user_message_text(messages: &[MessageParam]) -> Option<String> {
+    let message = messages.last()?;
+    if message.role != MessageRole::User {
+        return None;
+    }
+    match &message.content {
+        claudius::MessageParamContent::String(text) => Some(text.clone()),
+        claudius::MessageParamContent::Array(blocks) => {
+            if blocks.iter().any(ContentBlock::is_tool_result) {
+                return None;
+            }
+            let text = blocks
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            Some(text)
+        }
+    }
+}
+
 fn missing_agent_error(agent: &str) -> SError {
     SError::new("sid-agent")
         .with_code("unknown_agent")
@@ -2584,6 +2610,65 @@ esac
                 .unwrap()
                 .contains("Use local rules.")
         );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn user_instruction_hook_receives_user_message_and_skill_manifest() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_SKILLS='rust python PATH'\nbuild_USER_INSTRUCTIONS_HOOK='context'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        write_agent_hook(
+            &root,
+            "context",
+            r#"#!/bin/sh
+set -eu
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_USER_MESSAGE_FILE" \
+        "${PREFIX}_SKILLS_MANIFEST_FILE"
+    ;;
+run)
+    USER_MESSAGE_FILE=$(printenv "${PREFIX}_USER_MESSAGE_FILE")
+    SKILLS_MANIFEST_FILE=$(printenv "${PREFIX}_SKILLS_MANIFEST_FILE")
+    printf 'message=%s\n' "$(cat "$USER_MESSAGE_FILE")"
+    printf 'manifest='
+    cat "$SKILLS_MANIFEST_FILE"
+    ;;
+*)
+    exit 129
+    ;;
+esac
+"#,
+        );
+        write_skill(&root, "rust", "# Rust Skill\n\nUse Rust idioms.\n");
+        write_skill(&root, "python", "# Python Skill\n\nUse Python idioms.\n");
+        write_skill(&root, "PATH", "# Path Skill\n\nShould not be injected.\n");
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let original = "Use $rust and $rust; ignore $python-extra and $PATH.";
+        let mut messages = vec![MessageParam::user(original)];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.inject_user_instructions_for_turn(&mut messages))
+            .unwrap();
+
+        let injected = injected_user_instruction_text(&messages[0]);
+        assert!(injected.contains("message=Use $rust and $rust; ignore $python-extra and $PATH."));
+        assert!(injected.contains("rust\t/skills/rust/SKILL.md\t"));
+        assert!(injected.contains("python\t/skills/python/SKILL.md\t"));
+        assert!(!injected.contains("PATH\t/skills/PATH/SKILL.md\t"));
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
@@ -3885,5 +3970,11 @@ format_ALIASES="fmt"
         let executable = root.join(format!("agents/{hook}")).into_owned();
         fs::write(executable.as_str(), body).unwrap();
         make_executable(&executable);
+    }
+
+    fn write_skill(root: &Path, skill: &str, body: &str) {
+        let skill_dir = root.join(format!("skills/{skill}")).into_owned();
+        fs::create_dir_all(skill_dir.as_str()).unwrap();
+        fs::write(skill_dir.join("SKILL.md").as_str(), body).unwrap();
     }
 }

@@ -14,6 +14,7 @@ use utf8path::Path;
 
 use crate::config::{
     AGENTS_CONF_FILE, AGENTS_DIR, AGENTS_MD_FILE, AGENTS_MD_PATH_ENV, AgentConfig, Config,
+    SkillConfig,
 };
 use crate::seatbelt::WritableRoots;
 use crate::session;
@@ -47,6 +48,8 @@ pub(crate) struct UserInstructionRuntimeContext<'a> {
     pub(crate) config_root: &'a Path<'a>,
     pub(crate) workspace_root: &'a Path<'a>,
     pub(crate) session: Option<&'a session::SidSession>,
+    pub(crate) latest_user_message: Option<&'a str>,
+    pub(crate) skills: &'a [SkillConfig],
 }
 
 struct HookDirs {
@@ -57,9 +60,18 @@ struct HookDirs {
 struct HookOverlayContext<'a> {
     scratch_dir: &'a StdPath,
     temp_dir: &'a StdPath,
+    user_message_file: &'a StdPath,
+    skills_manifest_file: &'a StdPath,
+    skills_dir: &'a StdPath,
     rc_conf_path: &'a str,
     rc_d_path: &'a str,
     agents_md_path: &'a str,
+}
+
+struct HookTurnFiles {
+    user_message_file: PathBuf,
+    skills_manifest_file: PathBuf,
+    skills_dir: PathBuf,
 }
 
 pub(crate) fn resolve_user_instruction_settings(
@@ -331,6 +343,108 @@ fn join_paths_for_env(paths: &[PathBuf]) -> String {
         .join(":")
 }
 
+fn write_hook_turn_files(
+    hook: &UserInstructionHook,
+    context: &UserInstructionRuntimeContext<'_>,
+    dirs: &HookDirs,
+) -> Result<HookTurnFiles, String> {
+    let user_message_file = dirs.scratch_dir.join("user-message.txt");
+    fs::write(
+        &user_message_file,
+        context.latest_user_message.unwrap_or_default(),
+    )
+    .map_err(|err| {
+        format!(
+            "user-instructions hook '{}' failed to write user message file {}: {}",
+            hook.service_name,
+            user_message_file.display(),
+            err
+        )
+    })?;
+
+    let skills_dir = dirs.scratch_dir.join("skills");
+    fs::create_dir_all(&skills_dir).map_err(|err| {
+        format!(
+            "user-instructions hook '{}' failed to create skills directory {}: {}",
+            hook.service_name,
+            skills_dir.display(),
+            err
+        )
+    })?;
+
+    let skills_manifest_file = dirs.scratch_dir.join("skills.tsv");
+    let mut manifest = String::new();
+    for (idx, skill) in context.skills.iter().enumerate() {
+        if !is_skill_mention_id(&skill.id) {
+            continue;
+        }
+        let skill_dir = skills_dir.join(idx.to_string());
+        fs::create_dir_all(&skill_dir).map_err(|err| {
+            format!(
+                "user-instructions hook '{}' failed to create skill scratch directory {}: {}",
+                hook.service_name,
+                skill_dir.display(),
+                err
+            )
+        })?;
+        let content_file = skill_dir.join("SKILL.md");
+        fs::write(&content_file, &skill.content).map_err(|err| {
+            format!(
+                "user-instructions hook '{}' failed to write skill file {}: {}",
+                hook.service_name,
+                content_file.display(),
+                err
+            )
+        })?;
+        manifest.push_str(&skill.id);
+        manifest.push('\t');
+        manifest.push_str(&format!("/skills/{}/SKILL.md", skill.id));
+        manifest.push('\t');
+        manifest.push_str(&content_file.to_string_lossy());
+        manifest.push('\n');
+    }
+    fs::write(&skills_manifest_file, manifest).map_err(|err| {
+        format!(
+            "user-instructions hook '{}' failed to write skills manifest {}: {}",
+            hook.service_name,
+            skills_manifest_file.display(),
+            err
+        )
+    })?;
+
+    Ok(HookTurnFiles {
+        user_message_file,
+        skills_manifest_file,
+        skills_dir,
+    })
+}
+
+fn is_skill_mention_id(id: &str) -> bool {
+    !id.is_empty()
+        && !is_common_env_var(id)
+        && id.bytes().all(
+            |byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':'),
+        )
+}
+
+fn is_common_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "PWD"
+            | "TMPDIR"
+            | "TEMP"
+            | "TMP"
+            | "LANG"
+            | "TERM"
+            | "XDG_CONFIG_HOME"
+    )
+}
+
 async fn run_user_instruction_hook(
     hook: &UserInstructionHook,
     context: &UserInstructionRuntimeContext<'_>,
@@ -422,6 +536,7 @@ fn prepare_hook_runtime(
     agents_md_path: &str,
     dirs: &HookDirs,
 ) -> Result<PreparedHookRuntime, String> {
+    let turn_files = write_hook_turn_files(hook, context, dirs)?;
     let agents_conf_path = context.config_root.join(AGENTS_CONF_FILE);
     let rc_d_path = context.config_root.join(AGENTS_DIR);
     let overlay_path = dirs.scratch_dir.join("user-instructions-hook.conf");
@@ -450,6 +565,9 @@ fn prepare_hook_runtime(
     let overlay_context = HookOverlayContext {
         scratch_dir: &dirs.scratch_dir,
         temp_dir: &dirs.temp_dir,
+        user_message_file: &turn_files.user_message_file,
+        skills_manifest_file: &turn_files.skills_manifest_file,
+        skills_dir: &turn_files.skills_dir,
         rc_conf_path: &rc_conf_path,
         rc_d_path: &rc_d_path,
         agents_md_path,
@@ -492,6 +610,15 @@ fn render_hook_overlay(
 ) -> String {
     let scratch_dir = overlay_context.scratch_dir.to_string_lossy().into_owned();
     let temp_dir = overlay_context.temp_dir.to_string_lossy().into_owned();
+    let user_message_file = overlay_context
+        .user_message_file
+        .to_string_lossy()
+        .into_owned();
+    let skills_manifest_file = overlay_context
+        .skills_manifest_file
+        .to_string_lossy()
+        .into_owned();
+    let skills_dir = overlay_context.skills_dir.to_string_lossy().into_owned();
     let config_root = context.config_root.as_str();
     let workspace_root = context.workspace_root.as_str();
     let mut overlay = String::new();
@@ -514,6 +641,17 @@ fn render_hook_overlay(
             &format!("{prefix}AGENTS_MD_PATH"),
             overlay_context.agents_md_path,
         );
+        append_rc_conf_assignment(
+            &mut overlay,
+            &format!("{prefix}USER_MESSAGE_FILE"),
+            &user_message_file,
+        );
+        append_rc_conf_assignment(
+            &mut overlay,
+            &format!("{prefix}SKILLS_MANIFEST_FILE"),
+            &skills_manifest_file,
+        );
+        append_rc_conf_assignment(&mut overlay, &format!("{prefix}SKILLS_DIR"), &skills_dir);
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}SCRATCH_DIR"), &scratch_dir);
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}TEMP_DIR"), &temp_dir);
         append_rc_conf_assignment(&mut overlay, &format!("{prefix}TMPDIR"), &temp_dir);

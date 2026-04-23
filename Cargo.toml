@@ -43,6 +43,10 @@ name = "sid-seatbelt"
 path = "src/bin/sid-seatbelt.rs"
 
 [[bin]]
+name = "sid-skill-inject"
+path = "src/bin/sid-skill-inject.rs"
+
+[[bin]]
 name = "sidiff"
 path = "src/bin/sidiff.rs"
 

@@ -254,6 +254,9 @@ and any rcvars it advertises.  Common advertised variables are:
 <hook>_AGENT_ID
 <hook>_HOOK_NAME
 <hook>_AGENTS_MD_PATH
+<hook>_USER_MESSAGE_FILE
+<hook>_SKILLS_MANIFEST_FILE
+<hook>_SKILLS_DIR
 <hook>_SCRATCH_DIR
 <hook>_TEMP_DIR
 <hook>_TMPDIR
@@ -317,6 +320,23 @@ A skill should be self-contained markdown that tells the model when to use it
 and what procedure to follow.  Keep skill ids stable and filesystem-friendly;
 the document is mounted for the model at `/skills/<skill>/SKILL.md`.  Bash and
 external tools do not see this virtual `/skills` mount.
+
+The bundled `skill-inject` user-instructions hook delegates to
+`sid-skill-inject`.  Enable it with `<agent>_USER_INSTRUCTIONS_HOOK` and mention
+an exposed skill as `$skill-id` in a user prompt to append a Codex-style block
+to that turn:
+
+```xml
+<skill>
+<name>skill-id</name>
+<path>/skills/skill-id/SKILL.md</path>
+...skill markdown...
+</skill>
+```
+
+Custom hooks can symlink to `sid-skill-inject` or `exec sid-skill-inject "$@"`
+to reuse the same `$skill-id` parsing and block rendering.  The
+`sid-skill-inject` binary must be on the hook process's `PATH`.
 
 ## TOOLS
 
@@ -584,6 +604,19 @@ Protocol rules:
 `SID_SKILLS_PATH`
 : Colon-separated list of directories to scan for `*/SKILL.md`.  If unset,
   `sid` scans `skills/` under the configuration root.
+
+`<hook>_USER_MESSAGE_FILE`
+: Per-turn user-instructions hook rcvar containing a scratch file with the
+  current user message text.
+
+`<hook>_SKILLS_MANIFEST_FILE`
+: Per-turn user-instructions hook rcvar containing a tab-separated manifest of
+  exposed, `$mention`-invocable skills.  Each row is
+  `skill-id<TAB>/skills/<skill-id>/SKILL.md<TAB>scratch-content-file`.
+
+`<hook>_SKILLS_DIR`
+: Per-turn user-instructions hook rcvar containing the scratch directory that
+  holds skill content files referenced by `<hook>_SKILLS_MANIFEST_FILE`.
 
 `AGENTS_MD_PATH`
 : Colon-separated list of AGENTS.md files to inject when

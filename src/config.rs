@@ -179,7 +179,7 @@ pub struct ToolManifest {
 }
 
 /// Per-skill configuration loaded from a markdown file in the skills directory.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SkillConfig {
     /// Skill identifier derived from the filename without the `.md` extension.
     pub id: String,
