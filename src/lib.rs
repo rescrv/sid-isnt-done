@@ -22,10 +22,10 @@ use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
     Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Budget,
     Content, ContentBlock, Error, FileSystem, IntermediateToolResult, Message, MessageParam,
-    MessageRole, Metadata, Model, MountHierarchy, OperatorLine, Renderer, StopReason,
-    StreamContext, SystemPrompt, ThinkingConfig, Tool, ToolBash20250124, ToolCallback, ToolChoice,
-    ToolParam, ToolResult, ToolResultBlock, ToolResultBlockContent, ToolTextEditor20250728,
-    ToolUnionParam, ToolUseBlock, TurnOutcome, Usage,
+    MessageParamContent, MessageRole, Metadata, Model, MountHierarchy, OperatorLine, Renderer,
+    StopReason, StreamContext, SystemPrompt, TextBlock, ThinkingConfig, Tool, ToolBash20250124,
+    ToolCallback, ToolChoice, ToolParam, ToolResult, ToolResultBlock, ToolResultBlockContent,
+    ToolTextEditor20250728, ToolUnionParam, ToolUseBlock, TurnOutcome, Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -613,9 +613,11 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
+            top_up_cancelled_tool_results(messages);
             return Ok(TurnOutcome {
                 stop_reason,
                 usage: Usage::new(0, 0),
@@ -643,6 +645,7 @@ impl Agent for SidAgent {
                         .tool_cancellation_pending
                         .swap(false, Ordering::Relaxed)
                     {
+                        top_up_cancelled_tool_results(messages);
                         return Ok(TurnOutcome {
                             stop_reason: StopReason::EndTurn,
                             usage: usage_total,
@@ -651,15 +654,25 @@ impl Agent for SidAgent {
                     }
                 }
                 ControlFlow::Break(res) => {
-                    let mut outcome = res?;
-                    outcome.usage = outcome.usage + usage_total;
-                    outcome.request_count = outcome.request_count.saturating_add(request_count);
-                    return Ok(outcome);
+                    return match res {
+                        Ok(mut outcome) => {
+                            outcome.usage = outcome.usage + usage_total;
+                            outcome.request_count =
+                                outcome.request_count.saturating_add(request_count);
+                            top_up_cancelled_tool_results(messages);
+                            Ok(outcome)
+                        }
+                        Err(err) => {
+                            top_up_cancelled_tool_results(messages);
+                            Err(err)
+                        }
+                    };
                 }
             }
         }
 
         let stop_reason = self.handle_max_tokens().await?;
+        top_up_cancelled_tool_results(messages);
         Ok(TurnOutcome {
             stop_reason,
             usage: usage_total,
@@ -677,10 +690,12 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
         renderer.start_agent(&context);
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
+            top_up_cancelled_tool_results(messages);
             renderer.finish_agent(&context, Some(&stop_reason));
             return Ok(TurnOutcome {
                 stop_reason,
@@ -710,6 +725,7 @@ impl Agent for SidAgent {
                         .swap(false, Ordering::Relaxed)
                     {
                         let stop_reason = StopReason::EndTurn;
+                        top_up_cancelled_tool_results(messages);
                         renderer.finish_agent(&context, Some(&stop_reason));
                         return Ok(TurnOutcome {
                             stop_reason,
@@ -722,10 +738,12 @@ impl Agent for SidAgent {
                     Ok(mut outcome) => {
                         outcome.usage = outcome.usage + usage_total;
                         outcome.request_count = outcome.request_count.saturating_add(request_count);
+                        top_up_cancelled_tool_results(messages);
                         renderer.finish_agent(&context, Some(&outcome.stop_reason));
                         return Ok(outcome);
                     }
                     Err(err) => {
+                        top_up_cancelled_tool_results(messages);
                         renderer.finish_agent(&context, None);
                         return Err(err);
                     }
@@ -734,6 +752,7 @@ impl Agent for SidAgent {
         }
 
         let stop_reason = self.handle_max_tokens().await?;
+        top_up_cancelled_tool_results(messages);
         renderer.finish_agent(&context, Some(&stop_reason));
         Ok(TurnOutcome {
             stop_reason,
@@ -970,6 +989,111 @@ async fn collect_requested_tool_calls(agent: &SidAgent, resp: &Message) -> Vec<R
             })
         })
         .collect()
+}
+
+fn top_up_cancelled_tool_results(messages: &mut Vec<MessageParam>) -> usize {
+    let mut cancelled = 0;
+    let mut index = 0;
+    while index < messages.len() {
+        let tool_use_ids = assistant_tool_use_ids(&messages[index]);
+        if tool_use_ids.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let next_index = index + 1;
+        if next_index < messages.len()
+            && messages[next_index].role == MessageRole::User
+            && user_message_has_required_tool_result(&messages[next_index], &tool_use_ids)
+        {
+            cancelled +=
+                top_up_user_tool_results(&mut messages[next_index], tool_use_ids.as_slice());
+        } else {
+            let blocks = tool_use_ids
+                .iter()
+                .map(|tool_use_id| user_cancelled_tool_result_block(tool_use_id).into())
+                .collect::<Vec<ContentBlock>>();
+            cancelled += blocks.len();
+            messages.insert(
+                next_index,
+                MessageParam::new(MessageParamContent::Array(blocks), MessageRole::User),
+            );
+        }
+        index += 2;
+    }
+    cancelled
+}
+
+fn assistant_tool_use_ids(message: &MessageParam) -> Vec<String> {
+    if message.role != MessageRole::Assistant {
+        return Vec::new();
+    }
+    let MessageParamContent::Array(blocks) = &message.content else {
+        return Vec::new();
+    };
+
+    let mut seen = BTreeSet::new();
+    let mut ids = Vec::new();
+    for block in blocks {
+        let Some(tool_use) = block.as_tool_use() else {
+            continue;
+        };
+        if seen.insert(tool_use.id.clone()) {
+            ids.push(tool_use.id.clone());
+        }
+    }
+    ids
+}
+
+fn user_message_has_required_tool_result(message: &MessageParam, tool_use_ids: &[String]) -> bool {
+    let required = tool_use_ids.iter().collect::<BTreeSet<_>>();
+    let MessageParamContent::Array(blocks) = &message.content else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        block
+            .as_tool_result()
+            .is_some_and(|tool_result| required.contains(&tool_result.tool_use_id))
+    })
+}
+
+fn top_up_user_tool_results(message: &mut MessageParam, tool_use_ids: &[String]) -> usize {
+    let required = tool_use_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let content = std::mem::replace(&mut message.content, MessageParamContent::Array(Vec::new()));
+    let mut existing_results = BTreeMap::new();
+    let mut tail = Vec::new();
+
+    match content {
+        MessageParamContent::String(text) => {
+            tail.push(ContentBlock::Text(TextBlock::new(text)));
+        }
+        MessageParamContent::Array(blocks) => {
+            for block in blocks {
+                if let ContentBlock::ToolResult(tool_result) = &block
+                    && required.contains(&tool_result.tool_use_id)
+                    && !existing_results.contains_key(&tool_result.tool_use_id)
+                {
+                    existing_results.insert(tool_result.tool_use_id.clone(), block);
+                    continue;
+                }
+                tail.push(block);
+            }
+        }
+    }
+
+    let mut cancelled = 0;
+    let mut blocks = Vec::with_capacity(tool_use_ids.len() + tail.len());
+    for tool_use_id in tool_use_ids {
+        if let Some(block) = existing_results.remove(tool_use_id) {
+            blocks.push(block);
+        } else {
+            blocks.push(user_cancelled_tool_result_block(tool_use_id).into());
+            cancelled += 1;
+        }
+    }
+    blocks.extend(tail);
+    message.content = MessageParamContent::Array(blocks);
+    cancelled
 }
 
 fn missing_tool_result(tool_use: &ToolUseBlock) -> Result<ToolResultBlock, ToolResultBlock> {
@@ -2413,6 +2537,100 @@ mod tests {
         assert_eq!(tool_block_text(second), USER_CANCELLED_ACTION);
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn top_up_cancelled_tool_results_appends_after_partial_assistant_tool_use() {
+        let mut messages = vec![
+            MessageParam::user("Do the work."),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ContentBlock::Text(TextBlock::new("I will check.".to_string())),
+                    ToolUseBlock::new("toolu_partial", "bash", json!({"command": "pwd"})).into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+        ];
+
+        assert_eq!(top_up_cancelled_tool_results(&mut messages), 1);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, MessageRole::User);
+        let MessageParamContent::Array(blocks) = &messages[2].content else {
+            panic!("expected synthesized tool result blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        let result = blocks[0].as_tool_result().unwrap().clone();
+        assert_eq!(result.tool_use_id, "toolu_partial");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(tool_block_text(result), USER_CANCELLED_ACTION);
+    }
+
+    #[test]
+    fn top_up_cancelled_tool_results_inserts_before_stale_user_message() {
+        let mut messages = vec![
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ToolUseBlock::new("toolu_stale", "bash", json!({"command": "pwd"})).into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+            MessageParam::user("Try again."),
+        ];
+
+        assert_eq!(top_up_cancelled_tool_results(&mut messages), 1);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(messages[2], MessageParam::user("Try again."));
+        let MessageParamContent::Array(blocks) = &messages[1].content else {
+            panic!("expected synthesized tool result blocks");
+        };
+        let result = blocks[0].as_tool_result().unwrap().clone();
+        assert_eq!(result.tool_use_id, "toolu_stale");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(tool_block_text(result), USER_CANCELLED_ACTION);
+    }
+
+    #[test]
+    fn top_up_cancelled_tool_results_preserves_existing_results_and_cancels_missing() {
+        let existing =
+            ToolResultBlock::new("toolu_done".to_string()).with_string_content("done".to_string());
+        let mut messages = vec![
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ToolUseBlock::new("toolu_missing", "bash", json!({"command": "pwd"})).into(),
+                    ToolUseBlock::new("toolu_done", "bash", json!({"command": "date"})).into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ContentBlock::Text(TextBlock::new("next request".to_string())),
+                    existing.into(),
+                ]),
+                MessageRole::User,
+            ),
+        ];
+
+        assert_eq!(top_up_cancelled_tool_results(&mut messages), 1);
+
+        assert_eq!(messages.len(), 2);
+        let MessageParamContent::Array(blocks) = &messages[1].content else {
+            panic!("expected reordered user content blocks");
+        };
+        assert_eq!(blocks.len(), 3);
+        let first = blocks[0].as_tool_result().unwrap().clone();
+        let second = blocks[1].as_tool_result().unwrap().clone();
+        assert_eq!(first.tool_use_id, "toolu_missing");
+        assert_eq!(first.is_error, Some(true));
+        assert_eq!(tool_block_text(first), USER_CANCELLED_ACTION);
+        assert_eq!(second.tool_use_id, "toolu_done");
+        assert_eq!(tool_block_text(second), "done");
+        assert_eq!(
+            blocks[2].as_text().map(|block| block.text.as_str()),
+            Some("next request")
+        );
     }
 
     #[test]
