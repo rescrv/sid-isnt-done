@@ -153,7 +153,7 @@ struct LineId {
 struct Analysis {
     lines: HashMap<LineId, LineAnalysis>,
     moves: Vec<MoveBlock>,
-    roles: Vec<RoleGroup>,
+    chunk_roles: BTreeMap<ChunkId, Vec<RoleGroup>>,
     syntax: HashMap<LineId, Vec<SyntaxRange>>,
 }
 
@@ -164,6 +164,7 @@ struct LineAnalysis {
     paired_with: Option<LineId>,
     move_id: Option<usize>,
     role_ranges: Vec<RoleRange>,
+    role_chunk: Option<ChunkId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -195,6 +196,13 @@ struct RoleRange {
     start: usize,
     end: usize,
     role: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, PartialOrd, Ord)]
+struct ChunkId {
+    file: usize,
+    hunk: usize,
+    start: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,30 +331,42 @@ pub fn parse_unified_diff(input: &str) -> Diff {
     let mut diff = Diff::default();
     let mut current_file: Option<DiffFile> = None;
     let mut current_hunk: Option<Hunk> = None;
+    let mut pending_header: Vec<String> = vec![];
 
     for raw in input.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw).to_string();
 
+        if current_hunk
+            .as_ref()
+            .is_some_and(|hunk| should_append_hunk_line(hunk, &line))
+        {
+            append_hunk_line(current_hunk.as_mut().expect("checked above"), &line);
+            continue;
+        }
+        flush_hunk(&mut current_file, &mut current_hunk);
+
         if line.starts_with("diff --git ") {
-            flush_hunk(&mut current_file, &mut current_hunk);
             flush_file(&mut diff, &mut current_file);
             let (old_path, new_path) = parse_diff_git_paths(&line);
+            let mut header = take_pending_header(&mut pending_header);
+            header.push(line);
             current_file = Some(DiffFile {
                 old_path,
                 new_path,
-                header: vec![line],
+                header,
                 hunks: vec![],
             });
             continue;
         }
 
         if line.starts_with("--- ") && should_start_plain_file(&current_file, &current_hunk) {
-            flush_hunk(&mut current_file, &mut current_hunk);
             flush_file(&mut diff, &mut current_file);
+            let mut header = take_pending_header(&mut pending_header);
+            header.push(line.clone());
             current_file = Some(DiffFile {
                 old_path: parse_header_path(&line, "--- "),
                 new_path: None,
-                header: vec![line],
+                header,
                 hunks: vec![],
             });
             continue;
@@ -377,20 +397,25 @@ pub fn parse_unified_diff(input: &str) -> Diff {
             continue;
         }
 
-        if let Some(hunk) = current_hunk.as_mut() {
-            append_hunk_line(hunk, &line);
-            continue;
-        }
-
         if let Some(file) = current_file.as_mut() {
-            file.header.push(line);
+            if file.hunks.is_empty() {
+                file.header.push(line);
+            } else {
+                flush_file(&mut diff, &mut current_file);
+                pending_header.push(line);
+            }
         } else {
-            diff.preamble.push(line);
+            pending_header.push(line);
         }
     }
 
     flush_hunk(&mut current_file, &mut current_hunk);
     flush_file(&mut diff, &mut current_file);
+    if diff.files.is_empty() {
+        diff.preamble.extend(pending_header);
+    } else if let Some(last) = diff.files.last_mut() {
+        last.header.extend(pending_header);
+    }
     diff
 }
 
@@ -607,6 +632,10 @@ fn ensure_file(current_file: &mut Option<DiffFile>) {
     }
 }
 
+fn take_pending_header(pending_header: &mut Vec<String>) -> Vec<String> {
+    std::mem::take(pending_header)
+}
+
 fn should_start_plain_file(current_file: &Option<DiffFile>, current_hunk: &Option<Hunk>) -> bool {
     current_file.is_none()
         || current_hunk.is_some()
@@ -719,22 +748,48 @@ fn append_hunk_line(hunk: &mut Hunk, line: &str) {
     });
 }
 
+fn should_append_hunk_line(hunk: &Hunk, line: &str) -> bool {
+    line.starts_with("\\ ") || (!hunk_is_complete(hunk) && is_hunk_content_line(line))
+}
+
+fn hunk_is_complete(hunk: &Hunk) -> bool {
+    let old_seen = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Remove))
+        .count();
+    let new_seen = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Add))
+        .count();
+    old_seen >= hunk.old_count && new_seen >= hunk.new_count
+}
+
+fn is_hunk_content_line(line: &str) -> bool {
+    matches!(
+        line.as_bytes().first().copied(),
+        Some(b' ') | Some(b'+') | Some(b'-')
+    )
+}
+
 fn analyze_diff(diff: &Diff) -> Analysis {
     let mut analysis = Analysis {
         lines: HashMap::new(),
         moves: vec![],
-        roles: vec![],
+        chunk_roles: BTreeMap::new(),
         syntax: syntax_maps(diff),
     };
-    let pairs = analyze_change_pairs(diff, &mut analysis.lines);
+    analyze_change_pairs(diff, &mut analysis.lines, &mut analysis.chunk_roles);
     detect_moves(diff, &mut analysis);
-    analysis.roles = detect_roles(&pairs);
-    apply_roles(diff, &mut analysis);
     analysis
 }
 
-fn analyze_change_pairs(diff: &Diff, lines: &mut HashMap<LineId, LineAnalysis>) -> Vec<ChangePair> {
-    let mut pairs = vec![];
+fn analyze_change_pairs(
+    diff: &Diff,
+    lines: &mut HashMap<LineId, LineAnalysis>,
+    chunk_roles: &mut BTreeMap<ChunkId, Vec<RoleGroup>>,
+) {
     for (file_idx, file) in diff.files.iter().enumerate() {
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             let mut index = 0usize;
@@ -749,6 +804,11 @@ fn analyze_change_pairs(diff: &Diff, lines: &mut HashMap<LineId, LineAnalysis>) 
                 {
                     index += 1;
                 }
+                let chunk_id = ChunkId {
+                    file: file_idx,
+                    hunk: hunk_idx,
+                    start,
+                };
                 let mut removes = vec![];
                 let mut adds = vec![];
                 for line_idx in start..index {
@@ -770,6 +830,7 @@ fn analyze_change_pairs(diff: &Diff, lines: &mut HashMap<LineId, LineAnalysis>) 
                         DiffOp::Context | DiffOp::Note => {}
                     }
                 }
+                let mut chunk_pairs = vec![];
                 for (remove, add) in pair_change_lines(removes, adds) {
                     let old_meta = analyze_paired_line(&remove.content, &add.content, Side::Pre);
                     let new_meta = analyze_paired_line(&remove.content, &add.content, Side::Post);
@@ -787,7 +848,7 @@ fn analyze_change_pairs(diff: &Diff, lines: &mut HashMap<LineId, LineAnalysis>) 
                             ..new_meta
                         },
                     );
-                    pairs.push(ChangePair { remove, add });
+                    chunk_pairs.push(ChangePair { remove, add });
                 }
                 for line_idx in start..index {
                     let id = LineId {
@@ -803,10 +864,16 @@ fn analyze_change_pairs(diff: &Diff, lines: &mut HashMap<LineId, LineAnalysis>) 
                         lines.insert(id, analyze_unpaired_line(&line.content));
                     }
                 }
+                let roles = detect_roles(&chunk_pairs);
+                if !roles.is_empty() {
+                    apply_roles_to_chunk(
+                        hunk, file_idx, hunk_idx, start, index, chunk_id, &roles, lines,
+                    );
+                    chunk_roles.insert(chunk_id, roles);
+                }
             }
         }
     }
-    pairs
 }
 
 fn pair_change_lines(removes: Vec<LineRef>, adds: Vec<LineRef>) -> Vec<(LineRef, LineRef)> {
@@ -1311,46 +1378,52 @@ fn pair_identifier_segment(
     }
 }
 
-fn apply_roles(diff: &Diff, analysis: &mut Analysis) {
-    if analysis.roles.is_empty() {
-        return;
-    }
-    for (file_idx, file) in diff.files.iter().enumerate() {
-        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-            for (line_idx, line) in hunk.lines.iter().enumerate() {
-                let side = match line.op {
-                    DiffOp::Remove => Side::Pre,
-                    DiffOp::Add => Side::Post,
-                    DiffOp::Context | DiffOp::Note => continue,
+#[allow(clippy::too_many_arguments)]
+fn apply_roles_to_chunk(
+    hunk: &Hunk,
+    file_idx: usize,
+    hunk_idx: usize,
+    start: usize,
+    end: usize,
+    chunk_id: ChunkId,
+    roles: &[RoleGroup],
+    lines: &mut HashMap<LineId, LineAnalysis>,
+) {
+    for line_idx in start..end {
+        let line = &hunk.lines[line_idx];
+        let side = match line.op {
+            DiffOp::Remove => Side::Pre,
+            DiffOp::Add => Side::Post,
+            DiffOp::Context | DiffOp::Note => continue,
+        };
+        let mut ranges = vec![];
+        for token in tokenize(&line.content) {
+            if token.kind != TokenKind::Identifier {
+                continue;
+            }
+            for (role_idx, role) in roles.iter().enumerate() {
+                let target = match side {
+                    Side::Pre => &role.removed,
+                    Side::Post => &role.added,
                 };
-                let mut ranges = vec![];
-                for token in tokenize(&line.content) {
-                    if token.kind != TokenKind::Identifier {
-                        continue;
-                    }
-                    for (role_idx, role) in analysis.roles.iter().enumerate() {
-                        let target = match side {
-                            Side::Pre => &role.removed,
-                            Side::Post => &role.added,
-                        };
-                        if token.text == *target {
-                            ranges.push(RoleRange {
-                                start: token.start,
-                                end: token.end,
-                                role: role_idx,
-                            });
-                        }
-                    }
-                }
-                if !ranges.is_empty() {
-                    let id = LineId {
-                        file: file_idx,
-                        hunk: hunk_idx,
-                        line: line_idx,
-                    };
-                    analysis.lines.entry(id).or_default().role_ranges = ranges;
+                if token.text == *target {
+                    ranges.push(RoleRange {
+                        start: token.start,
+                        end: token.end,
+                        role: role_idx,
+                    });
                 }
             }
+        }
+        if !ranges.is_empty() {
+            let id = LineId {
+                file: file_idx,
+                hunk: hunk_idx,
+                line: line_idx,
+            };
+            let meta = lines.entry(id).or_default();
+            meta.role_ranges = ranges;
+            meta.role_chunk = Some(chunk_id);
         }
     }
 }
@@ -1720,6 +1793,12 @@ fn build_rendered_lines(
     }
 
     for (file_idx, file) in diff.files.iter().enumerate() {
+        let (preface, header) = split_file_header(&file.header);
+        for line in preface {
+            out.push(RenderedLine {
+                text: paint_fg(line, Rgb::new(150, 150, 150), options.use_color),
+            });
+        }
         let file_label = format!(
             "file {} -> {}",
             file.old_path.as_deref().unwrap_or("/dev/null"),
@@ -1728,7 +1807,7 @@ fn build_rendered_lines(
         out.push(RenderedLine {
             text: paint_fg(&file_label, Rgb::new(120, 200, 220), options.use_color),
         });
-        for header in &file.header {
+        for header in header {
             out.push(RenderedLine {
                 text: paint_fg(header, Rgb::new(120, 120, 120), options.use_color),
             });
@@ -1739,6 +1818,21 @@ fn build_rendered_lines(
             });
             let mut last_move = None;
             for (line_idx, line) in hunk.lines.iter().enumerate() {
+                if matches!(line.op, DiffOp::Add | DiffOp::Remove)
+                    && (line_idx == 0
+                        || !matches!(hunk.lines[line_idx - 1].op, DiffOp::Add | DiffOp::Remove))
+                {
+                    let chunk_id = ChunkId {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                        start: line_idx,
+                    };
+                    if let Some(roles) = analysis.chunk_roles.get(&chunk_id) {
+                        out.push(RenderedLine {
+                            text: render_role_summary(roles, options),
+                        });
+                    }
+                }
                 let id = LineId {
                     file: file_idx,
                     hunk: hunk_idx,
@@ -1762,11 +1856,15 @@ fn build_rendered_lines(
             }
         }
     }
-
-    if !analysis.roles.is_empty() {
+    if options.use_color && !analysis.chunk_roles.is_empty() {
         out.push(RenderedLine {
-            text: render_role_summary(&analysis.roles, options),
+            text: "role key:".to_string(),
         });
+        for (chunk_id, roles) in &analysis.chunk_roles {
+            out.push(RenderedLine {
+                text: render_role_key_entry(diff, *chunk_id, roles, options),
+            });
+        }
     }
     out
 }
@@ -1827,6 +1925,10 @@ fn render_diff_line(
     options: SidiffOptions,
 ) -> String {
     let meta = analysis.lines.get(&id);
+    let roles = meta
+        .and_then(|meta| meta.role_chunk)
+        .and_then(|chunk_id| analysis.chunk_roles.get(&chunk_id).map(Vec::as_slice))
+        .unwrap_or(&[]);
     let old = line
         .old_lineno
         .map(|num| format!("{num:>4}"))
@@ -1868,7 +1970,7 @@ fn render_diff_line(
         line.op,
         meta,
         syntax,
-        &analysis.roles,
+        roles,
         options,
     ));
     if meta.is_some_and(|meta| meta.paired_with.is_none())
@@ -2056,6 +2158,10 @@ fn paint(text: &str, fg: Rgb, bg: Option<Rgb>, use_color: bool) -> String {
 }
 
 fn render_role_summary(roles: &[RoleGroup], options: SidiffOptions) -> String {
+    format!("roles: {}", render_role_labels(roles, options))
+}
+
+fn render_role_labels(roles: &[RoleGroup], options: SidiffOptions) -> String {
     let mut parts = vec![];
     for (idx, role) in roles.iter().enumerate() {
         let label = format!(
@@ -2076,7 +2182,65 @@ fn render_role_summary(roles: &[RoleGroup], options: SidiffOptions) -> String {
             parts.push(label);
         }
     }
-    format!("roles: {}", parts.join("  "))
+    parts.join("  ")
+}
+
+fn render_role_key_entry(
+    diff: &Diff,
+    chunk_id: ChunkId,
+    roles: &[RoleGroup],
+    options: SidiffOptions,
+) -> String {
+    let file = &diff.files[chunk_id.file];
+    let hunk = &file.hunks[chunk_id.hunk];
+    let chunk_end = hunk.lines[chunk_id.start..]
+        .iter()
+        .position(|line| !matches!(line.op, DiffOp::Add | DiffOp::Remove))
+        .map(|offset| chunk_id.start + offset)
+        .unwrap_or(hunk.lines.len());
+    let chunk_lines = &hunk.lines[chunk_id.start..chunk_end];
+    let old = chunk_lines
+        .iter()
+        .find_map(|line| line.old_lineno)
+        .map(|lineno| lineno.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let new = chunk_lines
+        .iter()
+        .find_map(|line| line.new_lineno)
+        .map(|lineno| lineno.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    format!(
+        "  {}:{old}/{new} {}",
+        display_path(file),
+        render_role_labels(roles, options)
+    )
+}
+
+fn split_file_header(header: &[String]) -> (&[String], &[String]) {
+    let header_start = header
+        .iter()
+        .position(|line| is_diff_metadata_line(line))
+        .unwrap_or(header.len());
+    header.split_at(header_start)
+}
+
+fn is_diff_metadata_line(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("dissimilarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("copy from ")
+        || line.starts_with("copy to ")
+        || line.starts_with("Binary files ")
+        || line.starts_with("GIT binary patch")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
 }
 
 fn display_path(file: &DiffFile) -> String {
@@ -2117,6 +2281,36 @@ index 1111111..2222222 100644
  }
 ";
 
+    const GIT_LOG_SAMPLE: &str = "\
+commit abcdef0123456789
+Author: Example <e@example.com>
+Date:   Tue Jan 1 00:00:00 2026 +0000
+
+    first change
+
+diff --git a/a.rs b/a.rs
+index 1111111..2222222 100644
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old
++new
+
+commit fedcba9876543210
+Author: Example <e@example.com>
+Date:   Wed Jan 2 00:00:00 2026 +0000
+
+    second change
+
+diff --git a/b.rs b/b.rs
+index 3333333..4444444 100644
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-left
++right
+";
+
     #[test]
     fn parser_reads_git_unified_diff() {
         let diff = parse_unified_diff(SAMPLE);
@@ -2128,6 +2322,33 @@ index 1111111..2222222 100644
         assert_eq!(diff.files[0].hunks[0].new_start, 1);
         assert_eq!(diff.files[0].hunks[0].lines[1].old_lineno, Some(2));
         assert_eq!(diff.files[0].hunks[0].lines[3].new_lineno, Some(2));
+    }
+
+    #[test]
+    fn parser_tolerates_git_log_patch_output() {
+        let diff = parse_unified_diff(GIT_LOG_SAMPLE);
+        assert_eq!(diff.files.len(), 2);
+        assert_eq!(diff.files[0].old_path.as_deref(), Some("a.rs"));
+        assert_eq!(diff.files[1].old_path.as_deref(), Some("b.rs"));
+        assert_eq!(diff.files[0].hunks.len(), 1);
+        assert_eq!(diff.files[1].hunks.len(), 1);
+        assert_eq!(diff.files[0].hunks[0].lines.len(), 2);
+        assert_eq!(diff.files[1].hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn git_log_commit_lines_are_not_rendered_as_hunk_context() {
+        let rendered = render_diff(
+            GIT_LOG_SAMPLE,
+            SidiffOptions {
+                use_color: false,
+                ..SidiffOptions::default()
+            },
+        );
+        assert!(rendered.contains("commit abcdef0123456789"));
+        assert!(rendered.contains("commit fedcba9876543210"));
+        assert!(!rendered.contains("3    3   commit fedcba9876543210"));
+        assert!(!rendered.contains("3    3   Author: Example <e@example.com>"));
     }
 
     #[test]
@@ -2267,6 +2488,76 @@ diff --git a/lib.rs b/lib.rs
         assert!(!rendered.contains("\x1b["));
         assert!(rendered.contains("\u{2460}"));
         assert!(rendered.contains("old_name->new_name"));
+    }
+
+    #[test]
+    fn role_summaries_are_scoped_to_each_change_chunk() {
+        let input = "\
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,7 +1,7 @@
+-let old_alpha = old_alpha + old_alpha;
++let new_alpha = new_alpha + new_alpha;
+-call(old_alpha);
++call(new_alpha);
+ keep();
+-let old_beta = old_beta + old_beta;
++let new_beta = new_beta + new_beta;
+-call(old_beta);
++call(new_beta);
+";
+        let rendered = render_diff(
+            input,
+            SidiffOptions {
+                use_color: false,
+                ..SidiffOptions::default()
+            },
+        );
+        let summaries: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("roles: "))
+            .collect();
+        assert_eq!(
+            summaries,
+            vec![
+                "roles: \u{2460} old_alpha->new_alpha x4",
+                "roles: \u{2460} old_beta->new_beta x4",
+            ]
+        );
+        assert!(rendered.lines().any(|line| line.starts_with("\u{2460}")
+            && line.contains("let old_alpha = old_alpha + old_alpha;")));
+        assert!(rendered.lines().any(|line| line.starts_with("\u{2460}")
+            && line.contains("let new_alpha = new_alpha + new_alpha;")));
+        assert!(rendered.lines().any(|line| line.starts_with("\u{2460}")
+            && line.contains("let old_beta = old_beta + old_beta;")));
+        assert!(rendered.lines().any(|line| line.starts_with("\u{2460}")
+            && line.contains("let new_beta = new_beta + new_beta;")));
+    }
+
+    #[test]
+    fn color_output_has_diff_level_role_key() {
+        let input = "\
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,7 +1,7 @@
+-let old_alpha = old_alpha + old_alpha;
++let new_alpha = new_alpha + new_alpha;
+-call(old_alpha);
++call(new_alpha);
+ keep();
+-let old_beta = old_beta + old_beta;
++let new_beta = new_beta + new_beta;
+-call(old_beta);
++call(new_beta);
+";
+        let rendered = render_diff(input, SidiffOptions::default());
+        assert!(rendered.contains("role key:"));
+        assert!(rendered.contains("  lib.rs:1/1 "));
+        assert!(rendered.contains("  lib.rs:4/4 "));
+        assert!(rendered.contains("old_alpha->new_alpha"));
+        assert!(rendered.contains("old_beta->new_beta"));
     }
 
     #[test]
