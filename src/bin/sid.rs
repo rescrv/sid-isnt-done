@@ -1,10 +1,12 @@
 use std::io::{self, Write};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrrg::CommandLine;
 use handled::SError;
 use rustyline::DefaultEditor;
+use rustyline::config::{Config, EditMode};
 use rustyline::error::ReadlineError;
 use utf8path::Path;
 
@@ -36,7 +38,8 @@ struct SidTerminal {
 
 impl SidTerminal {
     fn new(use_color: bool, interrupted: Arc<AtomicBool>) -> Result<Self, SError> {
-        let editor = DefaultEditor::new().map_err(|err| {
+        let config = Config::builder().edit_mode(EditMode::Vi).build();
+        let editor = DefaultEditor::with_config(config).map_err(|err| {
             cli_error(
                 "readline_init_failed",
                 "failed to initialize the terminal editor",
@@ -303,6 +306,31 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                 }
 
                 terminal.add_history_entry(line);
+
+                if line == "/edit" {
+                    match invoke_external_editor() {
+                        Ok(Some(content)) => {
+                            let content = content.trim();
+                            terminal.add_history_entry(content);
+                            let message = claudius::MessageParam::user(content);
+                            if let Err(err) =
+                                session.send_message(message, &mut terminal).await
+                            {
+                                terminal.print_error(&context, &err.to_string());
+                            }
+                        }
+                        Ok(None) => {
+                            terminal.print_info(&context, "Editor returned empty; nothing sent.");
+                        }
+                        Err(err) => {
+                            terminal.print_error(
+                                &context,
+                                &format!("Failed to invoke editor: {err}"),
+                            );
+                        }
+                    }
+                    continue;
+                }
 
                 if let Some(cmd) = parse_command(line) {
                     match cmd {
@@ -679,6 +707,45 @@ fn describe_top_k(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn invoke_external_editor() -> io::Result<Option<String>> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let tmp_dir = std::env::temp_dir();
+    let filename = format!(
+        "sid-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+    );
+    let tmp_path = tmp_dir.join(filename);
+
+    let status = Command::new(&editor)
+        .arg(&tmp_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|err| io::Error::other(format!("{editor}: {err}")))?;
+
+    let result = if status.success() {
+        match std::fs::read_to_string(&tmp_path) {
+            Ok(content) if content.trim().is_empty() => Ok(None),
+            Ok(content) => Ok(Some(content)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    } else {
+        Ok(None)
+    };
+
+    let _ = std::fs::remove_file(&tmp_path);
+    result
 }
 
 #[cfg(test)]
