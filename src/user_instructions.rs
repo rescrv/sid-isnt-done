@@ -74,6 +74,11 @@ struct HookTurnFiles {
     skills_dir: PathBuf,
 }
 
+struct ResolvedAgentsMdComponent {
+    path: PathBuf,
+    workspace_relative: bool,
+}
+
 pub(crate) fn resolve_user_instruction_settings(
     config: &Config,
     agent_config: &AgentConfig,
@@ -281,15 +286,25 @@ fn resolve_agents_md_files(
         .split(':')
         .filter(|component| !component.is_empty())
     {
-        let path = resolve_agents_md_component(component, workspace_root)?;
-        if path.is_file() {
-            files.push(path);
+        let resolved = resolve_agents_md_component(component, workspace_root)?;
+        if resolved.path.is_file() {
+            if resolved.workspace_relative {
+                require_workspace_relative_agents_md_file(
+                    component,
+                    &resolved.path,
+                    workspace_root,
+                )?;
+            }
+            files.push(resolved.path);
         }
     }
     Ok(files)
 }
 
-fn resolve_agents_md_component(component: &str, workspace_root: &Path) -> Result<PathBuf, String> {
+fn resolve_agents_md_component(
+    component: &str,
+    workspace_root: &Path,
+) -> Result<ResolvedAgentsMdComponent, String> {
     let path = if let Some(rest) = component.strip_prefix("~/") {
         let home = std::env::var("HOME")
             .map_err(|_| format!("failed to expand {component}: HOME is not set"))?;
@@ -298,9 +313,16 @@ fn resolve_agents_md_component(component: &str, workspace_root: &Path) -> Result
         PathBuf::from(component)
     };
     if path.is_absolute() {
-        Ok(path)
+        Ok(ResolvedAgentsMdComponent {
+            path,
+            workspace_relative: false,
+        })
     } else {
-        Ok(PathBuf::from(workspace_root.as_str()).join(drop_cur_dir_components(path)))
+        let relative = normalize_workspace_relative_path(component, &path)?;
+        Ok(ResolvedAgentsMdComponent {
+            path: PathBuf::from(workspace_root.as_str()).join(relative),
+            workspace_relative: true,
+        })
     }
 }
 
@@ -310,15 +332,53 @@ fn nonempty_env(name: &str) -> Option<String> {
         .and_then(|value| (!value.trim().is_empty()).then_some(value))
 }
 
-fn drop_cur_dir_components(path: PathBuf) -> PathBuf {
+fn normalize_workspace_relative_path(component: &str, path: &StdPath) -> Result<PathBuf, String> {
     let mut cleaned = PathBuf::new();
-    for component in path.components() {
-        if component == std::path::Component::CurDir {
-            continue;
+    for path_component in path.components() {
+        match path_component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => cleaned.push(part),
+            std::path::Component::ParentDir => {
+                if !cleaned.pop() {
+                    return Err(format!(
+                        "AGENTS.md path component {component:?} escapes the workspace root"
+                    ));
+                }
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!(
+                    "AGENTS.md path component {component:?} is not workspace-relative"
+                ));
+            }
         }
-        cleaned.push(component.as_os_str());
     }
-    cleaned
+    Ok(cleaned)
+}
+
+fn require_workspace_relative_agents_md_file(
+    component: &str,
+    path: &StdPath,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let workspace = fs::canonicalize(workspace_root.as_str()).map_err(|err| {
+        format!(
+            "failed to canonicalize workspace root {} for AGENTS.md path {component:?}: {err}",
+            workspace_root.as_str()
+        )
+    })?;
+    let file = fs::canonicalize(path).map_err(|err| {
+        format!(
+            "failed to canonicalize AGENTS.md path {} from component {component:?}: {err}",
+            path.display()
+        )
+    })?;
+    if file.starts_with(&workspace) {
+        Ok(())
+    } else {
+        Err(format!(
+            "AGENTS.md path component {component:?} resolves outside the workspace root"
+        ))
+    }
 }
 
 fn read_agents_md_files(files: &[PathBuf]) -> Result<String, String> {
@@ -698,4 +758,82 @@ fn create_hook_dirs() -> Result<HookDirs, std::io::Error> {
         std::io::ErrorKind::AlreadyExists,
         "failed to allocate unique user-instructions hook directory",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path as StdPath;
+
+    use super::*;
+    use crate::test_support::temp_config_root;
+
+    #[test]
+    fn agents_md_path_allows_internal_parent_components() {
+        let root = temp_config_root("agents-md-path");
+        fs::create_dir_all(root.join("local").as_str()).unwrap();
+        fs::write(root.join("AGENTS.md").as_str(), "Workspace rules.\n").unwrap();
+        let settings = UserInstructionSettings {
+            agents_md_enabled: true,
+            agents_md_path: Some("local/../AGENTS.md".to_string()),
+            hook: None,
+        };
+
+        let files = resolve_agents_md_files(&settings, &root).unwrap();
+
+        assert_eq!(files, vec![StdPath::new(root.as_str()).join("AGENTS.md")]);
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn agents_md_path_rejects_relative_parent_escape() {
+        let root = temp_config_root("agents-md-path");
+        let outside = temp_config_root("agents-md-outside");
+        fs::write(outside.join("AGENTS.md").as_str(), "Outside rules.\n").unwrap();
+        let outside_name = StdPath::new(outside.as_str())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let settings = UserInstructionSettings {
+            agents_md_enabled: true,
+            agents_md_path: Some(format!("../{outside_name}/AGENTS.md")),
+            hook: None,
+        };
+
+        let err = resolve_agents_md_files(&settings, &root).unwrap_err();
+
+        assert!(err.contains("escapes the workspace root"), "{err}");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(outside.as_str()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_path_rejects_relative_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_config_root("agents-md-path");
+        let outside = temp_config_root("agents-md-outside");
+        fs::create_dir_all(root.join("local").as_str()).unwrap();
+        fs::write(outside.join("AGENTS.md").as_str(), "Outside rules.\n").unwrap();
+        symlink(
+            outside.join("AGENTS.md").as_str(),
+            root.join("local/AGENTS.md").as_str(),
+        )
+        .unwrap();
+        let settings = UserInstructionSettings {
+            agents_md_enabled: true,
+            agents_md_path: Some("local/AGENTS.md".to_string()),
+            hook: None,
+        };
+
+        let err = resolve_agents_md_files(&settings, &root).unwrap_err();
+
+        assert!(err.contains("resolves outside the workspace root"), "{err}");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(outside.as_str()).unwrap();
+    }
 }
