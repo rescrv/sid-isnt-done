@@ -5,18 +5,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrrg::CommandLine;
 use handled::SError;
+use rc_conf::SwitchPosition;
 use rustyline::DefaultEditor;
 use rustyline::config::{Config, EditMode};
 use rustyline::error::ReadlineError;
 use utf8path::Path;
 
 use claudius::chat::{
-    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, help_text,
-    parse_command,
+    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, SessionStats,
+    help_text, parse_command,
 };
-use claudius::{Anthropic, Model, SystemPrompt, ThinkingConfig};
+use claudius::{Anthropic, Model};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
+use sid_isnt_done::config::{AGENTS_CONF_FILE, Config as SidConfig, TOOLS_CONF_FILE};
 use sid_isnt_done::{SidAgent, seatbelt, session, session::SidSession};
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
@@ -24,6 +26,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "Use configured tools when they help accomplish the user's request.\n",
     "Ground your answers in the files and tool results you can access, explain changes you make, and do not claim to have run commands or changed files unless you actually did."
 );
+const BUILTIN_AGENT_ID: &str = "sid";
 const SANDBOX_UNAVAILABLE_WARNING: &str = concat!(
     "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
     "!! WARNING: /usr/bin/sandbox-exec is unavailable.\n",
@@ -166,6 +169,356 @@ struct PreRuntimeSetup {
     resumed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentSummary {
+    id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    enabled: SwitchPosition,
+    current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidCommand {
+    ShowAgent,
+    AgentList,
+    SwitchAgent(String),
+    Invalid(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SessionStatsRollup {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_requests: u64,
+    total_cache_creation_tokens: u64,
+    total_cache_read_tokens: u64,
+}
+
+impl SessionStatsRollup {
+    fn add(&mut self, stats: &SessionStats) {
+        self.total_input_tokens = self
+            .total_input_tokens
+            .saturating_add(stats.total_input_tokens);
+        self.total_output_tokens = self
+            .total_output_tokens
+            .saturating_add(stats.total_output_tokens);
+        self.total_requests = self.total_requests.saturating_add(stats.total_requests);
+        self.total_cache_creation_tokens = self
+            .total_cache_creation_tokens
+            .saturating_add(stats.total_cache_creation_tokens);
+        self.total_cache_read_tokens = self
+            .total_cache_read_tokens
+            .saturating_add(stats.total_cache_read_tokens);
+    }
+
+    fn apply(&self, stats: &mut SessionStats) {
+        stats.total_input_tokens = stats
+            .total_input_tokens
+            .saturating_add(self.total_input_tokens);
+        stats.total_output_tokens = stats
+            .total_output_tokens
+            .saturating_add(self.total_output_tokens);
+        stats.total_requests = stats.total_requests.saturating_add(self.total_requests);
+        stats.total_cache_creation_tokens = stats
+            .total_cache_creation_tokens
+            .saturating_add(self.total_cache_creation_tokens);
+        stats.total_cache_read_tokens = stats
+            .total_cache_read_tokens
+            .saturating_add(self.total_cache_read_tokens);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionOverrides {
+    model: Option<Model>,
+    system_prompt: Option<Option<String>>,
+    max_tokens: Option<u32>,
+    temperature: Option<Option<f32>>,
+    top_p: Option<Option<f32>>,
+    top_k: Option<Option<u32>>,
+    stop_sequences: Option<Option<Vec<String>>>,
+    thinking_budget: Option<Option<u32>>,
+    session_budget: Option<Option<u64>>,
+    caching_enabled: Option<bool>,
+}
+
+impl SessionOverrides {
+    fn apply_to(&self, config: &mut ChatConfig) {
+        if let Some(model) = self.model.as_ref() {
+            config.set_model(model.clone());
+        }
+        if let Some(prompt) = self.system_prompt.as_ref() {
+            config.set_system_prompt(prompt.clone());
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            config.set_max_tokens(max_tokens);
+        }
+        if let Some(temperature) = self.temperature {
+            config.set_temperature(temperature);
+        }
+        if let Some(top_p) = self.top_p {
+            config.set_top_p(top_p);
+        }
+        if let Some(top_k) = self.top_k {
+            config.set_top_k(top_k);
+        }
+        if let Some(stop_sequences) = self.stop_sequences.as_ref() {
+            config.template.stop_sequences = stop_sequences.clone();
+        }
+        if let Some(thinking_budget) = self.thinking_budget {
+            config.set_thinking_budget(thinking_budget);
+        }
+        if let Some(session_budget) = self.session_budget {
+            config.set_session_budget(session_budget);
+        }
+        if let Some(caching_enabled) = self.caching_enabled {
+            config.caching_enabled = caching_enabled;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentSwitchResult {
+    NoChange,
+    Switched(AgentSummary),
+}
+
+struct SidRuntimeSession {
+    client: Anthropic,
+    chat: ChatSession<SidAgent>,
+    fallback_config: ChatConfig,
+    workspace_root: Path<'static>,
+    config_root: Path<'static>,
+    sid_session: Arc<SidSession>,
+    current_agent_id: String,
+    overrides: SessionOverrides,
+    rolled_up_stats: SessionStatsRollup,
+}
+
+impl SidRuntimeSession {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        client: Anthropic,
+        chat: ChatSession<SidAgent>,
+        fallback_config: ChatConfig,
+        workspace_root: Path<'static>,
+        config_root: Path<'static>,
+        sid_session: Arc<SidSession>,
+        current_agent_id: String,
+    ) -> Self {
+        Self {
+            client,
+            chat,
+            fallback_config,
+            workspace_root,
+            config_root,
+            sid_session,
+            current_agent_id,
+            overrides: SessionOverrides::default(),
+            rolled_up_stats: SessionStatsRollup::default(),
+        }
+    }
+
+    fn current_agent_id(&self) -> &str {
+        &self.current_agent_id
+    }
+
+    fn config(&self) -> &ChatConfig {
+        self.chat.config()
+    }
+
+    fn stats(&self) -> SessionStats {
+        let mut stats = self.chat.stats();
+        self.rolled_up_stats.apply(&mut stats);
+        stats
+    }
+
+    async fn send_message(
+        &mut self,
+        message: claudius::MessageParam,
+        renderer: &mut dyn Renderer,
+    ) -> Result<(), claudius::Error> {
+        self.chat.send_message(message, renderer).await
+    }
+
+    fn clear(&mut self) -> Result<(), SError> {
+        self.chat.clear();
+        self.persist_transcript()
+    }
+
+    fn save_transcript_to(&self, path: &str) -> Result<(), SError> {
+        self.chat
+            .save_transcript_to(path)
+            .map_err(|err| transcript_error("transcript_save_failed", path, &err.to_string()))
+    }
+
+    fn load_transcript_from(&mut self, path: &str) -> Result<(), SError> {
+        self.chat
+            .load_transcript_from(path)
+            .map_err(|err| transcript_error("transcript_load_failed", path, &err.to_string()))?;
+        self.persist_transcript()
+    }
+
+    fn load_resumed_transcript(&mut self, resumed: bool) -> Result<(), SError> {
+        if !resumed {
+            return Ok(());
+        }
+
+        let transcript_path = self.sid_session.transcript_path();
+        if !transcript_path.is_file() {
+            return Ok(());
+        }
+
+        self.chat
+            .load_transcript_from(&transcript_path)
+            .map_err(|err| {
+                cli_error(
+                    "resume_transcript_failed",
+                    "failed to load resumed transcript",
+                )
+                .with_string_field("path", transcript_path.to_string_lossy().as_ref())
+                .with_string_field("cause", &err.to_string())
+            })
+    }
+
+    fn set_model(&mut self, model_name: &str) {
+        let model = model_name
+            .parse()
+            .unwrap_or_else(|_| Model::Custom(model_name.to_string()));
+        self.chat.config_mut().set_model(model.clone());
+        self.overrides.model = Some(model);
+    }
+
+    fn set_system_prompt(&mut self, prompt: Option<String>) {
+        self.chat.config_mut().set_system_prompt(prompt.clone());
+        self.overrides.system_prompt = Some(prompt);
+    }
+
+    fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.chat.config_mut().set_max_tokens(max_tokens);
+        self.overrides.max_tokens = Some(max_tokens);
+    }
+
+    fn set_temperature(&mut self, temperature: Option<f32>) {
+        self.chat.config_mut().set_temperature(temperature);
+        self.overrides.temperature = Some(temperature);
+    }
+
+    fn set_top_p(&mut self, top_p: Option<f32>) {
+        self.chat.config_mut().set_top_p(top_p);
+        self.overrides.top_p = Some(top_p);
+    }
+
+    fn set_top_k(&mut self, top_k: Option<u32>) {
+        self.chat.config_mut().set_top_k(top_k);
+        self.overrides.top_k = Some(top_k);
+    }
+
+    fn add_stop_sequence(&mut self, sequence: String) {
+        let stop_sequences = self
+            .chat
+            .template_mut()
+            .stop_sequences
+            .get_or_insert_with(Vec::new);
+        if !stop_sequences.iter().any(|existing| existing == &sequence) {
+            stop_sequences.push(sequence);
+        }
+        self.overrides.stop_sequences = Some(self.chat.template().stop_sequences.clone());
+    }
+
+    fn clear_stop_sequences(&mut self) {
+        self.chat.template_mut().stop_sequences = None;
+        self.overrides.stop_sequences = Some(None);
+    }
+
+    fn set_thinking_budget(&mut self, thinking_budget: Option<u32>) {
+        self.chat.config_mut().set_thinking_budget(thinking_budget);
+        self.overrides.thinking_budget = Some(thinking_budget);
+    }
+
+    fn set_session_budget(&mut self, session_budget: Option<u64>) {
+        self.chat.config_mut().set_session_budget(session_budget);
+        self.overrides.session_budget = Some(session_budget);
+    }
+
+    fn set_caching_enabled(&mut self, enabled: bool) {
+        self.chat.config_mut().caching_enabled = enabled;
+        self.overrides.caching_enabled = Some(enabled);
+    }
+
+    fn current_agent_summary(&self) -> Result<AgentSummary, SError> {
+        self.agent_summary(self.current_agent_id())?.ok_or_else(|| {
+            cli_error("missing_agent", "current agent is unavailable")
+                .with_string_field("agent", self.current_agent_id())
+        })
+    }
+
+    fn agent_summary(&self, agent_id: &str) -> Result<Option<AgentSummary>, SError> {
+        Ok(self
+            .list_agents()?
+            .into_iter()
+            .find(|summary| summary.id == agent_id))
+    }
+
+    fn list_agents(&self) -> Result<Vec<AgentSummary>, SError> {
+        load_agent_summaries(&self.config_root, self.current_agent_id())
+    }
+
+    fn switch_agent(&mut self, agent_id: &str) -> Result<AgentSwitchResult, SError> {
+        if agent_id == self.current_agent_id() {
+            return Ok(AgentSwitchResult::NoChange);
+        }
+
+        let messages = self.chat.clone_messages();
+        let mut next_agent = SidAgent::from_workspace_agent_with_config_root(
+            &self.workspace_root,
+            &self.config_root,
+            agent_id,
+            self.fallback_config.clone(),
+        )?
+        .with_session(self.sid_session.clone());
+        self.overrides.apply_to(next_agent.config_mut());
+
+        self.roll_up_current_stats();
+
+        let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
+        next_chat.replace_messages(messages);
+
+        self.chat = next_chat;
+        self.current_agent_id = agent_id.to_string();
+        self.persist_transcript()?;
+
+        let summary = self.current_agent_summary()?;
+        Ok(AgentSwitchResult::Switched(summary))
+    }
+
+    fn roll_up_current_stats(&mut self) {
+        let stats = self.chat.stats();
+        self.rolled_up_stats.add(&stats);
+    }
+
+    fn persist_transcript(&self) -> Result<(), SError> {
+        let Some(path) = self.chat.config().transcript_path.as_ref() else {
+            return Ok(());
+        };
+        self.chat
+            .save_transcript_to(path)
+            .map_err(|err| transcript_error_path("transcript_save_failed", path, &err.to_string()))
+    }
+
+    #[cfg(test)]
+    fn clone_messages(&self) -> Vec<claudius::MessageParam> {
+        self.chat.clone_messages()
+    }
+
+    #[cfg(test)]
+    fn replace_messages(&mut self, messages: Vec<claudius::MessageParam>) -> Result<(), SError> {
+        self.chat.replace_messages(messages);
+        self.persist_transcript()
+    }
+}
+
 /// Parse arguments, resolve paths, create the session directory, and set
 /// environment variables for child processes.  Runs before the tokio runtime
 /// so that process-global `set_var` calls are single-threaded and safe.
@@ -260,8 +613,9 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
 
     warn_if_sandbox_unavailable();
 
-    let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?
-        .with_session(sid_session.clone());
+    let agent =
+        SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
+            .with_session(sid_session.clone());
     let agent_id = agent.id().to_string();
     let use_color = agent.config().use_color;
 
@@ -292,8 +646,17 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         )
         .with_string_field("cause", &err.to_string())
     })?;
-    let mut session = ChatSession::with_agent(client, agent);
-    load_resumed_transcript(&mut session, sid_session.as_ref(), resumed)?;
+    let chat = ChatSession::with_agent(client.clone(), agent);
+    let mut session = SidRuntimeSession::new(
+        client,
+        chat,
+        config,
+        workspace_root.clone(),
+        config_root.clone(),
+        sid_session.clone(),
+        agent_id.clone(),
+    );
+    session.load_resumed_transcript(resumed)?;
 
     let interrupted_clone = interrupted.clone();
     ctrlc::set_handler(move || {
@@ -348,31 +711,75 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                     continue;
                 }
 
+                if let Some(cmd) = parse_sid_command(line) {
+                    match cmd {
+                        SidCommand::ShowAgent => match session.current_agent_summary() {
+                            Ok(summary) => print_agent_summary(&summary, session.config()),
+                            Err(err) => terminal.print_error(&context, &err.to_string()),
+                        },
+                        SidCommand::AgentList => match session.list_agents() {
+                            Ok(agents) => print_agent_list(&agents),
+                            Err(err) => terminal.print_error(&context, &err.to_string()),
+                        },
+                        SidCommand::SwitchAgent(agent_name) => {
+                            match session.agent_summary(&agent_name) {
+                                Ok(Some(summary)) if summary.enabled == SwitchPosition::Manual => {
+                                    if !confirm_manual_agent(&mut terminal, &summary.id)? {
+                                        terminal.print_info(&context, "Agent switch cancelled.");
+                                        continue;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    terminal.print_error(&context, &err.to_string());
+                                    continue;
+                                }
+                            }
+
+                            match session.switch_agent(&agent_name) {
+                                Ok(AgentSwitchResult::NoChange) => terminal.print_info(
+                                    &context,
+                                    &format!("Already using agent: {agent_name}"),
+                                ),
+                                Ok(AgentSwitchResult::Switched(summary)) => {
+                                    terminal.print_info(
+                                        &context,
+                                        &format!(
+                                            "Switched to agent: {}",
+                                            format_agent_label(&summary)
+                                        ),
+                                    );
+                                }
+                                Err(err) => terminal.print_error(&context, &err.to_string()),
+                            }
+                        }
+                        SidCommand::Invalid(message) => {
+                            terminal.print_error(&context, &message);
+                        }
+                    }
+                    continue;
+                }
+
                 if let Some(cmd) = parse_command(line) {
                     match cmd {
                         ChatCommand::Quit => {
                             println!("Goodbye!");
                             break;
                         }
-                        ChatCommand::Clear => {
-                            session.clear();
-                            terminal.print_info(&context, "Conversation cleared.");
-                        }
+                        ChatCommand::Clear => match session.clear() {
+                            Ok(()) => terminal.print_info(&context, "Conversation cleared."),
+                            Err(err) => terminal.print_error(&context, &err.to_string()),
+                        },
                         ChatCommand::Help => {
-                            for line in help_text().lines() {
-                                println!("    {}", line);
-                            }
+                            print_help();
                         }
                         ChatCommand::Model(model_name) => {
-                            let model = model_name
-                                .parse()
-                                .unwrap_or_else(|_| Model::Custom(model_name.clone()));
-                            session.template_mut().model = Some(model);
+                            session.set_model(&model_name);
                             terminal
                                 .print_info(&context, &format!("Model changed to: {model_name}"));
                         }
                         ChatCommand::System(prompt) => {
-                            session.template_mut().system = prompt.clone().map(SystemPrompt::from);
+                            session.set_system_prompt(prompt.clone());
                             match prompt {
                                 Some(prompt) => terminal.print_info(
                                     &context,
@@ -382,56 +789,48 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                             }
                         }
                         ChatCommand::MaxTokens(value) => {
-                            session.template_mut().max_tokens = Some(value);
+                            session.set_max_tokens(value);
                             terminal.print_info(&context, &format!("max_tokens set to {value}"));
                         }
                         ChatCommand::Temperature(value) => {
-                            session.template_mut().temperature = Some(value);
+                            session.set_temperature(Some(value));
                             terminal
                                 .print_info(&context, &format!("temperature set to {value:.2}"));
                         }
                         ChatCommand::ClearTemperature => {
-                            session.template_mut().temperature = None;
+                            session.set_temperature(None);
                             terminal.print_info(&context, "temperature reset to model default");
                         }
                         ChatCommand::TopP(value) => {
-                            session.template_mut().top_p = Some(value);
+                            session.set_top_p(Some(value));
                             terminal.print_info(&context, &format!("top_p set to {value:.2}"));
                         }
                         ChatCommand::ClearTopP => {
-                            session.template_mut().top_p = None;
+                            session.set_top_p(None);
                             terminal.print_info(&context, "top_p reset to model default");
                         }
                         ChatCommand::TopK(value) => {
-                            session.template_mut().top_k = Some(value);
+                            session.set_top_k(Some(value));
                             terminal.print_info(&context, &format!("top_k set to {value}"));
                         }
                         ChatCommand::ClearTopK => {
-                            session.template_mut().top_k = None;
+                            session.set_top_k(None);
                             terminal.print_info(&context, "top_k reset to model default");
                         }
                         ChatCommand::AddStopSequence(sequence) => {
-                            let stop_sequences = session
-                                .template_mut()
-                                .stop_sequences
-                                .get_or_insert_with(Vec::new);
-                            if !stop_sequences.iter().any(|existing| existing == &sequence) {
-                                stop_sequences.push(sequence.clone());
-                            }
+                            session.add_stop_sequence(sequence.clone());
                             terminal
                                 .print_info(&context, &format!("Added stop sequence: {sequence}"));
                         }
                         ChatCommand::ClearStopSequences => {
-                            session.template_mut().stop_sequences = None;
+                            session.clear_stop_sequences();
                             terminal.print_info(&context, "Stop sequences cleared.");
                         }
                         ChatCommand::ListStopSequences => {
-                            let sequences =
-                                session.template().stop_sequences.as_deref().unwrap_or(&[]);
-                            print_stop_sequences(sequences);
+                            print_stop_sequences(session.config().stop_sequences());
                         }
                         ChatCommand::Thinking(budget) => {
-                            session.template_mut().thinking = budget.map(ThinkingConfig::enabled);
+                            session.set_thinking_budget(budget);
                             match budget {
                                 Some(tokens) => terminal.print_info(
                                     &context,
@@ -445,15 +844,19 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                                 }
                             }
                         }
-                        ChatCommand::Budget(_tokens) => {
-                            terminal.print_error(&context, "budget not supported");
+                        ChatCommand::Budget(tokens) => {
+                            session.set_session_budget(Some(tokens));
+                            terminal.print_info(
+                                &context,
+                                &format!("Session budget set to {tokens} tokens."),
+                            );
                         }
                         ChatCommand::ClearBudget => {
-                            session.config_mut().session_budget = None;
+                            session.set_session_budget(None);
                             terminal.print_info(&context, "Session budget cleared.");
                         }
                         ChatCommand::Caching(enabled) => {
-                            session.config_mut().caching_enabled = enabled;
+                            session.set_caching_enabled(enabled);
                             if enabled {
                                 terminal.print_info(&context, "Prompt caching enabled.");
                             } else {
@@ -489,10 +892,10 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                             }
                         }
                         ChatCommand::Stats => {
-                            print_stats(&session);
+                            print_stats(&session.stats());
                         }
                         ChatCommand::ShowConfig => {
-                            print_config(&session);
+                            print_config(&session.stats());
                         }
                         ChatCommand::Invalid(message) => {
                             terminal.print_error(&context, &message);
@@ -524,30 +927,137 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
     Ok(())
 }
 
-fn load_resumed_transcript(
-    session: &mut ChatSession<SidAgent>,
-    sid_session: &SidSession,
-    resumed: bool,
-) -> Result<(), SError> {
-    if !resumed {
-        return Ok(());
+fn parse_sid_command(input: &str) -> Option<SidCommand> {
+    let input = input.trim();
+    if !input.starts_with('/') {
+        return None;
     }
 
-    let transcript_path = sid_session.transcript_path();
-    if !transcript_path.is_file() {
-        return Ok(());
+    let mut parts = input[1..].splitn(2, ' ');
+    let command = parts.next()?.to_ascii_lowercase();
+    let argument = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    if command != "agent" && command != "agents" {
+        return None;
     }
 
-    session
-        .load_transcript_from(&transcript_path)
-        .map_err(|err| {
-            cli_error(
-                "resume_transcript_failed",
-                "failed to load resumed transcript",
-            )
-            .with_string_field("path", transcript_path.to_string_lossy().as_ref())
-            .with_string_field("cause", &err.to_string())
+    let Some(argument) = argument else {
+        return Some(match command.as_str() {
+            "agents" => SidCommand::AgentList,
+            _ => SidCommand::ShowAgent,
+        });
+    };
+
+    let mut parts = argument.splitn(2, ' ');
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    match action.as_str() {
+        "show" | "current" => Some(SidCommand::ShowAgent),
+        "list" => Some(SidCommand::AgentList),
+        "switch" => {
+            let Some(agent) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                return Some(SidCommand::Invalid(
+                    "/agent switch requires an agent name".to_string(),
+                ));
+            };
+            Some(SidCommand::SwitchAgent(agent.to_string()))
+        }
+        _ => Some(SidCommand::Invalid(
+            "Use /agent, /agent list, or /agent switch <name>.".to_string(),
+        )),
+    }
+}
+
+fn print_help() {
+    for line in help_text().lines() {
+        println!("    {}", line);
+    }
+    println!("      /agent                Show the current agent");
+    println!("      /agent list           List configured agents");
+    println!("      /agent switch <name>  Switch to another agent in this session");
+}
+
+fn load_agent_summaries(
+    config_root: &Path,
+    current_agent_id: &str,
+) -> Result<Vec<AgentSummary>, SError> {
+    if !config_root.join(AGENTS_CONF_FILE).is_file() && !config_root.join(TOOLS_CONF_FILE).is_file()
+    {
+        return Ok(vec![AgentSummary {
+            id: BUILTIN_AGENT_ID.to_string(),
+            display_name: None,
+            description: None,
+            enabled: SwitchPosition::Yes,
+            current: current_agent_id == BUILTIN_AGENT_ID,
+        }]);
+    }
+
+    let config = SidConfig::load(config_root)?;
+    Ok(config
+        .agents
+        .values()
+        .map(|agent| AgentSummary {
+            id: agent.id.clone(),
+            display_name: agent.display_name.clone(),
+            description: agent.description.clone(),
+            enabled: agent.enabled,
+            current: agent.id == current_agent_id,
         })
+        .collect())
+}
+
+fn format_agent_label(summary: &AgentSummary) -> String {
+    match summary.display_name.as_deref() {
+        Some(name) => format!("{} ({name})", summary.id),
+        None => summary.id.clone(),
+    }
+}
+
+fn print_agent_summary(summary: &AgentSummary, config: &ChatConfig) {
+    println!("    Agent: {}", format_agent_label(summary));
+    println!(
+        "      Status: {}{}",
+        describe_agent_enabled(summary.enabled),
+        if summary.current { " (current)" } else { "" }
+    );
+    println!("      Model: {}", config.model());
+    if let Some(description) = summary.description.as_deref() {
+        println!("      Description: {description}");
+    }
+}
+
+fn print_agent_list(agents: &[AgentSummary]) {
+    println!("    Agents:");
+    for agent in agents {
+        let marker = if agent.current { "*" } else { " " };
+        let mut line = format!(
+            "      {marker} {} [{}]",
+            format_agent_label(agent),
+            describe_agent_enabled(agent.enabled)
+        );
+        if let Some(description) = agent.description.as_deref() {
+            line.push_str(&format!(" - {description}"));
+        }
+        println!("{line}");
+    }
+}
+
+fn describe_agent_enabled(enabled: SwitchPosition) -> &'static str {
+    match enabled {
+        SwitchPosition::Yes => "YES",
+        SwitchPosition::Manual => "MANUAL",
+        SwitchPosition::No => "NO",
+    }
+}
+
+fn transcript_error(code: &str, path: &str, cause: &str) -> SError {
+    cli_error(code, "transcript operation failed")
+        .with_string_field("path", path)
+        .with_string_field("cause", cause)
+}
+
+fn transcript_error_path(code: &str, path: &std::path::Path, cause: &str) -> SError {
+    cli_error(code, "transcript operation failed")
+        .with_string_field("path", &path.display().to_string())
+        .with_string_field("cause", cause)
 }
 
 fn parse_sid_args() -> Result<SidArgs, SError> {
@@ -650,8 +1160,7 @@ fn parse_confirmation(input: &str) -> Option<bool> {
     }
 }
 
-fn print_stats<A: ChatAgent>(session: &ChatSession<A>) {
-    let stats = session.stats();
+fn print_stats(stats: &SessionStats) {
     println!("    Session Statistics:");
     println!("      Model: {}", stats.model);
     println!("      Messages: {}", stats.message_count);
@@ -697,8 +1206,7 @@ fn print_stats<A: ChatAgent>(session: &ChatSession<A>) {
     }
 }
 
-fn print_config<A: ChatAgent>(session: &ChatSession<A>) {
-    let stats = session.stats();
+fn print_config(stats: &SessionStats) {
     println!("    Current Configuration:");
     println!("      Model: {}", stats.model);
     println!("      Max tokens: {}", stats.max_tokens);
@@ -793,19 +1301,37 @@ fn invoke_external_editor() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SANDBOX_UNAVAILABLE_WARNING, SidArgs, load_resumed_transcript, parse_confirmation,
-        validate_no_free_args,
+        AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, SANDBOX_UNAVAILABLE_WARNING,
+        SidArgs, SidCommand, SidRuntimeSession, SwitchPosition, parse_confirmation,
+        parse_sid_command, validate_no_free_args,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
     use claudius::MessageParam;
     use claudius::chat::{ChatConfig, ChatSession};
+    use serde::Deserialize;
     use sid_isnt_done::{SidAgent, session::SidSession};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use utf8path::Path;
+
+    #[derive(Debug, PartialEq)]
+    struct SessionSnapshot {
+        agent_id: String,
+        messages: Vec<MessageParam>,
+        model: claudius::Model,
+        temperature: Option<f32>,
+        stop_sequences: Vec<String>,
+        session_budget_tokens: Option<u64>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TranscriptSnapshot {
+        version: u8,
+        messages: Vec<MessageParam>,
+    }
 
     fn parse_args(argv: &[&str]) -> (SidArgs, Vec<String>, i32, Vec<String>) {
         let (parsed, free) =
@@ -859,15 +1385,138 @@ mod tests {
         )
         .unwrap();
 
-        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
-        let agent = SidAgent::new(ChatConfig::new(), workspace_root.clone())
-            .with_session(sid_session.clone());
-        let mut chat = ChatSession::with_agent(client, agent);
+        let mut session =
+            new_runtime_session(&workspace_root, &workspace_root, sid_session.clone(), None);
 
-        load_resumed_transcript(&mut chat, sid_session.as_ref(), true).unwrap();
-        assert_eq!(chat.clone_messages(), vec![MessageParam::user("resume me")]);
+        session.load_resumed_transcript(true).unwrap();
+        assert_eq!(
+            session.clone_messages(),
+            vec![MessageParam::user("resume me")]
+        );
 
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn parse_agent_commands() {
+        assert_eq!(parse_sid_command("/agent"), Some(SidCommand::ShowAgent));
+        assert_eq!(parse_sid_command("/agents"), Some(SidCommand::AgentList));
+        assert_eq!(
+            parse_sid_command("/agent list"),
+            Some(SidCommand::AgentList)
+        );
+        assert_eq!(
+            parse_sid_command("/agent switch review"),
+            Some(SidCommand::SwitchAgent("review".to_string()))
+        );
+        assert_eq!(
+            parse_sid_command("/agent switch"),
+            Some(SidCommand::Invalid(
+                "/agent switch requires an agent name".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn list_agents_reports_current_manual_and_disabled_agents() {
+        let root = unique_workspace_root("agent-list");
+        write_multi_agent_config(&root);
+        let session = configured_runtime_session(&root, "build");
+
+        assert_eq!(
+            session.list_agents().unwrap(),
+            vec![
+                AgentSummary {
+                    id: "build".to_string(),
+                    display_name: Some("Builder".to_string()),
+                    description: Some("Build changes".to_string()),
+                    enabled: SwitchPosition::Yes,
+                    current: true,
+                },
+                AgentSummary {
+                    id: "off".to_string(),
+                    display_name: None,
+                    description: Some("Disabled agent".to_string()),
+                    enabled: SwitchPosition::No,
+                    current: false,
+                },
+                AgentSummary {
+                    id: "review".to_string(),
+                    display_name: Some("Reviewer".to_string()),
+                    description: Some("Review changes".to_string()),
+                    enabled: SwitchPosition::Manual,
+                    current: false,
+                },
+            ]
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn switch_agent_preserves_transcript_overrides_and_saved_transcript() {
+        let root = unique_workspace_root("agent-switch");
+        write_multi_agent_config(&root);
+        let mut session = configured_runtime_session(&root, "build");
+
+        session
+            .replace_messages(vec![MessageParam::user("resume me")])
+            .unwrap();
+        session.set_model("claude-sonnet-4-0");
+        session.set_temperature(Some(0.5));
+        session.add_stop_sequence("END".to_string());
+        session.set_session_budget(Some(1234));
+
+        assert_eq!(
+            session.switch_agent("review").unwrap(),
+            AgentSwitchResult::Switched(AgentSummary {
+                id: "review".to_string(),
+                display_name: Some("Reviewer".to_string()),
+                description: Some("Review changes".to_string()),
+                enabled: SwitchPosition::Manual,
+                current: true,
+            })
+        );
+        assert_eq!(
+            snapshot(&session),
+            SessionSnapshot {
+                agent_id: "review".to_string(),
+                messages: vec![MessageParam::user("resume me")],
+                model: "claude-sonnet-4-0".parse().unwrap(),
+                temperature: Some(0.5),
+                stop_sequences: vec!["END".to_string()],
+                session_budget_tokens: Some(1234),
+            }
+        );
+        assert!(
+            session
+                .config()
+                .system_prompt_text()
+                .unwrap()
+                .contains("# Review Agent"),
+            "expected review prompt in system prompt"
+        );
+        assert_eq!(
+            read_saved_transcript(&session.sid_session.transcript_path()),
+            TranscriptSnapshot {
+                version: 1,
+                messages: vec![MessageParam::user("resume me")],
+            }
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn switch_agent_rejects_disabled_agents() {
+        let root = unique_workspace_root("agent-disabled");
+        write_multi_agent_config(&root);
+        let mut session = configured_runtime_session(&root, "build");
+
+        let err = session.switch_agent("off").unwrap_err().to_string();
+        assert!(err.contains("disabled_agent"), "error: {err}");
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
     }
 
     fn unique_workspace_root(prefix: &str) -> Path<'static> {
@@ -878,6 +1527,96 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sid-isnt-done-{prefix}-{nanos}"));
         fs::create_dir_all(&root).unwrap();
         Path::try_from(root).unwrap().into_owned()
+    }
+
+    fn test_chat_config(transcript_path: PathBuf) -> ChatConfig {
+        let mut config = ChatConfig::new().with_system_prompt(DEFAULT_SYSTEM_PROMPT.to_string());
+        config.transcript_path = Some(transcript_path);
+        config
+    }
+
+    fn new_runtime_session(
+        workspace_root: &Path,
+        config_root: &Path,
+        sid_session: Arc<SidSession>,
+        agent: Option<&str>,
+    ) -> SidRuntimeSession {
+        let config = test_chat_config(sid_session.transcript_path());
+        let agent = match agent {
+            Some(agent) => SidAgent::from_workspace_agent_with_config_root(
+                workspace_root,
+                config_root,
+                agent,
+                config.clone(),
+            )
+            .unwrap(),
+            None => SidAgent::from_workspace_with_config_root(
+                workspace_root,
+                config_root,
+                config.clone(),
+            )
+            .unwrap(),
+        }
+        .with_session(sid_session.clone());
+        let current_agent_id = agent.id().to_string();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let chat = ChatSession::with_agent(client.clone(), agent);
+        SidRuntimeSession::new(
+            client,
+            chat,
+            config,
+            workspace_root.clone().into_owned(),
+            config_root.clone().into_owned(),
+            sid_session,
+            current_agent_id,
+        )
+    }
+
+    fn configured_runtime_session(root: &Path, agent: &str) -> SidRuntimeSession {
+        let sid_session = Arc::new(SidSession::create(root).unwrap());
+        new_runtime_session(root, root, sid_session, Some(agent))
+    }
+
+    fn write_multi_agent_config(root: &Path) {
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            concat!(
+                "DEFAULT_AGENT=build\n",
+                "build_ENABLED=YES\n",
+                "build_NAME='Builder'\n",
+                "build_DESC='Build changes'\n",
+                "build_TOOLS='bash'\n",
+                "review_ENABLED=MANUAL\n",
+                "review_NAME='Reviewer'\n",
+                "review_DESC='Review changes'\n",
+                "review_TOOLS='bash'\n",
+                "off_ENABLED=NO\n",
+                "off_DESC='Disabled agent'\n",
+                "off_TOOLS='bash'\n",
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        fs::write(root.join("agents/build.md").as_str(), "# Build Agent\n").unwrap();
+        fs::write(root.join("agents/review.md").as_str(), "# Review Agent\n").unwrap();
+        fs::write(root.join("agents/off.md").as_str(), "# Off Agent\n").unwrap();
+    }
+
+    fn snapshot(session: &SidRuntimeSession) -> SessionSnapshot {
+        let stats = session.stats();
+        SessionSnapshot {
+            agent_id: session.current_agent_id().to_string(),
+            messages: session.clone_messages(),
+            model: session.config().model(),
+            temperature: session.config().template.temperature,
+            stop_sequences: session.config().stop_sequences().to_vec(),
+            session_budget_tokens: stats.session_budget_tokens,
+        }
+    }
+
+    fn read_saved_transcript(path: &std::path::Path) -> TranscriptSnapshot {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
     #[test]

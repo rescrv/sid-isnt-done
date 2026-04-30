@@ -32,8 +32,8 @@ configuration is loaded from the current directory.
 
 The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for chat commands such as changing the model,
-saving or loading transcripts, clearing context, and printing session stats.
-Use `--resume <session-id-or-dir>` to reopen an earlier session directory,
+switching agents, saving or loading transcripts, clearing context, and printing
+session stats.  Use `--resume <session-id-or-dir>` to reopen an earlier session directory,
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
 
@@ -244,6 +244,20 @@ by `<agent>_SYSTEM`.
 
 If `DEFAULT_AGENT` is unset, `sid` starts the first enabled agent.  If no agent
 is enabled, it starts the first manual agent after confirmation.
+
+Within an interactive session, `sid` can hand work from one configured agent to
+another without restarting:
+
+```text
+/agent
+/agent list
+/agent switch <name>
+```
+
+The active transcript, session journals, and persisted bash state remain tied
+to the same `sid` session directory.  Explicit runtime overrides such as
+`/model`, `/temperature`, `/stop`, `/thinking`, `/budget`, and `/cache` remain
+in effect after an agent switch until they are changed again.
 
 ## USER INSTRUCTIONS
 
