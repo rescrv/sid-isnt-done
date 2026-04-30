@@ -628,6 +628,15 @@ impl SidAgent {
         client: &Anthropic,
         question: &str,
     ) -> Result<String, std::io::Error> {
+        self.ask_an_expert_with_renderer(client, question, None).await
+    }
+
+    async fn ask_an_expert_with_renderer(
+        &self,
+        client: &Anthropic,
+        question: &str,
+        renderer: Option<&mut dyn Renderer>,
+    ) -> Result<String, std::io::Error> {
         let Some(source) = self.memory_source() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -656,10 +665,18 @@ impl SidAgent {
         let mut chat = claudius::chat::ChatSession::with_agent(client.clone(), expert);
         chat.replace_messages(parent_messages);
 
-        let mut renderer = NullRenderer;
-        chat.send_message(MessageParam::user(question), &mut renderer)
-            .await
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        match renderer {
+            Some(renderer) => chat
+                .send_message(MessageParam::user(question), renderer)
+                .await
+                .map_err(|err| std::io::Error::other(err.to_string()))?,
+            None => {
+                let mut renderer = NullRenderer;
+                chat.send_message(MessageParam::user(question), &mut renderer)
+                    .await
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+            }
+        }
 
         extract_last_assistant_text(&chat.clone_messages()).ok_or_else(|| {
             std::io::Error::other("expert conversation produced no assistant response")
@@ -1239,11 +1256,35 @@ impl Agent for SidAgent {
                             &tool_context,
                         )
                         .await;
+                    let render_result = should_render_tool_result(intermediate.as_ref());
                     match callback
                         .apply_tool_result(client, self, &requested.tool_use, intermediate)
                         .await
                     {
-                        ControlFlow::Continue(result) => result,
+                        ControlFlow::Continue(result) => {
+                            let cancelled = tool_result_is_user_cancelled(&result);
+                            if render_result {
+                                push_tool_result(
+                                    &mut tool_results,
+                                    Some((renderer, &tool_context as &dyn StreamContext)),
+                                    result,
+                                );
+                            } else {
+                                push_tool_result(&mut tool_results, None, result);
+                            }
+                            if cancelled {
+                                self.tool_cancellation_pending
+                                    .store(true, Ordering::Relaxed);
+                                cancel_remaining_tool_calls_streaming(
+                                    &mut tool_results,
+                                    renderer,
+                                    context,
+                                    requested_tools.iter().skip(index + 1),
+                                );
+                                break;
+                            }
+                            continue;
+                        }
                         ControlFlow::Break(err) => return ControlFlow::Break(Err(err)),
                     }
                 }
@@ -1757,12 +1798,51 @@ impl ToolCallback<SidAgent> for SidTextEditorCallback {
 }
 
 fn apply_computed_tool_result(intermediate: Box<dyn IntermediateToolResult>) -> ToolResult {
-    let Some(intermediate) = intermediate.as_any().downcast_ref::<ToolResult>() else {
-        return ControlFlow::Break(Error::unknown(
-            "intermediate tool result fails to deserialize",
-        ));
-    };
-    intermediate.clone()
+    if let Some(intermediate) = intermediate.as_any().downcast_ref::<ToolResult>() {
+        return intermediate.clone();
+    }
+    if let Some(intermediate) = intermediate.as_any().downcast_ref::<ComputedToolResult>() {
+        return intermediate.result.clone();
+    }
+    ControlFlow::Break(Error::unknown(
+        "intermediate tool result fails to deserialize",
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct ComputedToolResult {
+    result: ToolResult,
+    render_result: bool,
+}
+
+impl ComputedToolResult {
+    fn new(result: ToolResult) -> Self {
+        Self {
+            result,
+            render_result: true,
+        }
+    }
+
+    fn with_render_result(result: ToolResult, render_result: bool) -> Self {
+        Self {
+            result,
+            render_result,
+        }
+    }
+}
+
+impl IntermediateToolResult for ComputedToolResult {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn should_render_tool_result(intermediate: &dyn IntermediateToolResult) -> bool {
+    intermediate
+        .as_any()
+        .downcast_ref::<ComputedToolResult>()
+        .map(|intermediate| intermediate.render_result)
+        .unwrap_or(true)
 }
 
 #[derive(Clone, Debug)]
@@ -1816,10 +1896,13 @@ impl ToolCallback<SidAgent> for AskAnExpertCallback {
         client: &Anthropic,
         agent: &SidAgent,
         tool_use: &ToolUseBlock,
-        _renderer: &mut dyn Renderer,
-        _context: &AgentStreamContext,
+        renderer: &mut dyn Renderer,
+        context: &AgentStreamContext,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(ask_an_expert_result(client, agent, tool_use).await)
+        Box::new(ask_an_expert_result_streaming(
+            client, agent, tool_use, renderer, context,
+        )
+        .await)
     }
 
     async fn apply_tool_result(
@@ -1838,6 +1921,18 @@ async fn ask_an_expert_result(
     agent: &SidAgent,
     tool_use: &ToolUseBlock,
 ) -> ToolResult {
+    let question = match ask_an_expert_question(tool_use) {
+        Ok(question) => question,
+        Err(result) => return result,
+    };
+
+    match agent.ask_an_expert(client, &question).await {
+        Ok(output) => tool_success_result(&tool_use.id, output),
+        Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+    }
+}
+
+fn ask_an_expert_question(tool_use: &ToolUseBlock) -> Result<String, ToolResult> {
     #[derive(serde::Deserialize)]
     struct AskAnExpertInput {
         question: String,
@@ -1845,16 +1940,178 @@ async fn ask_an_expert_result(
 
     let input: AskAnExpertInput = match serde_json::from_value(tool_use.input.clone()) {
         Ok(input) => input,
-        Err(err) => return tool_error_result(&tool_use.id, err.to_string()),
+        Err(err) => return Err(tool_error_result(&tool_use.id, err.to_string())),
     };
     let question = input.question.trim();
     if question.is_empty() {
-        return tool_error_result(&tool_use.id, "question must not be empty".to_string());
+        return Err(tool_error_result(
+            &tool_use.id,
+            "question must not be empty".to_string(),
+        ));
     }
 
-    match agent.ask_an_expert(client, question).await {
-        Ok(output) => tool_success_result(&tool_use.id, output),
-        Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+    Ok(question.to_string())
+}
+
+async fn ask_an_expert_result_streaming(
+    client: &Anthropic,
+    agent: &SidAgent,
+    tool_use: &ToolUseBlock,
+    renderer: &mut dyn Renderer,
+    context: &AgentStreamContext,
+) -> ComputedToolResult {
+    let question = match ask_an_expert_question(tool_use) {
+        Ok(question) => question,
+        Err(result) => return ComputedToolResult::new(result),
+    };
+    let mut renderer = AskAnExpertStreamRenderer::new(renderer, context, &question);
+    let result = match agent
+        .ask_an_expert_with_renderer(client, &question, Some(&mut renderer))
+        .await
+    {
+        Ok(output) => ComputedToolResult::with_render_result(
+            tool_success_result(&tool_use.id, output),
+            !renderer.started(),
+        ),
+        Err(err) => ComputedToolResult::new(tool_error_result(&tool_use.id, err.to_string())),
+    };
+    renderer.finish_if_open(None);
+    result
+}
+
+struct AskAnExpertStreamRenderer<'a> {
+    parent: &'a mut dyn Renderer,
+    context: AgentStreamContext,
+    question: &'a str,
+    started: bool,
+    finished: bool,
+}
+
+impl<'a> AskAnExpertStreamRenderer<'a> {
+    fn new(
+        parent: &'a mut dyn Renderer,
+        parent_context: &AgentStreamContext,
+        question: &'a str,
+    ) -> Self {
+        Self {
+            parent,
+            context: parent_context.child("expert"),
+            question,
+            started: false,
+            finished: false,
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.parent.start_agent(&self.context);
+        self.parent.print_info(&self.context, "question:");
+        self.parent.print_text(&self.context, self.question);
+        if !self.question.ends_with('\n') {
+            self.parent.print_text(&self.context, "\n");
+        }
+        self.parent.print_text(&self.context, "\n");
+        self.started = true;
+    }
+
+    fn finish_if_open(&mut self, stop_reason: Option<&StopReason>) {
+        if self.started && !self.finished {
+            self.parent.finish_agent(&self.context, stop_reason);
+            self.finished = true;
+        }
+    }
+
+    fn started(&self) -> bool {
+        self.started
+    }
+}
+
+impl Renderer for AskAnExpertStreamRenderer<'_> {
+    fn start_agent(&mut self, _context: &dyn StreamContext) {
+        self.ensure_started();
+    }
+
+    fn finish_agent(&mut self, _context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.finish_if_open(stop_reason);
+    }
+
+    fn print_text(&mut self, _context: &dyn StreamContext, text: &str) {
+        self.ensure_started();
+        self.parent.print_text(&self.context, text);
+    }
+
+    fn print_thinking(&mut self, _context: &dyn StreamContext, text: &str) {
+        self.ensure_started();
+        self.parent.print_thinking(&self.context, text);
+    }
+
+    fn print_error(&mut self, _context: &dyn StreamContext, error: &str) {
+        self.ensure_started();
+        self.parent.print_error(&self.context, error);
+    }
+
+    fn print_info(&mut self, _context: &dyn StreamContext, info: &str) {
+        self.ensure_started();
+        self.parent.print_info(&self.context, info);
+    }
+
+    fn start_tool_use(&mut self, _context: &dyn StreamContext, name: &str, id: &str) {
+        self.ensure_started();
+        self.parent.start_tool_use(&self.context, name, id);
+    }
+
+    fn print_tool_input(&mut self, _context: &dyn StreamContext, partial_json: &str) {
+        self.ensure_started();
+        self.parent.print_tool_input(&self.context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, _context: &dyn StreamContext) {
+        self.ensure_started();
+        self.parent.finish_tool_use(&self.context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        _context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.ensure_started();
+        self.parent
+            .start_tool_result(&self.context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, _context: &dyn StreamContext, text: &str) {
+        self.ensure_started();
+        self.parent.print_tool_result_text(&self.context, text);
+    }
+
+    fn finish_tool_result(&mut self, _context: &dyn StreamContext) {
+        self.ensure_started();
+        self.parent.finish_tool_result(&self.context);
+    }
+
+    fn finish_response(&mut self, _context: &dyn StreamContext) {
+        self.ensure_started();
+        self.parent.finish_response(&self.context);
+    }
+
+    fn print_interrupted(&mut self, _context: &dyn StreamContext) {
+        self.ensure_started();
+        self.parent.print_interrupted(&self.context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.parent.should_interrupt()
+    }
+
+    fn read_operator_line(
+        &mut self,
+        prompt: &str,
+    ) -> std::io::Result<Option<OperatorLine>> {
+        self.parent.read_operator_line(prompt)
     }
 }
 
@@ -2717,6 +2974,114 @@ mod tests {
             self.prompts.push(prompt.to_string());
             Ok(self.lines.pop_front())
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        output: String,
+    }
+
+    impl Renderer for RecordingRenderer {
+        fn start_agent(&mut self, context: &dyn claudius::StreamContext) {
+            self.output.push_str(&format!(
+                "[start:{}:{}]\n",
+                context.label().unwrap_or_default(),
+                context.depth()
+            ));
+        }
+
+        fn finish_agent(
+            &mut self,
+            context: &dyn claudius::StreamContext,
+            stop_reason: Option<&StopReason>,
+        ) {
+            self.output.push_str(&format!(
+                "[finish:{}:{}:{stop_reason:?}]\n",
+                context.label().unwrap_or_default(),
+                context.depth(),
+            ));
+        }
+
+        fn print_text(&mut self, _context: &dyn claudius::StreamContext, text: &str) {
+            self.output.push_str(text);
+        }
+
+        fn print_thinking(&mut self, _context: &dyn claudius::StreamContext, text: &str) {
+            self.output.push_str(text);
+        }
+
+        fn print_error(&mut self, _context: &dyn claudius::StreamContext, error: &str) {
+            self.output.push_str(error);
+            self.output.push('\n');
+        }
+
+        fn print_info(&mut self, _context: &dyn claudius::StreamContext, info: &str) {
+            self.output.push_str(info);
+            self.output.push('\n');
+        }
+
+        fn start_tool_use(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            _name: &str,
+            _id: &str,
+        ) {
+        }
+
+        fn print_tool_input(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            partial_json: &str,
+        ) {
+            self.output.push_str(partial_json);
+        }
+
+        fn finish_tool_use(&mut self, _context: &dyn claudius::StreamContext) {}
+
+        fn start_tool_result(
+            &mut self,
+            _context: &dyn claudius::StreamContext,
+            _tool_use_id: &str,
+            _is_error: bool,
+        ) {
+        }
+
+        fn print_tool_result_text(&mut self, _context: &dyn claudius::StreamContext, text: &str) {
+            self.output.push_str(text);
+        }
+
+        fn finish_tool_result(&mut self, _context: &dyn claudius::StreamContext) {}
+
+        fn finish_response(&mut self, _context: &dyn claudius::StreamContext) {}
+    }
+
+    #[test]
+    fn ask_an_expert_stream_renderer_streams_question_and_answer() {
+        let parent_context = AgentStreamContext::root("build").child("tool:ask_an_expert");
+        let mut parent = RecordingRenderer::default();
+        {
+            let mut renderer =
+                AskAnExpertStreamRenderer::new(&mut parent, &parent_context, "Where is it?");
+            renderer.start_agent(&());
+            renderer.print_text(&(), "In src/lib.rs.");
+            renderer.finish_agent(&(), Some(&StopReason::EndTurn));
+        }
+
+        assert!(parent.output.contains("[start:expert:2]"));
+        assert!(parent.output.contains("question:\nWhere is it?\n\n"));
+        assert!(parent.output.contains("In src/lib.rs."));
+        assert!(parent.output.contains("[finish:expert:2:Some(EndTurn)]"));
+    }
+
+    #[test]
+    fn computed_tool_result_can_suppress_terminal_rendering() {
+        let result = ComputedToolResult::with_render_result(
+            tool_success_result("toolu_test", "ok".to_string()),
+            false,
+        );
+
+        assert!(!should_render_tool_result(&result));
+        assert_eq!(unwrap_success_text(apply_computed_tool_result(Box::new(result))), "ok");
     }
 
     #[test]
