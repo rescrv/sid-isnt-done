@@ -149,6 +149,9 @@ struct SidArgs {
         "COMMAND"
     )]
     bash_debug: Option<String>,
+
+    #[arrrg(optional, "Resume an existing session by ID or directory", "SESSION")]
+    resume: Option<String>,
 }
 
 /// Data computed synchronously before the tokio runtime starts.
@@ -160,13 +163,18 @@ struct PreRuntimeSetup {
     workspace_display: String,
     session_display: String,
     bash_debug: Option<String>,
+    resumed: bool,
 }
 
 /// Parse arguments, resolve paths, create the session directory, and set
 /// environment variables for child processes.  Runs before the tokio runtime
 /// so that process-global `set_var` calls are single-threaded and safe.
 fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
-    let SidArgs { param, bash_debug } = parse_sid_args()?;
+    let SidArgs {
+        param,
+        bash_debug,
+        resume,
+    } = parse_sid_args()?;
     let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
             .with_string_field("cause", &err.to_string())
@@ -191,7 +199,12 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
     })?
     .into_owned();
     let config_root = resolve_sid_home(&workspace_root)?;
-    let sid_session = Arc::new(SidSession::create(&config_root)?);
+    let resumed = resume.is_some();
+    let sid_session = Arc::new(match resume {
+        Some(session) => SidSession::resume(&config_root, &session)?,
+        None => SidSession::create(&config_root)?,
+    });
+    config.transcript_path = Some(sid_session.transcript_path());
     // Safe: no other threads are running yet.
     unsafe {
         std::env::set_var("SID_WORKSPACE_ROOT", workspace_root.as_str());
@@ -208,8 +221,13 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         config_root,
         sid_session,
         workspace_display,
-        session_display,
+        session_display: if resumed {
+            format!("{session_display} (resumed)")
+        } else {
+            session_display
+        },
         bash_debug,
+        resumed,
     })
 }
 
@@ -237,12 +255,13 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         workspace_display,
         session_display,
         bash_debug,
+        resumed,
     } = setup;
 
     warn_if_sandbox_unavailable();
 
     let agent = SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config)?
-        .with_session(sid_session);
+        .with_session(sid_session.clone());
     let agent_id = agent.id().to_string();
     let use_color = agent.config().use_color;
 
@@ -274,6 +293,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         .with_string_field("cause", &err.to_string())
     })?;
     let mut session = ChatSession::with_agent(client, agent);
+    load_resumed_transcript(&mut session, sid_session.as_ref(), resumed)?;
 
     let interrupted_clone = interrupted.clone();
     ctrlc::set_handler(move || {
@@ -313,9 +333,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                             let content = content.trim();
                             terminal.add_history_entry(content);
                             let message = claudius::MessageParam::user(content);
-                            if let Err(err) =
-                                session.send_message(message, &mut terminal).await
-                            {
+                            if let Err(err) = session.send_message(message, &mut terminal).await {
                                 terminal.print_error(&context, &err.to_string());
                             }
                         }
@@ -323,10 +341,8 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                             terminal.print_info(&context, "Editor returned empty; nothing sent.");
                         }
                         Err(err) => {
-                            terminal.print_error(
-                                &context,
-                                &format!("Failed to invoke editor: {err}"),
-                            );
+                            terminal
+                                .print_error(&context, &format!("Failed to invoke editor: {err}"));
                         }
                     }
                     continue;
@@ -506,6 +522,32 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
     }
 
     Ok(())
+}
+
+fn load_resumed_transcript(
+    session: &mut ChatSession<SidAgent>,
+    sid_session: &SidSession,
+    resumed: bool,
+) -> Result<(), SError> {
+    if !resumed {
+        return Ok(());
+    }
+
+    let transcript_path = sid_session.transcript_path();
+    if !transcript_path.is_file() {
+        return Ok(());
+    }
+
+    session
+        .load_transcript_from(&transcript_path)
+        .map_err(|err| {
+            cli_error(
+                "resume_transcript_failed",
+                "failed to load resumed transcript",
+            )
+            .with_string_field("path", transcript_path.to_string_lossy().as_ref())
+            .with_string_field("cause", &err.to_string())
+        })
 }
 
 fn parse_sid_args() -> Result<SidArgs, SError> {
@@ -750,8 +792,20 @@ fn invoke_external_editor() -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SANDBOX_UNAVAILABLE_WARNING, SidArgs, parse_confirmation, validate_no_free_args};
+    use super::{
+        SANDBOX_UNAVAILABLE_WARNING, SidArgs, load_resumed_transcript, parse_confirmation,
+        validate_no_free_args,
+    };
     use arrrg::{CommandLine, NoExitCommandLine};
+    use claudius::Anthropic;
+    use claudius::MessageParam;
+    use claudius::chat::{ChatConfig, ChatSession};
+    use sid_isnt_done::{SidAgent, session::SidSession};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use utf8path::Path;
 
     fn parse_args(argv: &[&str]) -> (SidArgs, Vec<String>, i32, Vec<String>) {
         let (parsed, free) =
@@ -776,6 +830,54 @@ mod tests {
     fn parse_confirmation_rejects_other_values() {
         assert_eq!(parse_confirmation(""), None);
         assert_eq!(parse_confirmation("maybe"), None);
+    }
+
+    #[test]
+    fn parse_args_accept_resume_option() {
+        let (args, free, status, messages) =
+            parse_args(&["--resume", "2026-04-20T18-42-13.123456-0700"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert_eq!(
+            args.resume.as_deref(),
+            Some("2026-04-20T18-42-13.123456-0700")
+        );
+    }
+
+    #[test]
+    fn load_resumed_transcript_restores_saved_history() {
+        let workspace_root = unique_workspace_root("resume-transcript");
+        let sid_session = Arc::new(SidSession::create(&workspace_root).unwrap());
+
+        fs::write(
+            sid_session.transcript_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "messages": [MessageParam::user("resume me")]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let agent = SidAgent::new(ChatConfig::new(), workspace_root.clone())
+            .with_session(sid_session.clone());
+        let mut chat = ChatSession::with_agent(client, agent);
+
+        load_resumed_transcript(&mut chat, sid_session.as_ref(), true).unwrap();
+        assert_eq!(chat.clone_messages(), vec![MessageParam::user("resume me")]);
+
+        fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    fn unique_workspace_root(prefix: &str) -> Path<'static> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sid-isnt-done-{prefix}-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        Path::try_from(root).unwrap().into_owned()
     }
 
     #[test]

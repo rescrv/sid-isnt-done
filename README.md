@@ -8,6 +8,7 @@ sid - run a small, rc-configured coding agent in the current workspace
 
 ```text
 sid [OPTIONS]
+sid --resume SESSION [OPTIONS]
 SID_HOME=DIR sid [OPTIONS]
 sid --bash-debug COMMAND
 sid-seatbelt [--writable-roots DIR[:DIR...]] -- COMMAND [ARG...]
@@ -32,6 +33,9 @@ configuration is loaded from the current directory.
 The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for chat commands such as changing the model,
 saving or loading transcripts, clearing context, and printing session stats.
+Use `--resume <session-id-or-dir>` to reopen an earlier session directory,
+reload `transcript.json`, continue appending to the same journals, and restore
+the persisted bash shell state for future `bash` tool calls.
 
 ## QUICKSTART
 
@@ -59,6 +63,7 @@ After installing the binaries, the same examples can be run as:
 ```sh
 SID_HOME=init sid
 SID_HOME=init sid --bash-debug 'pwd && ls'
+SID_HOME=init sid --resume 2026-04-20T18-42-13.123456-0700
 ```
 
 ## BUILDING
@@ -113,6 +118,13 @@ warning.
 `--bash-debug COMMAND`
 : Run `COMMAND` through the configured built-in bash tool and exit.  This is
   useful for checking tool configuration without starting an interactive chat.
+
+`--resume SESSION`
+: Resume an existing session by timestamp id or by session directory path.
+  Session ids are resolved under `${SID_SESSIONS:-${SID_HOME}/sessions}`.
+  Resuming reloads the saved transcript, continues the existing event and API
+  journals, preserves ordered tool numbering, and restores the persisted bash
+  shell snapshot.
 
 `--help`
 : Print the command-line help.
@@ -474,7 +486,7 @@ esac
 Each `sid` process creates a timestamp-named session directory under
 `${SID_SESSIONS:-${SID_HOME}/sessions}`, for example
 `2026-04-20T18-42-13.123456-0700`.  Durable session state is written to a small
-set of append-only journals:
+set of append-only journals plus a bash snapshot file:
 
 ```text
 session.json
@@ -482,7 +494,13 @@ transcript.json
 events.jsonl
 api.jsonl
 tool-streams.jsonl
+bash-state.sh
 ```
+
+Starting `sid --resume <session>` reuses that directory instead of creating a
+new one.  `sid` reloads `transcript.json`, appends a `session_resume` record to
+`events.jsonl`, continues `api.jsonl` and ordered tool sequences, and restores
+`bash-state.sh` into the next fresh PTY-backed bash session.
 
 For each tool call, `sid` creates a fresh ordered runtime directory under
 `<session>/tmp/tool-000001/`, writes `request.json`, writes an rc-conf overlay,
@@ -712,6 +730,9 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tool-streams.jsonl`
 : Tool confirmation, stdout, and stderr stream journal.
+
+`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/bash-state.sh`
+: Restorable bash shell snapshot used when a session is resumed.
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tmp/`
 : Runtime scratch.  Tool directories and bash temporary files live here while

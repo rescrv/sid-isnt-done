@@ -47,6 +47,14 @@ use crate::user_instructions::{
 
 const DEFAULT_AGENT_ID: &str = "sid";
 const USER_CANCELLED_ACTION: &str = "user cancelled action";
+const BASH_STATE_CAPTURE_COMMAND: &str = concat!(
+    "builtin printf 'builtin cd -- %q\\n' \"$PWD\"\n",
+    "builtin set +o\n",
+    "builtin shopt -p\n",
+    "builtin export -p\n",
+    "builtin alias -p\n",
+    "builtin declare -pf\n",
+);
 
 /// Top-level agent combining chat configuration, tool bindings, and sandbox policy.
 pub struct SidAgent {
@@ -333,9 +341,13 @@ impl SidAgent {
             }
         }
 
+        if restart {
+            self.clear_persisted_bash_state()?;
+        }
+
         let mut session = self.bash_session.lock().await;
         if session.is_none() {
-            *session = Some(BashPtySession::new(self.bash_pty_config()).await?);
+            *session = Some(self.spawn_bash_session(!restart).await?);
         }
 
         let result = {
@@ -345,12 +357,30 @@ impl SidAgent {
             session.run(command, restart).await
         };
         match result {
-            Ok(result) => render_bash_pty_result(result),
+            Ok(result) => {
+                let bash_session = session
+                    .as_mut()
+                    .expect("bash PTY session should still be initialized");
+                self.persist_bash_state(bash_session).await?;
+                render_bash_pty_result(result)
+            }
             Err(err) => {
+                let _ = self.clear_persisted_bash_state();
                 *session = None;
                 Err(err)
             }
         }
+    }
+
+    async fn spawn_bash_session(
+        &self,
+        restore_state: bool,
+    ) -> Result<BashPtySession, std::io::Error> {
+        let mut session = BashPtySession::new(self.bash_pty_config()).await?;
+        if restore_state {
+            self.restore_bash_state(&mut session).await?;
+        }
+        Ok(session)
     }
 
     fn bash_pty_config(&self) -> BashPtyConfig {
@@ -384,6 +414,67 @@ impl SidAgent {
             shell_wrapper: seatbelt::shell_wrapper(&self.writable_roots),
             ..BashPtyConfig::default()
         }
+    }
+
+    fn clear_persisted_bash_state(&self) -> Result<(), std::io::Error> {
+        if let Some(session) = self.session.as_ref() {
+            session
+                .clear_bash_state()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn restore_bash_state(
+        &self,
+        bash_session: &mut BashPtySession,
+    ) -> Result<(), std::io::Error> {
+        let Some(sid_session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        let Some(_) = sid_session
+            .read_bash_state()
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+        else {
+            return Ok(());
+        };
+
+        let restore_command = format!(
+            "builtin source {}",
+            shvar::quote_string(sid_session.bash_state_path().to_string_lossy().as_ref())
+        );
+        let result = bash_session.run(&restore_command, false).await?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(bash_state_io_error("failed to restore bash state", &result))
+        }
+    }
+
+    async fn persist_bash_state(
+        &self,
+        bash_session: &mut BashPtySession,
+    ) -> Result<(), std::io::Error> {
+        let Some(sid_session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        if !bash_session.is_alive()? {
+            sid_session
+                .clear_bash_state()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            return Ok(());
+        }
+
+        let snapshot = bash_session.run(BASH_STATE_CAPTURE_COMMAND, false).await?;
+        if !snapshot.status.success() {
+            return Err(bash_state_io_error(
+                "failed to capture bash state",
+                &snapshot,
+            ));
+        }
+        sid_session
+            .write_bash_state(&snapshot.output)
+            .map_err(|err| std::io::Error::other(err.to_string()))
     }
 
     fn tool_runtime_context(&self) -> ToolRuntimeContext<'_> {
@@ -1760,6 +1851,15 @@ fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Erro
         rendered.push_str(&format!("{}\n", result.status));
         Err(std::io::Error::other(rendered))
     }
+}
+
+fn bash_state_io_error(context: &str, result: &BashPtyResult) -> std::io::Error {
+    let mut rendered = strip_ansi_escapes(&result.output);
+    if !rendered.is_empty() && !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered.push_str(&format!("{}", result.status));
+    std::io::Error::other(format!("{context}: {rendered}"))
 }
 
 /// Strip ANSI escape sequences from terminal output.
@@ -3454,6 +3554,105 @@ esac
     }
 
     #[test]
+    fn resumed_session_restores_bash_state_snapshot() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_agents = Path::try_from(
+            fs::canonicalize(root.join("agents").as_str())
+                .expect("canonicalize agents directory should succeed"),
+        )
+        .expect("canonical agents path should be valid UTF-8")
+        .into_owned();
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+
+        let config = Config::load(&root).unwrap();
+        let sid_session = Arc::new(SidSession::create_in(sessions_root.clone()).unwrap());
+        let agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(sid_session.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime
+            .block_on(agent.bash(
+                "export FOO=bar\nf() { printf hi; }\nalias ll='printf alias'\nset -o nounset\ncd agents",
+                true,
+            ))
+            .unwrap();
+
+        let resumed =
+            Arc::new(SidSession::resume_in(sessions_root.clone(), sid_session.id()).unwrap());
+        let resumed_agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(resumed);
+        let restored = runtime
+            .block_on(resumed_agent.bash(
+                "if shopt -qo nounset; then nounset=on; else nounset=off; fi\nprintf '%s:%s:%s:%s:%s' \"$FOO\" \"$(f)\" \"$(ll)\" \"$PWD\" \"$nounset\"",
+                false,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            restored.trim_end(),
+            format!("bar:hi:alias:{}:on", canonical_agents.as_str()),
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
+    }
+
+    #[test]
+    fn resumed_session_restart_discards_saved_bash_state() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_root = Path::try_from(
+            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
+        )
+        .expect("canonical root path should be valid UTF-8")
+        .into_owned();
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+
+        let config = Config::load(&root).unwrap();
+        let sid_session = Arc::new(SidSession::create_in(sessions_root.clone()).unwrap());
+        let agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(sid_session.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime
+            .block_on(agent.bash("export FOO=bar\ncd agents", true))
+            .unwrap();
+
+        let resumed =
+            Arc::new(SidSession::resume_in(sessions_root.clone(), sid_session.id()).unwrap());
+        let resumed_agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(resumed.clone());
+        let restarted = runtime
+            .block_on(resumed_agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", true))
+            .unwrap();
+        assert_eq!(
+            restarted.trim_end(),
+            format!("unset:{}", canonical_root.as_str())
+        );
+
+        let resumed_again =
+            Arc::new(SidSession::resume_in(sessions_root.clone(), sid_session.id()).unwrap());
+        let resumed_again_agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(resumed_again);
+        let restored = runtime
+            .block_on(resumed_again_agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", false))
+            .unwrap();
+        assert_eq!(
+            restored.trim_end(),
+            format!("unset:{}", canonical_root.as_str())
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
+    }
+
+    #[test]
     fn two_agents_with_different_workspace_roots_have_no_crosstalk() {
         let root_a = temp_config_root("agent-a");
         let root_b = temp_config_root("agent-b");
@@ -4255,10 +4454,7 @@ format_ALIASES="fmt"
     #[test]
     fn strip_ansi_escapes_sgr_color() {
         // Bold red "error" then reset.
-        assert_eq!(
-            strip_ansi_escapes("\x1b[1;31merror\x1b[0m"),
-            "error"
-        );
+        assert_eq!(strip_ansi_escapes("\x1b[1;31merror\x1b[0m"), "error");
     }
 
     #[test]
@@ -4271,36 +4467,24 @@ format_ALIASES="fmt"
 
     #[test]
     fn strip_ansi_escapes_256_color() {
-        assert_eq!(
-            strip_ansi_escapes("\x1b[38;5;196mred\x1b[0m"),
-            "red"
-        );
+        assert_eq!(strip_ansi_escapes("\x1b[38;5;196mred\x1b[0m"), "red");
     }
 
     #[test]
     fn strip_ansi_escapes_truecolor() {
-        assert_eq!(
-            strip_ansi_escapes("\x1b[38;2;255;0;0mred\x1b[0m"),
-            "red"
-        );
+        assert_eq!(strip_ansi_escapes("\x1b[38;2;255;0;0mred\x1b[0m"), "red");
     }
 
     #[test]
     fn strip_ansi_escapes_osc_bel() {
         // OSC title-set terminated by BEL.
-        assert_eq!(
-            strip_ansi_escapes("\x1b]0;my title\x07rest"),
-            "rest"
-        );
+        assert_eq!(strip_ansi_escapes("\x1b]0;my title\x07rest"), "rest");
     }
 
     #[test]
     fn strip_ansi_escapes_osc_st() {
         // OSC terminated by ST (ESC \).
-        assert_eq!(
-            strip_ansi_escapes("\x1b]0;my title\x1b\\rest"),
-            "rest"
-        );
+        assert_eq!(strip_ansi_escapes("\x1b]0;my title\x1b\\rest"), "rest");
     }
 
     #[test]
