@@ -19,7 +19,11 @@ use claudius::{Anthropic, Model};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{AGENTS_CONF_FILE, Config as SidConfig, TOOLS_CONF_FILE};
-use sid_isnt_done::{SidAgent, seatbelt, session, session::SidSession};
+use sid_isnt_done::{
+    COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
+    seatbelt, session,
+    session::SidSession,
+};
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "You are sid, a concise coding agent with access to the current workspace mounted at /.\n",
@@ -183,7 +187,40 @@ enum SidCommand {
     ShowAgent,
     AgentList,
     SwitchAgent(String),
+    Compact,
     Invalid(String),
+}
+
+struct QuietRenderer;
+
+impl Renderer for QuietRenderer {
+    fn print_text(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_thinking(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_error(&mut self, _context: &dyn StreamContext, _error: &str) {}
+
+    fn print_info(&mut self, _context: &dyn StreamContext, _info: &str) {}
+
+    fn start_tool_use(&mut self, _context: &dyn StreamContext, _name: &str, _id: &str) {}
+
+    fn print_tool_input(&mut self, _context: &dyn StreamContext, _partial_json: &str) {}
+
+    fn finish_tool_use(&mut self, _context: &dyn StreamContext) {}
+
+    fn start_tool_result(
+        &mut self,
+        _context: &dyn StreamContext,
+        _tool_use_id: &str,
+        _is_error: bool,
+    ) {
+    }
+
+    fn print_tool_result_text(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn finish_tool_result(&mut self, _context: &dyn StreamContext) {}
+
+    fn finish_response(&mut self, _context: &dyn StreamContext) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -276,12 +313,25 @@ impl SessionOverrides {
             config.caching_enabled = caching_enabled;
         }
     }
+
+    fn apply_to_without_system_prompt(&self, config: &mut ChatConfig) {
+        let mut overrides = self.clone();
+        overrides.system_prompt = None;
+        overrides.apply_to(config);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentSwitchResult {
     NoChange,
     Switched(AgentSummary),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactResult {
+    parent_session_id: String,
+    new_session_id: String,
+    new_session_root: String,
 }
 
 struct SidRuntimeSession {
@@ -491,6 +541,86 @@ impl SidRuntimeSession {
 
         let summary = self.current_agent_summary()?;
         Ok(AgentSwitchResult::Switched(summary))
+    }
+
+    async fn compact(&mut self) -> Result<CompactResult, SError> {
+        let parent_session_id = self.sid_session.id().to_string();
+        let parent_session_dir = self.sid_session.root().to_string_lossy().into_owned();
+        let messages = self.chat.clone_messages();
+        let mut compactor_fallback = self.fallback_config.clone();
+        compactor_fallback.set_system_prompt(None);
+        compactor_fallback.transcript_path = None;
+
+        let mut compactor = SidAgent::from_workspace_compactor_with_config_root(
+            &self.workspace_root,
+            &self.config_root,
+            compactor_fallback,
+        )?
+        .with_memory_source(self.sid_session.compaction_provenance().cloned());
+        self.overrides
+            .apply_to_without_system_prompt(compactor.config_mut());
+
+        let expert = compactor.compaction_snapshot();
+        let mut compactor_chat = ChatSession::with_agent(self.client.clone(), compactor);
+        compactor_chat.replace_messages(messages);
+
+        let mut renderer = QuietRenderer;
+        compactor_chat
+            .send_message(claudius::MessageParam::user(COMPACTION_REQUEST_PROMPT), &mut renderer)
+            .await
+            .map_err(|err| {
+                cli_error("compaction_failed", "failed to generate conversation summary")
+                    .with_string_field("cause", &err.to_string())
+            })?;
+
+        let summary = extract_last_assistant_text(&compactor_chat.clone_messages()).ok_or_else(
+            || {
+                cli_error(
+                    "compaction_empty",
+                    "compaction agent produced no assistant summary",
+                )
+            },
+        )?;
+
+        let next_sid_session = Arc::new(SidSession::create_compacted(
+            &self.config_root,
+            session::CompactionProvenance {
+                session_id: parent_session_id.clone(),
+                session_dir: parent_session_dir,
+                expert,
+            },
+        )?);
+
+        if let Some(state) = self.sid_session.read_bash_state()? {
+            next_sid_session.write_bash_state(&state)?;
+        }
+
+        let transcript_path = next_sid_session.transcript_path();
+        self.fallback_config.transcript_path = Some(transcript_path.clone());
+
+        let mut next_agent = SidAgent::from_workspace_agent_with_config_root(
+            &self.workspace_root,
+            &self.config_root,
+            &self.current_agent_id,
+            self.fallback_config.clone(),
+        )?
+        .with_session(next_sid_session.clone());
+        self.overrides.apply_to(next_agent.config_mut());
+        next_agent.config_mut().transcript_path = Some(transcript_path);
+
+        let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
+        next_chat.replace_messages(compacted_transcript(&parent_session_id, &summary));
+
+        self.chat = next_chat;
+        self.sid_session = next_sid_session.clone();
+        self.rolled_up_stats = SessionStatsRollup::default();
+        self.persist_transcript()?;
+
+        Ok(CompactResult {
+            parent_session_id,
+            new_session_id: next_sid_session.id().to_string(),
+            new_session_root: next_sid_session.root().display().to_string(),
+        })
     }
 
     fn roll_up_current_stats(&mut self) {
@@ -753,6 +883,18 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                                 Err(err) => terminal.print_error(&context, &err.to_string()),
                             }
                         }
+                        SidCommand::Compact => match session.compact().await {
+                            Ok(result) => terminal.print_info(
+                                &context,
+                                &format!(
+                                    "Compacted session {} into {} ({})",
+                                    result.parent_session_id,
+                                    result.new_session_id,
+                                    result.new_session_root
+                                ),
+                            ),
+                            Err(err) => terminal.print_error(&context, &err.to_string()),
+                        },
                         SidCommand::Invalid(message) => {
                             terminal.print_error(&context, &message);
                         }
@@ -936,6 +1078,15 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
     let mut parts = input[1..].splitn(2, ' ');
     let command = parts.next()?.to_ascii_lowercase();
     let argument = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    if command == "compact" {
+        return if argument.is_some() {
+            Some(SidCommand::Invalid(
+                "/compact does not take any arguments".to_string(),
+            ))
+        } else {
+            Some(SidCommand::Compact)
+        };
+    }
     if command != "agent" && command != "agents" {
         return None;
     }
@@ -970,6 +1121,7 @@ fn print_help() {
     for line in help_text().lines() {
         println!("    {}", line);
     }
+    println!("      /compact              Summarize the session and continue in a new child session");
     println!("      /agent                Show the current agent");
     println!("      /agent list           List configured agents");
     println!("      /agent switch <name>  Switch to another agent in this session");
@@ -1401,6 +1553,7 @@ mod tests {
     fn parse_agent_commands() {
         assert_eq!(parse_sid_command("/agent"), Some(SidCommand::ShowAgent));
         assert_eq!(parse_sid_command("/agents"), Some(SidCommand::AgentList));
+        assert_eq!(parse_sid_command("/compact"), Some(SidCommand::Compact));
         assert_eq!(
             parse_sid_command("/agent list"),
             Some(SidCommand::AgentList)
@@ -1413,6 +1566,12 @@ mod tests {
             parse_sid_command("/agent switch"),
             Some(SidCommand::Invalid(
                 "/agent switch requires an agent name".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_sid_command("/compact now"),
+            Some(SidCommand::Invalid(
+                "/compact does not take any arguments".to_string()
             ))
         );
     }

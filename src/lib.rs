@@ -38,15 +38,19 @@ use crate::config::{
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
 use crate::seatbelt::WritableRoots;
-use crate::session::SidSession;
+use crate::session::{CompactionExpertConfig, CompactionProvenance, SidSession};
 use crate::tool_runtime::ToolRuntimeContext;
 use crate::user_instructions::{
     UserInstructionRuntimeContext, UserInstructionSettings, append_agents_md_to_system_prompt,
-    append_user_instruction_block, build_user_instruction_block, resolve_user_instruction_settings,
+    append_user_instruction_block, build_user_instruction_block,
+    disabled_user_instruction_settings, resolve_user_instruction_settings,
 };
 
 const DEFAULT_AGENT_ID: &str = "sid";
+const DEFAULT_COMPACTOR_AGENT_ID: &str = "compact";
 const USER_CANCELLED_ACTION: &str = "user cancelled action";
+const ASK_AN_EXPERT_TOOL_NAME: &str = "ask_an_expert";
+const MAX_ASK_AN_EXPERT_DEPTH: usize = 8;
 const BASH_STATE_CAPTURE_COMMAND: &str = concat!(
     "builtin printf 'builtin cd -- %q\\n' \"$PWD\"\n",
     "builtin set +o\n",
@@ -55,6 +59,42 @@ const BASH_STATE_CAPTURE_COMMAND: &str = concat!(
     "builtin alias -p\n",
     "builtin declare -pf\n",
 );
+const DEFAULT_COMPACTOR_SYSTEM_PROMPT: &str = concat!(
+    "You are the sid compaction agent.\n",
+    "Turn the conversation history into a compact, high-signal handoff summary for a future session.\n",
+    "Preserve objectives, constraints, decisions, unfinished work, notable files, commands, errors, and next steps.\n",
+    "Prefer concrete facts over narration.\n",
+    "State uncertainty explicitly.\n",
+    "Do not ask follow-up questions.\n",
+);
+pub const COMPACTION_REQUEST_PROMPT: &str = concat!(
+    "Compact this conversation into a standalone handoff summary for the next session.\n",
+    "Write only the summary.\n",
+);
+const MEMORY_EXPERT_PROMPT_ADDENDUM: &str = concat!(
+    "\n\n# Expert follow-up mode\n",
+    "You previously wrote the summary for a compacted sid session.\n",
+    "Answer the latest user question from contextual memory only.\n",
+    "If the answer is not supported by the conversation context you have, reply exactly: I don't know\n",
+    "You may use ask_an_expert only to consult the earlier summary writer when available.\n",
+);
+const COMPACTED_SESSION_CONTEXT_TEMPLATE: &str = concat!(
+    "This session is a compacted continuation of session {session_id}.\n",
+    "The next assistant message is the handoff summary written by the previous owner of the project.\n",
+    "Use that summary as working context. If you need details that are not in it, use ask_an_expert.\n",
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidToolScope {
+    Normal,
+    MemoryOnly,
+}
+
+impl SidToolScope {
+    fn exposes_standard_tools(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
 
 /// Top-level agent combining chat configuration, tool bindings, and sandbox policy.
 pub struct SidAgent {
@@ -70,6 +110,9 @@ pub struct SidAgent {
     writable_roots: WritableRoots,
     filesystem: MountHierarchy,
     session: Option<Arc<SidSession>>,
+    memory_source: Option<CompactionProvenance>,
+    tool_scope: SidToolScope,
+    memory_depth: usize,
     bash_session: Mutex<Option<BashPtySession>>,
     tool_cancellation_pending: AtomicBool,
     token_usage_totals: StdMutex<TokenUsageTotals>,
@@ -85,10 +128,26 @@ impl SidAgent {
         config_root: Path<'static>,
         workspace_root: Path<'static>,
     ) -> Self {
+        Self::new_custom(
+            DEFAULT_AGENT_ID.to_string(),
+            config,
+            config_root,
+            workspace_root,
+            UserInstructionSettings::default(),
+        )
+    }
+
+    fn new_custom(
+        id: String,
+        config: ChatConfig,
+        config_root: Path<'static>,
+        workspace_root: Path<'static>,
+        user_instructions: UserInstructionSettings,
+    ) -> Self {
         let filesystem = build_default_filesystem(&workspace_root);
         let writable_roots = default_writable_roots(&workspace_root);
         Self::with_parts(
-            DEFAULT_AGENT_ID.to_string(),
+            id,
             SwitchPosition::Yes,
             config,
             vec![],
@@ -96,10 +155,13 @@ impl SidAgent {
             Vec::new(),
             config_root,
             workspace_root,
-            UserInstructionSettings::default(),
+            user_instructions,
             writable_roots,
             filesystem,
             None,
+            None,
+            SidToolScope::Normal,
+            0,
         )
     }
 
@@ -167,6 +229,37 @@ impl SidAgent {
         )
     }
 
+    pub fn from_workspace_compactor_with_config_root(
+        workspace_root: &Path,
+        config_root: &Path,
+        fallback: ChatConfig,
+    ) -> Result<Self, SError> {
+        if workspace_has_config(config_root) {
+            let config = Config::load(config_root)?;
+            if config.agents.contains_key(DEFAULT_COMPACTOR_AGENT_ID) {
+                return Self::from_loaded_config_inner(
+                    &config,
+                    DEFAULT_COMPACTOR_AGENT_ID,
+                    Some(&fallback),
+                    workspace_root.clone().into_owned(),
+                    true,
+                )
+                .map(|agent| agent.with_tool_scope(SidToolScope::MemoryOnly));
+            }
+        }
+
+        let mut config = fallback;
+        config.set_system_prompt(Some(DEFAULT_COMPACTOR_SYSTEM_PROMPT.to_string()));
+        Ok(Self::new_custom(
+            DEFAULT_COMPACTOR_AGENT_ID.to_string(),
+            config,
+            config_root.clone().into_owned(),
+            workspace_root.clone().into_owned(),
+            disabled_user_instruction_settings(),
+        )
+        .with_tool_scope(SidToolScope::MemoryOnly))
+    }
+
     pub fn from_config(
         config: &Config,
         agent: &str,
@@ -197,11 +290,21 @@ impl SidAgent {
         fallback: Option<&ChatConfig>,
         workspace_root: Path<'static>,
     ) -> Result<Self, SError> {
+        Self::from_loaded_config_inner(config, agent, fallback, workspace_root, false)
+    }
+
+    fn from_loaded_config_inner(
+        config: &Config,
+        agent: &str,
+        fallback: Option<&ChatConfig>,
+        workspace_root: Path<'static>,
+        allow_disabled: bool,
+    ) -> Result<Self, SError> {
         let agent_config = config
             .agents
             .get(agent)
             .ok_or_else(|| missing_agent_error(agent))?;
-        if !agent_config.enabled.can_be_started() {
+        if !allow_disabled && !agent_config.enabled.can_be_started() {
             return Err(disabled_agent_error(agent, agent_config.enabled));
         }
 
@@ -230,6 +333,9 @@ impl SidAgent {
             writable_roots,
             filesystem,
             None,
+            None,
+            SidToolScope::Normal,
+            0,
         ))
     }
 
@@ -247,6 +353,9 @@ impl SidAgent {
         writable_roots: WritableRoots,
         filesystem: MountHierarchy,
         session: Option<Arc<SidSession>>,
+        memory_source: Option<CompactionProvenance>,
+        tool_scope: SidToolScope,
+        memory_depth: usize,
     ) -> Self {
         Self {
             id,
@@ -261,6 +370,9 @@ impl SidAgent {
             writable_roots,
             filesystem,
             session,
+            memory_source,
+            tool_scope,
+            memory_depth,
             bash_session: Mutex::new(None),
             tool_cancellation_pending: AtomicBool::new(false),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
@@ -269,8 +381,38 @@ impl SidAgent {
 
     pub fn with_session(mut self, session: Arc<SidSession>) -> Self {
         append_writable_root(&mut self.writable_roots, session.root());
+        if self.memory_source.is_none() {
+            self.memory_source = session.compaction_provenance().cloned();
+        }
         self.session = Some(session);
         self
+    }
+
+    pub fn with_memory_source(mut self, memory_source: Option<CompactionProvenance>) -> Self {
+        self.memory_source = memory_source;
+        self
+    }
+
+    fn with_tool_scope(mut self, tool_scope: SidToolScope) -> Self {
+        self.tool_scope = tool_scope;
+        if !tool_scope.exposes_standard_tools() {
+            self.tools.clear();
+            self.builtin_bindings = BuiltinToolBindings::default();
+        }
+        self
+    }
+
+    fn with_memory_depth(mut self, memory_depth: usize) -> Self {
+        self.memory_depth = memory_depth;
+        self
+    }
+
+    pub fn compaction_snapshot(&self) -> CompactionExpertConfig {
+        CompactionExpertConfig {
+            agent_id: Some(self.id.clone()),
+            model: self.config.model().to_string(),
+            system_prompt: self.config.system_prompt_text().map(str::to_string),
+        }
     }
 
     async fn run_bash_command(
@@ -475,6 +617,87 @@ impl SidAgent {
         sid_session
             .write_bash_state(&snapshot.output)
             .map_err(|err| std::io::Error::other(err.to_string()))
+    }
+
+    fn memory_source(&self) -> Option<&CompactionProvenance> {
+        self.memory_source.as_ref()
+    }
+
+    async fn ask_an_expert(
+        &self,
+        client: &Anthropic,
+        question: &str,
+    ) -> Result<String, std::io::Error> {
+        let Some(source) = self.memory_source() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ask_an_expert is not available in this session",
+            ));
+        };
+        if self.memory_depth >= MAX_ASK_AN_EXPERT_DEPTH {
+            return Ok("I don't know".to_string());
+        }
+
+        let parent_root = std::path::Path::new(&source.session_dir);
+        let parent_messages = load_transcript_messages(
+            session::transcript_path_for_session_dir(parent_root).as_path(),
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let parent_memory_source = session::read_compaction_provenance_from_dir(parent_root)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        let expert = Self::memory_expert_from_snapshot(
+            &source.expert,
+            &self.config_root,
+            &self.workspace_root,
+            parent_memory_source,
+            self.memory_depth + 1,
+        );
+        let mut chat = claudius::chat::ChatSession::with_agent(client.clone(), expert);
+        chat.replace_messages(parent_messages);
+
+        let mut renderer = NullRenderer;
+        chat.send_message(MessageParam::user(question), &mut renderer)
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        extract_last_assistant_text(&chat.clone_messages()).ok_or_else(|| {
+            std::io::Error::other("expert conversation produced no assistant response")
+        })
+    }
+
+    fn memory_expert_from_snapshot(
+        snapshot: &CompactionExpertConfig,
+        config_root: &Path,
+        workspace_root: &Path,
+        memory_source: Option<CompactionProvenance>,
+        memory_depth: usize,
+    ) -> Self {
+        let mut config = ChatConfig::new();
+        let model = snapshot
+            .model
+            .parse()
+            .unwrap_or_else(|_| Model::Custom(snapshot.model.clone()));
+        config.set_model(model);
+        config.set_system_prompt(Some(format!(
+            "{}{}",
+            snapshot.system_prompt.as_deref().unwrap_or_default(),
+            MEMORY_EXPERT_PROMPT_ADDENDUM
+        )));
+
+        Self::new_custom(
+            snapshot
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_COMPACTOR_AGENT_ID.to_string()),
+            config,
+            config_root.clone().into_owned(),
+            workspace_root.clone().into_owned(),
+            disabled_user_instruction_settings(),
+        )
+        .with_tool_scope(SidToolScope::MemoryOnly)
+        .with_memory_source(memory_source)
+        .with_memory_depth(memory_depth)
     }
 
     fn tool_runtime_context(&self) -> ToolRuntimeContext<'_> {
@@ -895,7 +1118,15 @@ impl Agent for SidAgent {
     }
 
     async fn tools(&self) -> Vec<Arc<dyn Tool<Self>>> {
-        self.tools.clone()
+        let mut tools = if self.tool_scope.exposes_standard_tools() {
+            self.tools.clone()
+        } else {
+            Vec::new()
+        };
+        if self.memory_source().is_some() {
+            tools.push(Arc::new(AskAnExpertTool) as Arc<dyn Tool<Self>>);
+        }
+        tools
     }
 
     async fn top_k(&self) -> Option<u32> {
@@ -1535,6 +1766,99 @@ fn apply_computed_tool_result(intermediate: Box<dyn IntermediateToolResult>) -> 
 }
 
 #[derive(Clone, Debug)]
+struct AskAnExpertTool;
+
+impl Tool<SidAgent> for AskAnExpertTool {
+    fn name(&self) -> String {
+        ASK_AN_EXPERT_TOOL_NAME.to_string()
+    }
+
+    fn callback(&self) -> Box<dyn ToolCallback<SidAgent> + '_> {
+        Box::new(AskAnExpertCallback)
+    }
+
+    fn to_param(&self) -> ToolUnionParam {
+        ToolUnionParam::CustomTool(
+            ToolParam::new(
+                ASK_AN_EXPERT_TOOL_NAME.to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The direct question to ask the previous summary writer."
+                        }
+                    },
+                    "required": ["question"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_description("Ask a direct question of the person who wrote the summary for this compacted session. They are the previous owner of the project and only available for consultation by contextual memory.".to_string()),
+        )
+    }
+}
+
+struct AskAnExpertCallback;
+
+#[async_trait::async_trait]
+impl ToolCallback<SidAgent> for AskAnExpertCallback {
+    async fn compute_tool_result(
+        &self,
+        client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(ask_an_expert_result(client, agent, tool_use).await)
+    }
+
+    async fn compute_tool_result_streaming(
+        &self,
+        client: &Anthropic,
+        agent: &SidAgent,
+        tool_use: &ToolUseBlock,
+        _renderer: &mut dyn Renderer,
+        _context: &AgentStreamContext,
+    ) -> Box<dyn IntermediateToolResult> {
+        Box::new(ask_an_expert_result(client, agent, tool_use).await)
+    }
+
+    async fn apply_tool_result(
+        &self,
+        _client: &Anthropic,
+        _agent: &mut SidAgent,
+        _tool_use: &ToolUseBlock,
+        intermediate: Box<dyn IntermediateToolResult>,
+    ) -> ToolResult {
+        apply_computed_tool_result(intermediate)
+    }
+}
+
+async fn ask_an_expert_result(
+    client: &Anthropic,
+    agent: &SidAgent,
+    tool_use: &ToolUseBlock,
+) -> ToolResult {
+    #[derive(serde::Deserialize)]
+    struct AskAnExpertInput {
+        question: String,
+    }
+
+    let input: AskAnExpertInput = match serde_json::from_value(tool_use.input.clone()) {
+        Ok(input) => input,
+        Err(err) => return tool_error_result(&tool_use.id, err.to_string()),
+    };
+    let question = input.question.trim();
+    if question.is_empty() {
+        return tool_error_result(&tool_use.id, "question must not be empty".to_string());
+    }
+
+    match agent.ask_an_expert(client, question).await {
+        Ok(output) => tool_success_result(&tool_use.id, output),
+        Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ExternalTool {
     name: String,
     canonical_id: String,
@@ -1908,6 +2232,78 @@ fn strip_ansi_escapes(input: &str) -> String {
     out
 }
 
+#[derive(serde::Deserialize)]
+struct TranscriptSnapshot {
+    version: u8,
+    messages: Vec<MessageParam>,
+}
+
+struct NullRenderer;
+
+impl Renderer for NullRenderer {
+    fn print_text(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_thinking(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_error(&mut self, _context: &dyn StreamContext, _error: &str) {}
+
+    fn print_info(&mut self, _context: &dyn StreamContext, _info: &str) {}
+
+    fn start_tool_use(&mut self, _context: &dyn StreamContext, _name: &str, _id: &str) {}
+
+    fn print_tool_input(&mut self, _context: &dyn StreamContext, _partial_json: &str) {}
+
+    fn finish_tool_use(&mut self, _context: &dyn StreamContext) {}
+
+    fn start_tool_result(
+        &mut self,
+        _context: &dyn StreamContext,
+        _tool_use_id: &str,
+        _is_error: bool,
+    ) {
+    }
+
+    fn print_tool_result_text(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn finish_tool_result(&mut self, _context: &dyn StreamContext) {}
+
+    fn finish_response(&mut self, _context: &dyn StreamContext) {}
+}
+
+pub fn load_transcript_messages(path: &std::path::Path) -> Result<Vec<MessageParam>, SError> {
+    let payload = std::fs::read(path).map_err(|err| {
+        SError::new("sid-transcript")
+            .with_code("transcript_read_failed")
+            .with_message("failed to read transcript")
+            .with_string_field("path", path.to_string_lossy().as_ref())
+            .with_string_field("cause", &err.to_string())
+    })?;
+    let snapshot: TranscriptSnapshot = serde_json::from_slice(&payload).map_err(|err| {
+        SError::new("sid-transcript")
+            .with_code("transcript_parse_failed")
+            .with_message("failed to parse transcript")
+            .with_string_field("path", path.to_string_lossy().as_ref())
+            .with_string_field("cause", &err.to_string())
+    })?;
+    if snapshot.version != 1 {
+        return Err(SError::new("sid-transcript")
+            .with_code("unsupported_transcript_version")
+            .with_message("unsupported transcript version")
+            .with_string_field("path", path.to_string_lossy().as_ref())
+            .with_string_field("version", &snapshot.version.to_string()));
+    }
+    Ok(snapshot.messages)
+}
+
+pub fn compacted_transcript(parent_session_id: &str, summary: &str) -> Vec<MessageParam> {
+    vec![
+        MessageParam::user(
+            COMPACTED_SESSION_CONTEXT_TEMPLATE.replace("{session_id}", parent_session_id),
+        ),
+        MessageParam::assistant(summary),
+    ]
+}
+
 fn tool_success_result(tool_use_id: &str, message: String) -> ToolResult {
     ControlFlow::Continue(Ok(
         ToolResultBlock::new(tool_use_id.to_string()).with_string_content(message)
@@ -2193,6 +2589,32 @@ fn latest_user_message_text(messages: &[MessageParam]) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("\n\n");
             Some(text)
+        }
+    }
+}
+
+pub fn extract_last_assistant_text(messages: &[MessageParam]) -> Option<String> {
+    let message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)?;
+    assistant_message_text(message)
+}
+
+fn assistant_message_text(message: &MessageParam) -> Option<String> {
+    if message.role != MessageRole::Assistant {
+        return None;
+    }
+    match &message.content {
+        MessageParamContent::String(text) => Some(text.clone()),
+        MessageParamContent::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if text.is_empty() { None } else { Some(text) }
         }
     }
 }
@@ -2502,6 +2924,113 @@ mod tests {
         assert!(!agent.requires_confirmation());
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn from_workspace_compactor_falls_back_to_builtin_prompt() {
+        let root = unique_temp_dir("compactor");
+        fs::create_dir_all(root.as_str()).unwrap();
+
+        let agent = SidAgent::from_workspace_compactor_with_config_root(
+            &root,
+            &root,
+            ChatConfig::new().with_system_prompt("ignored".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(agent.id(), DEFAULT_COMPACTOR_AGENT_ID);
+        assert_eq!(
+            agent.config.system_prompt_text(),
+            Some(DEFAULT_COMPACTOR_SYSTEM_PROMPT)
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(agent.tools()).is_empty());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn configured_compactor_uses_reserved_agent_even_if_disabled() {
+        let root = temp_config_root("compact-agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+build_ENABLED="YES"
+build_TOOLS='bash'
+compact_ENABLED="NO"
+compact_TOOLS='bash'
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
+        write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(root.join("agents/compact.md").as_str(), "# Compact\n\nCustom compact prompt.\n")
+            .unwrap();
+
+        let agent = SidAgent::from_workspace_compactor_with_config_root(
+            &root,
+            &root,
+            ChatConfig::new().with_system_prompt("ignored".to_string()),
+        )
+        .unwrap();
+        assert_eq!(agent.id(), DEFAULT_COMPACTOR_AGENT_ID);
+        assert!(
+            agent
+                .config
+                .system_prompt_text()
+                .unwrap()
+                .contains("Custom compact prompt.")
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(agent.tools()).is_empty());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn compacted_session_exposes_ask_an_expert_tool() {
+        let root = temp_config_root("compact-memory");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+        let parent = SidSession::create_in(sessions_root.clone()).unwrap();
+        let child = SidSession::create_compacted_in(
+            sessions_root.clone(),
+            CompactionProvenance {
+                session_id: parent.id().to_string(),
+                session_dir: parent.root().to_string_lossy().into_owned(),
+                expert: CompactionExpertConfig {
+                    agent_id: Some(DEFAULT_COMPACTOR_AGENT_ID.to_string()),
+                    model: "claude-sonnet-4-5".to_string(),
+                    system_prompt: Some("Summarize carefully.".to_string()),
+                },
+            },
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone())
+            .unwrap()
+            .with_session(Arc::new(child));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let tool_names = runtime
+            .block_on(agent.tools())
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec![
+                "bash".to_string(),
+                "str_replace_based_edit_tool".to_string(),
+                ASK_AN_EXPERT_TOOL_NAME.to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
     }
 
     #[test]

@@ -32,8 +32,9 @@ configuration is loaded from the current directory.
 
 The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for chat commands such as changing the model,
-switching agents, saving or loading transcripts, clearing context, and printing
-session stats.  Use `--resume <session-id-or-dir>` to reopen an earlier session directory,
+switching agents, compacting the conversation into a new child session, saving
+or loading transcripts, clearing context, and printing session stats.  Use
+`--resume <session-id-or-dir>` to reopen an earlier session directory,
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
 
@@ -249,6 +250,7 @@ Within an interactive session, `sid` can hand work from one configured agent to
 another without restarting:
 
 ```text
+/compact
 /agent
 /agent list
 /agent switch <name>
@@ -258,6 +260,12 @@ The active transcript, session journals, and persisted bash state remain tied
 to the same `sid` session directory.  Explicit runtime overrides such as
 `/model`, `/temperature`, `/stop`, `/thinking`, `/budget`, and `/cache` remain
 in effect after an agent switch until they are changed again.
+
+`/compact` runs the reserved `compact` agent when it is configured in
+`agents.conf`; otherwise `sid` uses a built-in compaction prompt.  The command
+creates a new child session whose initial transcript is a summary of the prior
+session.  Compacted sessions expose an `ask_an_expert` tool that can consult
+the earlier summary writer by contextual memory.
 
 ## USER INSTRUCTIONS
 
@@ -515,6 +523,11 @@ Starting `sid --resume <session>` reuses that directory instead of creating a
 new one.  `sid` reloads `transcript.json`, appends a `session_resume` record to
 `events.jsonl`, continues `api.jsonl` and ordered tool sequences, and restores
 `bash-state.sh` into the next fresh PTY-backed bash session.
+
+Running `/compact` creates a fresh session directory instead of mutating the
+current one.  The new `session.json` records which prior session it came from
+plus the prompt/model snapshot for the summary writer so future
+`ask_an_expert` calls can recurse through older compacted sessions.
 
 For each tool call, `sid` creates a fresh ordered runtime directory under
 `<session>/tmp/tool-000001/`, writes `request.json`, writes an rc-conf overlay,

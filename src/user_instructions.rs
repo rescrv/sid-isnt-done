@@ -37,6 +37,14 @@ impl Default for UserInstructionSettings {
     }
 }
 
+pub(crate) fn disabled_user_instruction_settings() -> UserInstructionSettings {
+    UserInstructionSettings {
+        agents_md_enabled: false,
+        agents_md_path: None,
+        hook: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct UserInstructionHook {
     service_name: String,

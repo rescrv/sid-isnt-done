@@ -28,6 +28,22 @@ const API_JOURNAL_FILE: &str = "api.jsonl";
 const TOOL_STREAMS_JOURNAL_FILE: &str = "tool-streams.jsonl";
 const BASH_STATE_FILE: &str = "bash-state.sh";
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CompactionExpertConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CompactionProvenance {
+    pub session_id: String,
+    pub session_dir: String,
+    pub expert: CompactionExpertConfig,
+}
+
 #[derive(Debug)]
 pub struct SidSession {
     id: String,
@@ -39,6 +55,7 @@ pub struct SidSession {
     api_path: PathBuf,
     tool_streams_path: PathBuf,
     bash_state_path: PathBuf,
+    compaction_provenance: Option<CompactionProvenance>,
     counters: SessionCounters,
     journal_lock: StdMutex<()>,
     stream_lock: Arc<StdMutex<()>>,
@@ -150,6 +167,8 @@ struct SessionTimestamp {
 #[derive(Debug, Deserialize)]
 struct SessionMetadata {
     id: String,
+    #[serde(default)]
+    compacted_from: Option<CompactionProvenance>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,6 +188,13 @@ impl SidSession {
         Self::create_in(resolve_sessions_root(config_root)?)
     }
 
+    pub fn create_compacted(
+        config_root: &Path,
+        provenance: CompactionProvenance,
+    ) -> Result<Self, SError> {
+        Self::create_compacted_in(resolve_sessions_root(config_root)?, provenance)
+    }
+
     pub fn resume(config_root: &Path, spec: &str) -> Result<Self, SError> {
         let default_sessions_root = resolve_sessions_root(config_root)?;
         let root = resolve_existing_session_root(&default_sessions_root, spec)?;
@@ -180,6 +206,20 @@ impl SidSession {
     }
 
     pub(crate) fn create_in(sessions_root: PathBuf) -> Result<Self, SError> {
+        Self::create_in_with_provenance(sessions_root, None)
+    }
+
+    pub(crate) fn create_compacted_in(
+        sessions_root: PathBuf,
+        provenance: CompactionProvenance,
+    ) -> Result<Self, SError> {
+        Self::create_in_with_provenance(sessions_root, Some(provenance))
+    }
+
+    fn create_in_with_provenance(
+        sessions_root: PathBuf,
+        provenance: Option<CompactionProvenance>,
+    ) -> Result<Self, SError> {
         fs::create_dir_all(&sessions_root).map_err(|err| {
             session_error("io_error", "failed to create sessions directory")
                 .with_string_field("path", sessions_root.to_string_lossy().as_ref())
@@ -190,7 +230,14 @@ impl SidSession {
             let timestamp = now_session_timestamp();
             let root = sessions_root.join(&timestamp.id);
             match fs::create_dir(&root) {
-                Ok(()) => return Self::from_created_root(timestamp, sessions_root, root),
+                Ok(()) => {
+                    return Self::from_created_root(
+                        timestamp,
+                        sessions_root,
+                        root,
+                        provenance.clone(),
+                    );
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     return Err(
@@ -222,6 +269,7 @@ impl SidSession {
         timestamp: SessionTimestamp,
         sessions_root: PathBuf,
         root: PathBuf,
+        compaction_provenance: Option<CompactionProvenance>,
     ) -> Result<Self, SError> {
         let tmp_dir = root.join("tmp");
         let bash_tmp_dir = tmp_dir.join("bash");
@@ -244,6 +292,7 @@ impl SidSession {
             api_path: root.join(API_JOURNAL_FILE),
             tool_streams_path: root.join(TOOL_STREAMS_JOURNAL_FILE),
             bash_state_path: root.join(BASH_STATE_FILE),
+            compaction_provenance,
             counters: SessionCounters::default(),
             journal_lock: StdMutex::new(()),
             stream_lock: Arc::new(StdMutex::new(())),
@@ -277,6 +326,7 @@ impl SidSession {
             api_path: root.join(API_JOURNAL_FILE),
             tool_streams_path: root.join(TOOL_STREAMS_JOURNAL_FILE),
             bash_state_path: root.join(BASH_STATE_FILE),
+            compaction_provenance: metadata.compacted_from,
             counters: SessionCounters::from_state(counters),
             journal_lock: StdMutex::new(()),
             stream_lock: Arc::new(StdMutex::new(())),
@@ -297,6 +347,10 @@ impl SidSession {
         &self.root
     }
 
+    pub fn compaction_provenance(&self) -> Option<&CompactionProvenance> {
+        self.compaction_provenance.as_ref()
+    }
+
     pub fn transcript_path(&self) -> PathBuf {
         self.root.join(TRANSCRIPT_FILE)
     }
@@ -309,7 +363,7 @@ impl SidSession {
         &self.bash_state_path
     }
 
-    pub(crate) fn read_bash_state(&self) -> Result<Option<String>, SError> {
+    pub fn read_bash_state(&self) -> Result<Option<String>, SError> {
         match fs::read_to_string(&self.bash_state_path) {
             Ok(state) if state.trim().is_empty() => Ok(None),
             Ok(state) => Ok(Some(state)),
@@ -320,7 +374,7 @@ impl SidSession {
         }
     }
 
-    pub(crate) fn write_bash_state(&self, state: &str) -> Result<(), SError> {
+    pub fn write_bash_state(&self, state: &str) -> Result<(), SError> {
         fs::write(&self.bash_state_path, state).map_err(|err| {
             session_error("io_error", "failed to write bash state")
                 .with_string_field("path", self.bash_state_path.to_string_lossy().as_ref())
@@ -531,6 +585,8 @@ impl SidSession {
             pid: u32,
             sessions_root: String,
             session_dir: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            compacted_from: Option<&'a CompactionProvenance>,
         }
 
         let metadata = Metadata {
@@ -541,6 +597,7 @@ impl SidSession {
             pid: std::process::id(),
             sessions_root: self.sessions_root.to_string_lossy().into_owned(),
             session_dir: self.root.to_string_lossy().into_owned(),
+            compacted_from: self.compaction_provenance.as_ref(),
         };
         self.write_json(self.root.join(SESSION_METADATA_FILE), &metadata)
     }
@@ -634,6 +691,16 @@ fn env_truthy(name: &str) -> bool {
         ),
         Err(_) => false,
     }
+}
+
+pub fn transcript_path_for_session_dir(root: &StdPath) -> PathBuf {
+    root.join(TRANSCRIPT_FILE)
+}
+
+pub fn read_compaction_provenance_from_dir(
+    root: &StdPath,
+) -> Result<Option<CompactionProvenance>, SError> {
+    Ok(read_session_metadata(root)?.compacted_from)
 }
 
 fn resolve_sessions_root(config_root: &Path) -> Result<PathBuf, SError> {
@@ -947,6 +1014,53 @@ mod tests {
         assert!(metadata["created_unix_micros"].as_i64().unwrap() > 0);
         assert_eq!(metadata["uuid"], serde_json::Value::Null);
         assert_eq!(metadata["pid"], json!(std::process::id()));
+        assert!(metadata.get("compacted_from").is_none());
+
+        fs::remove_dir_all(sessions_root).unwrap();
+    }
+
+    #[test]
+    fn compacted_session_persists_provenance_and_reload() {
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+        let parent = SidSession::create_in(sessions_root.clone()).unwrap();
+        let provenance = CompactionProvenance {
+            session_id: parent.id().to_string(),
+            session_dir: parent.root().to_string_lossy().into_owned(),
+            expert: CompactionExpertConfig {
+                agent_id: Some("compact".to_string()),
+                model: "claude-sonnet-4-5".to_string(),
+                system_prompt: Some("Summarize carefully.".to_string()),
+            },
+        };
+
+        let child =
+            SidSession::create_compacted_in(sessions_root.clone(), provenance.clone()).unwrap();
+        assert_eq!(child.compaction_provenance(), Some(&provenance));
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(child.root().join(SESSION_METADATA_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["compacted_from"]["session_id"], json!(parent.id()));
+        assert_eq!(
+            metadata["compacted_from"]["session_dir"],
+            json!(parent.root().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            metadata["compacted_from"]["expert"]["agent_id"],
+            json!("compact")
+        );
+
+        let resumed = SidSession::resume_in(sessions_root.clone(), child.id()).unwrap();
+        assert_eq!(resumed.compaction_provenance(), Some(&provenance));
+        assert_eq!(
+            read_compaction_provenance_from_dir(child.root()).unwrap(),
+            Some(provenance.clone())
+        );
+        assert_eq!(
+            transcript_path_for_session_dir(child.root()),
+            child.root().join(TRANSCRIPT_FILE)
+        );
 
         fs::remove_dir_all(sessions_root).unwrap();
     }
