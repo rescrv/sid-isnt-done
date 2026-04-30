@@ -1747,7 +1747,7 @@ fn parse_tool_confirmation(input: &str) -> Option<bool> {
 }
 
 fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Error> {
-    let mut rendered = result.output;
+    let mut rendered = strip_ansi_escapes(&result.output);
     if result.status.success() {
         if rendered.is_empty() {
             rendered.push_str("success\n");
@@ -1760,6 +1760,52 @@ fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Erro
         rendered.push_str(&format!("{}\n", result.status));
         Err(std::io::Error::other(rendered))
     }
+}
+
+/// Strip ANSI escape sequences from terminal output.
+///
+/// Removes CSI sequences (`ESC[…X`), OSC sequences (`ESC]…ST`), and simple
+/// two-character escape pairs (`ESC X`).  This ensures the model never sees
+/// raw color or cursor-control codes in bash tool output.
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        // We saw ESC.  Peek at the next character to decide the sequence type.
+        match chars.next() {
+            // CSI sequence: ESC [ <params> <intermediate> <final byte>
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '@' || c == '~' {
+                        break;
+                    }
+                }
+            }
+            // OSC sequence: ESC ] … terminated by BEL or ST (ESC \)
+            Some(']') => {
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if prev == '\x1b' && c == '\\' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            // Two-character escape (e.g. ESC M, ESC 7, ESC 8) — consume and
+            // discard the second byte.
+            Some(_) => {}
+            // Trailing bare ESC at end of input — discard it.
+            None => {}
+        }
+    }
+    out
 }
 
 fn tool_success_result(tool_use_id: &str, message: String) -> ToolResult {
@@ -4194,5 +4240,91 @@ format_ALIASES="fmt"
         let skill_dir = root.join(format!("skills/{skill}")).into_owned();
         fs::create_dir_all(skill_dir.as_str()).unwrap();
         fs::write(skill_dir.join("SKILL.md").as_str(), body).unwrap();
+    }
+
+    #[test]
+    fn strip_ansi_escapes_plain_text() {
+        assert_eq!(strip_ansi_escapes("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_empty() {
+        assert_eq!(strip_ansi_escapes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_sgr_color() {
+        // Bold red "error" then reset.
+        assert_eq!(
+            strip_ansi_escapes("\x1b[1;31merror\x1b[0m"),
+            "error"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_multiple_csi() {
+        assert_eq!(
+            strip_ansi_escapes("\x1b[32mok\x1b[0m \x1b[33mwarn\x1b[0m"),
+            "ok warn"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_256_color() {
+        assert_eq!(
+            strip_ansi_escapes("\x1b[38;5;196mred\x1b[0m"),
+            "red"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_truecolor() {
+        assert_eq!(
+            strip_ansi_escapes("\x1b[38;2;255;0;0mred\x1b[0m"),
+            "red"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_osc_bel() {
+        // OSC title-set terminated by BEL.
+        assert_eq!(
+            strip_ansi_escapes("\x1b]0;my title\x07rest"),
+            "rest"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_osc_st() {
+        // OSC terminated by ST (ESC \).
+        assert_eq!(
+            strip_ansi_escapes("\x1b]0;my title\x1b\\rest"),
+            "rest"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_two_char_escape() {
+        // ESC M (reverse index) should be stripped.
+        assert_eq!(strip_ansi_escapes("a\x1bMb"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_trailing_esc() {
+        assert_eq!(strip_ansi_escapes("text\x1b"), "text");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_cursor_csi() {
+        // CSI sequences ending with ~ (e.g., key codes) or @ (insert).
+        assert_eq!(strip_ansi_escapes("\x1b[2~x\x1b[1@y"), "xy");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_preserves_newlines() {
+        assert_eq!(
+            strip_ansi_escapes("\x1b[32mline1\x1b[0m\nline2\n"),
+            "line1\nline2\n"
+        );
     }
 }
