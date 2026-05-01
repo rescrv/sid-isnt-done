@@ -375,10 +375,41 @@ pub fn run_pager(input: &str, options: SidiffOptions) -> io::Result<()> {
     }
 }
 
+/// Render a unified diff for a confirmation preview.
+///
+/// When `DIFF` is unset, sidiff's built-in renderer is used. When `DIFF` is
+/// set to a shell command, the raw unified diff is piped to that command and
+/// its stdout becomes the preview. An empty `DIFF` disables styling and
+/// returns the raw unified diff text.
+pub fn render_diff_preview(input: &str) -> io::Result<String> {
+    render_diff_preview_with_value(input, env::var_os("DIFF"))
+}
+
+pub fn render_diff_preview_with_value(input: &str, value: Option<OsString>) -> io::Result<String> {
+    match diff_preview_command_from_value(value) {
+        DiffPreviewCommand::Raw => Ok(input.to_string()),
+        DiffPreviewCommand::Shell(command) => run_shell_filter(&command, input),
+        DiffPreviewCommand::Sidiff => Ok(render_diff(
+            input,
+            SidiffOptions {
+                use_color: env::var_os("NO_COLOR").is_none(),
+                ..SidiffOptions::default()
+            },
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PagerCommand {
     Disabled,
     Shell(OsString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DiffPreviewCommand {
+    Raw,
+    Shell(OsString),
+    Sidiff,
 }
 
 fn pager_command_from_env() -> PagerCommand {
@@ -390,6 +421,14 @@ fn pager_command_from_value(value: Option<OsString>) -> PagerCommand {
         Some(value) if os_str_is_blank(&value) => PagerCommand::Disabled,
         Some(value) => PagerCommand::Shell(value),
         None => PagerCommand::Shell(OsString::from(DEFAULT_PAGER)),
+    }
+}
+
+fn diff_preview_command_from_value(value: Option<OsString>) -> DiffPreviewCommand {
+    match value {
+        Some(value) if os_str_is_blank(&value) => DiffPreviewCommand::Raw,
+        Some(value) => DiffPreviewCommand::Shell(value),
+        None => DiffPreviewCommand::Sidiff,
     }
 }
 
@@ -427,6 +466,47 @@ fn run_shell_pager(command: &OsStr, rendered: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other(format!(
             "pager '{}' exited with status {status}",
+            command.to_string_lossy()
+        )))
+    }
+}
+
+fn run_shell_filter(command: &OsStr, input: &str) -> io::Result<String> {
+    let mut child = shell_command(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to launch diff preview command '{}': {err}",
+                    command.to_string_lossy()
+                ),
+            )
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        match stdin.write_all(input.as_bytes()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            format!("{}: {stderr}", output.status)
+        };
+        Err(io::Error::other(format!(
+            "diff preview command '{}' failed: {detail}",
             command.to_string_lossy()
         )))
     }
@@ -2099,6 +2179,52 @@ diff --git a/lib.rs b/lib.rs
         assert_eq!(
             pager_command_from_value(None),
             PagerCommand::Shell(std::ffi::OsString::from(DEFAULT_PAGER))
+        );
+    }
+
+    #[test]
+    fn diff_preview_command_honors_diff_env_value() {
+        assert_eq!(
+            diff_preview_command_from_value(Some(std::ffi::OsString::from("cat"))),
+            DiffPreviewCommand::Shell(std::ffi::OsString::from("cat"))
+        );
+        assert_eq!(
+            diff_preview_command_from_value(Some(std::ffi::OsString::from(""))),
+            DiffPreviewCommand::Raw
+        );
+        assert_eq!(
+            diff_preview_command_from_value(Some(std::ffi::OsString::from("   "))),
+            DiffPreviewCommand::Raw
+        );
+        assert_eq!(
+            diff_preview_command_from_value(None),
+            DiffPreviewCommand::Sidiff
+        );
+    }
+
+    #[test]
+    fn blank_diff_preview_command_returns_raw_unified_diff() {
+        let rendered =
+            render_diff_preview_with_value(SAMPLE, Some(std::ffi::OsString::from(""))).unwrap();
+        assert_eq!(rendered, SAMPLE);
+    }
+
+    #[test]
+    fn shell_diff_preview_command_filters_raw_unified_diff() {
+        let rendered =
+            render_diff_preview_with_value(SAMPLE, Some(std::ffi::OsString::from("cat"))).unwrap();
+        assert_eq!(rendered, SAMPLE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_diff_preview_command_allows_early_exit_filters() {
+        let rendered =
+            render_diff_preview_with_value(SAMPLE, Some(std::ffi::OsString::from("head -n 3")))
+                .unwrap();
+        assert_eq!(
+            rendered,
+            "diff --git a/src/main.rs b/src/main.rs\nindex 1111111..2222222 100644\n--- a/src/main.rs\n"
         );
     }
 

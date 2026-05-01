@@ -629,7 +629,8 @@ impl SidAgent {
         client: &Anthropic,
         question: &str,
     ) -> Result<String, std::io::Error> {
-        self.ask_an_expert_with_renderer(client, question, None).await
+        self.ask_an_expert_with_renderer(client, question, None)
+            .await
     }
 
     async fn ask_an_expert_with_renderer(
@@ -970,7 +971,9 @@ impl Agent for SidAgent {
             let retry_backoff = retry_policy.backoff();
             let mut retry_count = 0usize;
             let step = loop {
-                let step = self.step_default_turn(client, messages, &mut tokens_rem).await;
+                let step = self
+                    .step_default_turn(client, messages, &mut tokens_rem)
+                    .await;
                 let Some(delay) = (match &step {
                     ControlFlow::Break(Err(err)) => {
                         retry_policy.retry_delay(&retry_backoff, retry_count, err)
@@ -1943,10 +1946,7 @@ impl ToolCallback<SidAgent> for AskAnExpertCallback {
         renderer: &mut dyn Renderer,
         context: &AgentStreamContext,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(ask_an_expert_result_streaming(
-            client, agent, tool_use, renderer, context,
-        )
-        .await)
+        Box::new(ask_an_expert_result_streaming(client, agent, tool_use, renderer, context).await)
     }
 
     async fn apply_tool_result(
@@ -2151,10 +2151,7 @@ impl Renderer for AskAnExpertStreamRenderer<'_> {
         self.parent.should_interrupt()
     }
 
-    fn read_operator_line(
-        &mut self,
-        prompt: &str,
-    ) -> std::io::Result<Option<OperatorLine>> {
+    fn read_operator_line(&mut self, prompt: &str) -> std::io::Result<Option<OperatorLine>> {
         self.parent.read_operator_line(prompt)
     }
 }
@@ -3072,11 +3069,7 @@ mod tests {
         ) {
         }
 
-        fn print_tool_input(
-            &mut self,
-            _context: &dyn claudius::StreamContext,
-            partial_json: &str,
-        ) {
+        fn print_tool_input(&mut self, _context: &dyn claudius::StreamContext, partial_json: &str) {
             self.output.push_str(partial_json);
         }
 
@@ -3125,7 +3118,10 @@ mod tests {
         );
 
         assert!(!should_render_tool_result(&result));
-        assert_eq!(unwrap_success_text(apply_computed_tool_result(Box::new(result))), "ok");
+        assert_eq!(
+            unwrap_success_text(apply_computed_tool_result(Box::new(result))),
+            "ok"
+        );
     }
 
     #[test]
@@ -3375,8 +3371,11 @@ compact_TOOLS='bash'
         fs::write(root.join("tools.conf").as_str(), "bash_ENABLED=YES\n").unwrap();
         write_tool_runtime(&root, "bash", "#!/bin/sh\nexit 0\n");
         fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
-        fs::write(root.join("agents/compact.md").as_str(), "# Compact\n\nCustom compact prompt.\n")
-            .unwrap();
+        fs::write(
+            root.join("agents/compact.md").as_str(),
+            "# Compact\n\nCustom compact prompt.\n",
+        )
+        .unwrap();
 
         let agent = SidAgent::from_workspace_compactor_with_config_root(
             &root,

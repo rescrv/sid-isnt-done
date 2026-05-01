@@ -402,7 +402,10 @@ format_ALIASES="fmt"
 : Optional boolean.  When `YES` and the tool is `MANUAL`, `sid` invokes
   `tools/<id> confirm` before the host-owned yes/no prompt.  The confirm
   subcommand renders a preview to standard output; it does not authorize the
-  call and must not perform the tool operation.
+  call and must not perform the tool operation.  The starter `edit` tool keeps
+  `view` previews compact, but mutating editor commands render a file summary
+  plus a diff preview.  Set `DIFF` to a shell command to filter that unified
+  diff, or set `DIFF` empty to show the raw unified diff text.
 
 `bash`
 : Built-in bash capability.  It is exposed to the model as Anthropic's bash
@@ -876,16 +879,19 @@ sid-editor-tool - execute the sid text-editor tool protocol
 
 ```text
 sid-editor-tool
+tools/edit confirm
 tools/edit run
 ```
 
 ## DESCRIPTION
 
 `sid-editor-tool` is the helper used by the configured `edit` tool.  It is not
-an interactive editor.  It reads a sid tool request from `REQUEST_FILE`,
-executes one filesystem edit operation relative to `WORKSPACE_ROOT`, and writes
-a sid tool result to `RESULT_FILE`.  The helper process is not chrooted, but
-editor paths are workspace-rooted by the protocol implementation.
+an interactive editor.  In `confirm` mode it simulates mutating editor
+operations in memory and prints a diff preview to standard output.  In `run`
+mode it reads a sid tool request from `REQUEST_FILE`, executes one filesystem
+edit operation relative to `WORKSPACE_ROOT`, and writes a sid tool result to
+`RESULT_FILE`.  The helper process is not chrooted, but editor paths are
+workspace-rooted by the protocol implementation.
 
 The starter `init/tools/edit` script is the normal entrypoint.  It receives
 prefixed rc-conf variables from `sid`, exports the unprefixed environment used
@@ -976,6 +982,15 @@ Create a file:
 : Workspace root used for filesystem operations.  Leading slashes in editor
   paths are stripped before joining with this directory, so editor path `/`
   names `WORKSPACE_ROOT`, not host `/`.
+
+`DIFF`
+: Optional shell command used by `confirm` mode to render mutating edit
+  previews from raw unified diff text.  An empty value disables styling and
+  prints the raw unified diff.  When unset, the built-in `sidiff` renderer is
+  used.
+
+`NO_COLOR`
+: Disables ANSI color in the built-in `sidiff` renderer used by `confirm` mode.
 
 ## EXIT STATUS
 

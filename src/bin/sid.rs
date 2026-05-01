@@ -21,8 +21,7 @@ use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 use sid_isnt_done::config::{AGENTS_CONF_FILE, Config as SidConfig, TOOLS_CONF_FILE};
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
-    seatbelt, session,
-    session::SidSession,
+    seatbelt, session, session::SidSession,
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
@@ -566,21 +565,26 @@ impl SidRuntimeSession {
 
         let mut renderer = QuietRenderer;
         compactor_chat
-            .send_message(claudius::MessageParam::user(COMPACTION_REQUEST_PROMPT), &mut renderer)
+            .send_message(
+                claudius::MessageParam::user(COMPACTION_REQUEST_PROMPT),
+                &mut renderer,
+            )
             .await
             .map_err(|err| {
-                cli_error("compaction_failed", "failed to generate conversation summary")
-                    .with_string_field("cause", &err.to_string())
+                cli_error(
+                    "compaction_failed",
+                    "failed to generate conversation summary",
+                )
+                .with_string_field("cause", &err.to_string())
             })?;
 
-        let summary = extract_last_assistant_text(&compactor_chat.clone_messages()).ok_or_else(
-            || {
+        let summary =
+            extract_last_assistant_text(&compactor_chat.clone_messages()).ok_or_else(|| {
                 cli_error(
                     "compaction_empty",
                     "compaction agent produced no assistant summary",
                 )
-            },
-        )?;
+            })?;
 
         let next_sid_session = Arc::new(SidSession::create_compacted(
             &self.config_root,
@@ -1121,7 +1125,9 @@ fn print_help() {
     for line in help_text().lines() {
         println!("    {}", line);
     }
-    println!("      /compact              Summarize the session and continue in a new child session");
+    println!(
+        "      /compact              Summarize the session and continue in a new child session"
+    );
     println!("      /agent                Show the current agent");
     println!("      /agent list           List configured agents");
     println!("      /agent switch <name>  Switch to another agent in this session");
