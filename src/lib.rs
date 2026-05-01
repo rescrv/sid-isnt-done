@@ -1,6 +1,7 @@
 pub mod builtin_tools;
 pub mod config;
 mod filesystem;
+mod retry;
 pub mod seatbelt;
 pub mod session;
 pub mod sidiff;
@@ -965,10 +966,23 @@ impl Agent for SidAgent {
                 .map(|thinking| thinking.num_tokens())
                 .unwrap_or(0)
         {
-            match self
-                .step_default_turn(client, messages, &mut tokens_rem)
-                .await
-            {
+            let retry_policy = retry::ApiRetryPolicy::default();
+            let retry_backoff = retry_policy.backoff();
+            let mut retry_count = 0usize;
+            let step = loop {
+                let step = self.step_default_turn(client, messages, &mut tokens_rem).await;
+                let Some(delay) = (match &step {
+                    ControlFlow::Break(Err(err)) => {
+                        retry_policy.retry_delay(&retry_backoff, retry_count, err)
+                    }
+                    _ => None,
+                }) else {
+                    break step;
+                };
+                retry_count += 1;
+                tokio::time::sleep(delay).await;
+            };
+            match step {
                 ControlFlow::Continue(step) => {
                     usage_total = usage_total + step.usage;
                     request_count = request_count.saturating_add(step.request_count);
@@ -1044,10 +1058,40 @@ impl Agent for SidAgent {
                 .map(|thinking| thinking.num_tokens())
                 .unwrap_or(0)
         {
-            match self
-                .step_default_turn_streaming(client, messages, &mut tokens_rem, renderer, &context)
-                .await
-            {
+            let retry_policy = retry::ApiRetryPolicy::default();
+            let retry_backoff = retry_policy.backoff();
+            let mut retry_count = 0usize;
+            let step = loop {
+                let step = self
+                    .step_default_turn_streaming(
+                        client,
+                        messages,
+                        &mut tokens_rem,
+                        renderer,
+                        &context,
+                    )
+                    .await;
+                let Some(delay) = (match &step {
+                    ControlFlow::Break(Err(err)) => {
+                        retry_policy.retry_delay(&retry_backoff, retry_count, err)
+                    }
+                    _ => None,
+                }) else {
+                    break step;
+                };
+                retry_count += 1;
+                renderer.print_info(
+                    &context,
+                    &format!(
+                        "Transient API failure; retrying in {} (retry {}/{})",
+                        retry::format_delay(delay),
+                        retry_count,
+                        retry_policy.max_retries(),
+                    ),
+                );
+                tokio::time::sleep(delay).await;
+            };
+            match step {
                 ControlFlow::Continue(step) => {
                     usage_total = usage_total + step.usage;
                     request_count = request_count.saturating_add(step.request_count);
