@@ -76,7 +76,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 ///   - Process control (fork, exec, signals within the same sandbox)
 ///   - Full disk read
 ///   - Write only to caller-specified roots and /tmp
-///   - Localhost-only networking
+///   - Network denied by default; only localhost permitted
 ///   - Platform defaults (system libs, frameworks, /dev, /tmp, binaries)
 const POLICY_BEFORE_WRITE_RULES: &str = r#"(version 1)
 
@@ -206,11 +206,14 @@ const POLICY_BEFORE_WRITE_RULES: &str = r#"(version 1)
 /// SBPL policy text after the writable-roots section.
 const POLICY_AFTER_WRITE_RULES: &str = r#"
 ;; =======================================================================
-;; 4. NETWORK POLICY — localhost only + platform services
+;; 4. NETWORK POLICY — deny by default, localhost only + platform services
 ;; =======================================================================
 
-; Allow binding on any local port (needed for dev servers).
-(allow network-bind (local ip "*:*"))
+; Explicit deny-all for network access (defense-in-depth over `deny default`).
+(deny network*)
+
+; Allow binding on localhost only (needed for dev servers).
+(allow network-bind (local ip "localhost:*"))
 
 ; Restrict traffic to loopback.
 (allow network-inbound (local ip "localhost:*"))
