@@ -600,15 +600,10 @@ fn collect_read_roots(
 
     for root in writable_roots.as_slice() {
         let root_path = Path::new(root);
-        let allow = if home_variants.is_empty() {
-            true
-        } else if !home_variants.iter().any(|home| root_path.starts_with(home)) {
-            true
-        } else {
-            allowed_home_variants
+        let allow = !home_variants.iter().any(|home| root_path.starts_with(home))
+            || allowed_home_variants
                 .iter()
-                .any(|allowed| root_path.starts_with(allowed))
-        };
+                .any(|allowed| root_path.starts_with(allowed));
         if allow {
             append_path_variants(&mut read_roots, root_path);
         }
