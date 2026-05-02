@@ -37,12 +37,15 @@ fn main() {
 
     let policy = seatbelt::build_policy(&options.writable_roots);
     let cache_dir = seatbelt::darwin_user_cache_dir();
+    let temp_dir = seatbelt::darwin_user_temp_dir();
 
     let err = Command::new("/usr/bin/sandbox-exec")
         .arg("-p")
         .arg(policy)
         .arg("-D")
         .arg(format!("DARWIN_USER_CACHE_DIR={cache_dir}"))
+        .arg("-D")
+        .arg(format!("DARWIN_USER_TEMP_DIR={temp_dir}"))
         .arg("--")
         .args(&free)
         .exec();

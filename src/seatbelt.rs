@@ -2,8 +2,9 @@
 ///
 /// Generates SBPL policies with configurable writable roots and provides
 /// helpers for wrapping child processes in `sandbox-exec`.
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -70,15 +71,36 @@ impl fmt::Display for WritableRoots {
 /// Absolute path to the macOS `sandbox-exec` binary.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// SBPL policy text before the writable-roots section.
+/// Home-directory read roots kept available inside the sandbox.
+///
+/// These cover the user's source tree, the standard Rust toolchain and package
+/// cache locations used by `cargo`, and common Git configuration locations.
+const HOME_READ_SUBPATHS: &[&str] = &[".cargo", ".config/git", ".rustup", "src"];
+
+/// Individual home-directory files kept readable inside the sandbox.
+const HOME_READ_FILES: &[&str] = &[
+    ".gitconfig",
+    ".gitignore",
+    ".gitignore_global",
+    ".gitmessage",
+];
+
+/// Additional system read roots kept available inside the sandbox.
+///
+/// Apple Command Line Tools ship git's support files and related toolchain
+/// resources under this tree on macOS installations without a full Xcode app.
+const GLOBAL_READ_ROOTS: &[&str] = &["/Library/Developer/CommandLineTools"];
+
+/// SBPL policy text before the generated read/write sections.
 ///
 /// The policy is deny-default, then allows:
 ///   - Process control (fork, exec, signals within the same sandbox)
-///   - Full disk read
-///   - Write only to caller-specified roots and /tmp
+///   - Restricted reads for Rust tooling, the source tree, and non-home
+///     writable roots
+///   - Write only to caller-specified roots and temporary directories
 ///   - Network denied by default; only localhost permitted
 ///   - Platform defaults (system libs, frameworks, /dev, /tmp, binaries)
-const POLICY_BEFORE_WRITE_RULES: &str = r#"(version 1)
+const POLICY_PREAMBLE: &str = r#"(version 1)
 
 ;; =======================================================================
 ;; 1. BASE POLICY — deny-default, process control, PTY, sysctls, IPC
@@ -192,10 +214,13 @@ const POLICY_BEFORE_WRITE_RULES: &str = r#"(version 1)
 (allow user-preference-read)
 
 ;; =======================================================================
-;; 2. READ POLICY — full disk read
+;; 2. READ POLICY — restricted allowlist
 ;; =======================================================================
 
-(allow file-read*)
+"#;
+
+/// SBPL policy text between the generated read and write sections.
+const POLICY_BEFORE_WRITE_RULES: &str = r#"
 
 ;; =======================================================================
 ;; 3. WRITE POLICY — writable roots + /tmp
@@ -240,9 +265,11 @@ const POLICY_AFTER_WRITE_RULES: &str = r#"
 (allow sysctl-read
   (sysctl-name-regex #"^net.routetable"))
 
-; TLS session cache writes.
+; TLS session cache and per-user temp writes.
 (allow file-write*
   (subpath (param "DARWIN_USER_CACHE_DIR")))
+(allow file-read* file-test-existence file-write*
+  (subpath (param "DARWIN_USER_TEMP_DIR")))
 
 ;; =======================================================================
 ;; 5. PLATFORM DEFAULTS — system libs, frameworks, /dev, /tmp, binaries
@@ -467,15 +494,34 @@ fn sandbox_exec_accepts_policy() -> bool {
 ///
 /// Falls back to `/private/var/folders` when `getconf` is unavailable.
 pub fn darwin_user_cache_dir() -> String {
-    let output = Command::new("/usr/bin/getconf")
-        .arg("DARWIN_USER_CACHE_DIR")
-        .output();
+    darwin_user_dir("DARWIN_USER_CACHE_DIR", || {
+        "/private/var/folders".to_string()
+    })
+}
+
+/// Resolve `DARWIN_USER_TEMP_DIR` for the current user.
+///
+/// Falls back to the process temp directory when `getconf` is unavailable.
+pub fn darwin_user_temp_dir() -> String {
+    darwin_user_dir("DARWIN_USER_TEMP_DIR", || {
+        std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string()
+    })
+}
+
+fn darwin_user_dir<F>(variable: &str, fallback: F) -> String
+where
+    F: FnOnce() -> String,
+{
+    let output = Command::new("/usr/bin/getconf").arg(variable).output();
     match output {
         Ok(out) if out.status.success() => {
             let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
             dir.trim_end_matches('/').to_string()
         }
-        _ => "/private/var/folders".to_string(),
+        _ => fallback(),
     }
 }
 
@@ -502,16 +548,144 @@ fn escape_sbpl_string(s: &str) -> String {
     out
 }
 
+fn path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = vec![path.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(path)
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+fn append_path_variants(read_roots: &mut BTreeSet<String>, path: &Path) {
+    for variant in path_variants(path) {
+        if let Some(path) = variant.to_str() {
+            read_roots.insert(path.to_string());
+        }
+    }
+}
+
+fn collect_read_roots(
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+    home_dir: Option<&Path>,
+) -> BTreeSet<String> {
+    let mut read_roots = BTreeSet::new();
+    let mut home_variants = Vec::new();
+    let mut allowed_home_variants = Vec::new();
+
+    if let Some(home_dir) = home_dir {
+        home_variants = path_variants(home_dir);
+        for suffix in HOME_READ_SUBPATHS {
+            let suffix_path = home_dir.join(suffix);
+            for variant in path_variants(&suffix_path) {
+                if !allowed_home_variants
+                    .iter()
+                    .any(|existing| existing == &variant)
+                {
+                    allowed_home_variants.push(variant);
+                }
+            }
+            append_path_variants(&mut read_roots, &suffix_path);
+        }
+        for file in HOME_READ_FILES {
+            append_path_variants(&mut read_roots, &home_dir.join(file));
+        }
+    }
+
+    for root in GLOBAL_READ_ROOTS {
+        append_path_variants(&mut read_roots, Path::new(root));
+    }
+
+    for root in writable_roots.as_slice() {
+        let root_path = Path::new(root);
+        let allow = if home_variants.is_empty() {
+            true
+        } else if !home_variants.iter().any(|home| root_path.starts_with(home)) {
+            true
+        } else {
+            allowed_home_variants
+                .iter()
+                .any(|allowed| root_path.starts_with(allowed))
+        };
+        if allow {
+            append_path_variants(&mut read_roots, root_path);
+        }
+    }
+
+    for root in extra_read_roots {
+        append_path_variants(&mut read_roots, Path::new(root));
+    }
+
+    read_roots
+}
+
+fn append_read_rules(
+    policy: &mut String,
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+    home_dir: Option<&Path>,
+) {
+    for root in collect_read_roots(writable_roots, extra_read_roots, home_dir) {
+        let escaped = escape_sbpl_string(&root);
+        policy.push_str(&format!(
+            "(allow file-read* file-test-existence (subpath \"{escaped}\"))\n"
+        ));
+        policy.push_str(&format!(
+            "(allow file-read-metadata file-test-existence (path-ancestors \"{escaped}\"))\n"
+        ));
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Build an SBPL policy string with the given writable roots inlined.
 ///
-/// Each entry becomes an `(allow file-write* (subpath "..."))` rule.
-/// Path strings are escaped to prevent SBPL injection.
-/// `DARWIN_USER_CACHE_DIR` remains a `sandbox-exec` parameter.
+/// Writable roots always become write rules.  Read rules are generated from a
+/// fixed home-directory allowlist plus writable roots that are not under
+/// disallowed locations in the user's home directory.  Path strings are
+/// escaped to prevent SBPL injection.  The per-user cache and temp roots
+/// remain `sandbox-exec` parameters.
 pub fn build_policy(writable_roots: &WritableRoots) -> String {
+    build_policy_with_home(writable_roots, home_dir().as_deref())
+}
+
+/// Build an SBPL policy string with additional read-only roots.
+///
+/// This is used for service executables and configuration trees that must stay
+/// readable even when they live outside the default home-directory allowlist.
+pub(crate) fn build_policy_with_read_roots(
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+) -> String {
+    build_policy_with_home_and_read_roots(writable_roots, extra_read_roots, home_dir().as_deref())
+}
+
+fn build_policy_with_home(writable_roots: &WritableRoots, home_dir: Option<&Path>) -> String {
+    build_policy_with_home_and_read_roots(writable_roots, &[], home_dir)
+}
+
+fn build_policy_with_home_and_read_roots(
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+    home_dir: Option<&Path>,
+) -> String {
     let roots = writable_roots.as_slice();
+    let read_roots = collect_read_roots(writable_roots, extra_read_roots, home_dir);
     let mut policy = String::with_capacity(
-        POLICY_BEFORE_WRITE_RULES.len() + POLICY_AFTER_WRITE_RULES.len() + roots.len() * 64,
+        POLICY_PREAMBLE.len()
+            + POLICY_BEFORE_WRITE_RULES.len()
+            + POLICY_AFTER_WRITE_RULES.len()
+            + read_roots.len() * 128
+            + roots.len() * 64,
     );
+    policy.push_str(POLICY_PREAMBLE);
+    append_read_rules(&mut policy, writable_roots, extra_read_roots, home_dir);
     policy.push_str(POLICY_BEFORE_WRITE_RULES);
     for root in roots {
         let escaped = escape_sbpl_string(root);
@@ -524,19 +698,23 @@ pub fn build_policy(writable_roots: &WritableRoots) -> String {
 /// Build the `shell_wrapper` argument list for [`claudius::BashPtyConfig`].
 ///
 /// Returns `None` when sandboxing is unavailable (non-macOS).
-/// The returned vec is `[sandbox-exec, -p, <policy>, -D, DARWIN_USER_CACHE_DIR=..., --]`.
+/// The returned vec is `[sandbox-exec, -p, <policy>, -D, DARWIN_USER_CACHE_DIR=..., -D,
+/// DARWIN_USER_TEMP_DIR=..., --]`.
 pub fn shell_wrapper(writable_roots: &WritableRoots) -> Option<Vec<String>> {
     if !sandbox_available() {
         return None;
     }
     let policy = build_policy(writable_roots);
     let cache_dir = darwin_user_cache_dir();
+    let temp_dir = darwin_user_temp_dir();
     Some(vec![
         SANDBOX_EXEC.to_string(),
         "-p".to_string(),
         policy,
         "-D".to_string(),
         format!("DARWIN_USER_CACHE_DIR={cache_dir}"),
+        "-D".to_string(),
+        format!("DARWIN_USER_TEMP_DIR={temp_dir}"),
         "--".to_string(),
     ])
 }
@@ -550,13 +728,27 @@ pub fn sandboxed_command(
     args: &[&str],
     writable_roots: &WritableRoots,
 ) -> tokio::process::Command {
+    let extra_read_roots = [program.to_string()];
+    sandboxed_command_with_read_roots(program, args, writable_roots, &extra_read_roots)
+}
+
+/// Build a [`tokio::process::Command`] with additional read-only roots.
+pub(crate) fn sandboxed_command_with_read_roots(
+    program: &str,
+    args: &[&str],
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+) -> tokio::process::Command {
     if sandbox_available() {
-        let policy = build_policy(writable_roots);
+        let policy = build_policy_with_read_roots(writable_roots, extra_read_roots);
         let cache_dir = darwin_user_cache_dir();
+        let temp_dir = darwin_user_temp_dir();
         let mut cmd = tokio::process::Command::new(SANDBOX_EXEC);
         cmd.arg("-p").arg(policy);
         cmd.arg("-D")
             .arg(format!("DARWIN_USER_CACHE_DIR={cache_dir}"));
+        cmd.arg("-D")
+            .arg(format!("DARWIN_USER_TEMP_DIR={temp_dir}"));
         cmd.arg("--");
         cmd.arg(program);
         cmd.args(args);
@@ -566,6 +758,17 @@ pub fn sandboxed_command(
         cmd.args(args);
         cmd
     }
+}
+
+/// Read-only sandbox roots needed to launch a configured external service.
+pub(crate) fn service_read_roots(config_root: &Path, executable_path: &Path) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    roots.insert(config_root.to_string_lossy().into_owned());
+    if let Some(parent) = executable_path.parent() {
+        roots.insert(parent.to_string_lossy().into_owned());
+    }
+    roots.insert(executable_path.to_string_lossy().into_owned());
+    roots.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -620,7 +823,7 @@ mod tests {
 
     #[test]
     fn build_policy_with_no_roots_has_no_writable_root_rules() {
-        let policy = build_policy(&WritableRoots::default());
+        let policy = build_policy_with_home(&WritableRoots::default(), None);
         assert!(
             !policy.contains("(allow file-write* (subpath \"/home"),
             "policy should have no writable-root rules"
@@ -629,11 +832,72 @@ mod tests {
 
     #[test]
     fn build_policy_is_valid_sbpl_structure() {
-        let policy = build_policy(&roots(&["/workspace"]));
+        let policy =
+            build_policy_with_home(&roots(&["/workspace"]), Some(Path::new("/Users/tester")));
         assert!(policy.starts_with("(version 1)"));
         assert!(policy.contains("(deny default)"));
-        assert!(policy.contains("(allow file-read*)"));
+        assert!(!policy.contains("\n(allow file-read*)\n"));
+        assert!(policy.contains("(allow file-read* file-test-existence (subpath \"/workspace\"))"));
+        assert!(
+            policy
+                .contains("(allow file-read* file-test-existence (subpath \"/Users/tester/src\"))")
+        );
         assert!(policy.contains("(param \"DARWIN_USER_CACHE_DIR\")"));
+        assert!(policy.contains("(param \"DARWIN_USER_TEMP_DIR\")"));
+    }
+
+    #[test]
+    fn build_policy_contains_minimal_home_read_allowlist() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(policy.contains("(subpath \"/Users/tester/.cargo\")"));
+        assert!(policy.contains("(subpath \"/Users/tester/.config/git\")"));
+        assert!(policy.contains("(subpath \"/Users/tester/.gitconfig\")"));
+        assert!(policy.contains("(subpath \"/Users/tester/.rustup\")"));
+        assert!(policy.contains("(subpath \"/Users/tester/src\")"));
+    }
+
+    #[test]
+    fn build_policy_contains_global_read_allowlist() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(policy.contains("(subpath \"/Library/Developer/CommandLineTools\")"));
+    }
+
+    #[test]
+    fn build_policy_does_not_make_library_readable() {
+        let policy = build_policy_with_home(
+            &roots(&["/Users/tester/Library"]),
+            Some(Path::new("/Users/tester")),
+        );
+        assert!(policy.contains("(allow file-write* (subpath \"/Users/tester/Library\"))"));
+        assert!(
+            !policy.contains(
+                "(allow file-read* file-test-existence (subpath \"/Users/tester/Library\"))"
+            ),
+            "home writable roots outside the allowlist must stay unreadable"
+        );
+    }
+
+    #[test]
+    fn build_policy_allows_explicit_read_roots_outside_home_allowlist() {
+        let extra_read_roots = vec![
+            "/Users/tester/.sid".to_string(),
+            "/Users/tester/.sid/agents/skill-inject".to_string(),
+        ];
+        let policy = build_policy_with_home_and_read_roots(
+            &WritableRoots::default(),
+            &extra_read_roots,
+            Some(Path::new("/Users/tester")),
+        );
+        assert!(
+            policy.contains(
+                "(allow file-read* file-test-existence (subpath \"/Users/tester/.sid\"))"
+            )
+        );
+        assert!(policy.contains(
+            "(allow file-read* file-test-existence (subpath \"/Users/tester/.sid/agents/skill-inject\"))"
+        ));
     }
 
     #[test]
@@ -647,7 +911,9 @@ mod tests {
         assert!(wrapper[2].contains("(version 1)"));
         assert_eq!(wrapper[3], "-D");
         assert!(wrapper[4].starts_with("DARWIN_USER_CACHE_DIR="));
-        assert_eq!(wrapper[5], "--");
+        assert_eq!(wrapper[5], "-D");
+        assert!(wrapper[6].starts_with("DARWIN_USER_TEMP_DIR="));
+        assert_eq!(wrapper[7], "--");
     }
 
     #[test]

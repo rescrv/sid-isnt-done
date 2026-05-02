@@ -551,6 +551,8 @@ impl SidAgent {
             );
         }
         env.insert("PAGER".to_string(), "cat".to_string());
+        env.insert("HISTFILE".to_string(), "/dev/null".to_string());
+        env.insert("INPUTRC".to_string(), "/dev/null".to_string());
         BashPtyConfig {
             cwd: PathBuf::from(self.workspace_root.as_str()),
             env,
@@ -3256,6 +3258,61 @@ mod tests {
     }
 
     #[test]
+    fn from_workspace_with_home_config_root_runs_external_tools() {
+        if !seatbelt::sandbox_available() {
+            return;
+        }
+
+        let home = match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => home,
+            _ => return,
+        };
+        let config_leaf = std::path::Path::new(unique_temp_dir("home-tool-config").as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp dir should have a utf-8 leaf")
+            .to_string();
+        let config_root = Path::new(&home)
+            .join(".sid-isnt-done-tests")
+            .join(config_leaf)
+            .into_owned();
+        write_sample_config_with_fmt_script(
+            &config_root,
+            &capturing_tool_script(
+                "format via home sid_root",
+                "home-sid-root-request-capture.json",
+                "home-sid-root-env-capture.json",
+            ),
+        );
+        let workspace_root = unique_temp_dir("workspace-root");
+        fs::create_dir_all(workspace_root.as_str()).unwrap();
+
+        let fallback = ChatConfig::new()
+            .with_system_prompt("fallback system".to_string())
+            .with_max_tokens(2048);
+        let agent =
+            SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, fallback)
+                .unwrap();
+
+        let config = Config::load(&config_root).unwrap();
+        let tool_config = config.tools.get("format").unwrap();
+        let exposed_name = exposed_tool_name("build", "format").unwrap();
+        let canonical_id = resolve_canonical_tool_id(&config.tools_rc_conf, "format").unwrap();
+        let tool = ExternalTool::from_config(exposed_name.clone(), canonical_id, tool_config);
+        let tool_use = ToolUseBlock::new(
+            "toolu_home_sid_root_123",
+            exposed_name,
+            json!({ "paths": ["src/lib.rs"] }),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(invoke_external_tool(&tool, &agent, &tool_use, None));
+        assert_eq!(unwrap_success_text(result), "format via home sid_root");
+
+        fs::remove_dir_all(config_root.as_str()).unwrap();
+        fs::remove_dir_all(workspace_root.as_str()).unwrap();
+    }
+
+    #[test]
     fn from_config_exposes_builtin_bash_and_edit_tools() {
         let root = temp_config_root("agent");
         write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
@@ -3913,6 +3970,81 @@ esac
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn user_instruction_hook_runs_from_home_config_root() {
+        if !seatbelt::sandbox_available() {
+            return;
+        }
+
+        let home = match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => home,
+            _ => return,
+        };
+        let config_leaf = std::path::Path::new(unique_temp_dir("home-config-root").as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp dir should have a utf-8 leaf")
+            .to_string();
+        let config_root = Path::new(&home)
+            .join(".sid-isnt-done-tests")
+            .join(config_leaf)
+            .into_owned();
+        let workspace_root = unique_temp_dir("workspace-root");
+
+        fs::create_dir_all(config_root.join("agents").as_str()).unwrap();
+        fs::write(
+            config_root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='bash'\nbuild_USER_INSTRUCTIONS_HOOK=context\n",
+        )
+        .unwrap();
+        fs::write(
+            config_root.join("tools.conf").as_str(),
+            "bash_ENABLED=YES\n",
+        )
+        .unwrap();
+        write_tool_runtime(&config_root, "bash", "#!/bin/sh\nexit 0\n");
+        fs::write(config_root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(
+            config_root.join("agents/context").as_str(),
+            "#!/bin/sh\nexec \"$(dirname \"$0\")/context.impl\" \"$@\"\n",
+        )
+        .unwrap();
+        make_executable(&config_root.join("agents/context"));
+        fs::write(
+            config_root.join("agents/context.impl").as_str(),
+            r#"#!/bin/sh
+case "${1:-}" in
+rcvar)
+    ;;
+run)
+    printf 'home hook ok\n'
+    ;;
+*)
+    exit 129
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        make_executable(&config_root.join("agents/context.impl"));
+        fs::create_dir_all(workspace_root.as_str()).unwrap();
+
+        let config = Config::load(&config_root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", workspace_root.clone()).unwrap();
+        let mut messages = vec![MessageParam::user("Do the work.")];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(agent.inject_user_instructions_for_turn(&mut messages))
+            .unwrap();
+
+        let injected = injected_user_instruction_text(&messages[0]);
+        assert!(injected.contains("# User instructions from hook context"));
+        assert!(injected.contains("home hook ok"));
+
+        fs::remove_dir_all(config_root.as_str()).unwrap();
+        fs::remove_dir_all(workspace_root.as_str()).unwrap();
     }
 
     #[test]

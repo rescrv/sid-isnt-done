@@ -746,10 +746,12 @@ Aliases get their own prefix.  If the model invokes `format`, the tool reads
 
 On macOS, `sid` wraps bash and external tool processes with
 `/usr/bin/sandbox-exec` when it is available.  This is a sandbox wrapper, not a
-chroot: processes still see host `/`.  The generated policy allows full
-filesystem reads, writes to the workspace, session directory, and system
-temporary directory, and loopback networking.  On systems without
-`sandbox-exec`, commands run without this wrapper.
+chroot: processes still see host `/`.  The generated policy allows reads from
+the workspace, session scratch, temporary directories, `~/src`, `~/.cargo`,
+`~/.rustup`, common Git config locations under `$HOME`, and
+`/Library/Developer/CommandLineTools`; and, writes to the workspace, session
+directory, and system temporary directory, and loopback networking.  On
+systems without `sandbox-exec`, commands run without this wrapper.
 
 `sid-seatbelt` is a helper for running an arbitrary command under the same
 macOS Seatbelt policy:
@@ -1069,9 +1071,12 @@ policy builder that `sid` uses for sandboxed bash and external tool processes.
 It is a macOS helper; it exits with an error when `/usr/bin/sandbox-exec` is not
 available.  It does not chroot `COMMAND`; host `/` remains the process root.
 
-The policy is deny-by-default, permits full filesystem reads, permits writes to
-configured writable roots and temporary directories, and limits network access
-to loopback.
+The policy is deny-by-default, permits reads from writable roots outside
+`$HOME`, permits writes to configured writable roots and temporary directories,
+and limits network access to loopback.  Reads from the user's home directory
+are limited to `~/src`, `~/.cargo`, `~/.rustup`, `~/.config/git`, and selected
+Git dotfiles such as `~/.gitconfig`.  It also allows
+`/Library/Developer/CommandLineTools` for system toolchain support.
 
 ## OPTIONS
 
@@ -1157,7 +1162,9 @@ The generated sid policy:
 
 - denies by default;
 - allows child process execution and same-sandbox signaling;
-- allows full filesystem reads;
+- allows reads from writable roots outside `$HOME`, plus `~/src`, `~/.cargo`,
+  `~/.rustup`, `~/.config/git`, selected Git dotfiles such as `~/.gitconfig`,
+  and `/Library/Developer/CommandLineTools`;
 - allows writes to the workspace, configured writable roots, and temporary
   directories;
 - allows loopback networking for local servers and tools;

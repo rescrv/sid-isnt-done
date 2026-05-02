@@ -547,10 +547,15 @@ async fn run_user_instruction_hook_inner(
     let prepared = prepare_hook_runtime(hook, context, agents_md_path, dirs)?;
     let mut writable_roots = WritableRoots::default();
     writable_roots.push(dirs.scratch_dir.to_string_lossy().into_owned());
-    let mut cmd = crate::seatbelt::sandboxed_command(
+    let read_roots = crate::seatbelt::service_read_roots(
+        StdPath::new(context.config_root.as_str()),
+        StdPath::new(hook.executable_path.as_str()),
+    );
+    let mut cmd = crate::seatbelt::sandboxed_command_with_read_roots(
         hook.executable_path.as_str(),
         &["run"],
         &writable_roots,
+        &read_roots,
     );
     cmd.current_dir(context.workspace_root.as_str())
         .stdin(Stdio::null())

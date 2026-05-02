@@ -57,6 +57,7 @@ pub(crate) struct PreparedRcToolInvocation {
     rc_service_name: String,
     canonical_id: String,
     executable_path: Path<'static>,
+    config_root: Path<'static>,
     workspace_root: Path<'static>,
     agent_id: String,
     tool_use_id: String,
@@ -179,6 +180,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         rc_service_name: rc_service_name.to_string(),
         canonical_id: canonical_id.to_string(),
         executable_path: executable_path.clone().into_owned(),
+        config_root: context.config_root.clone().into_owned(),
         workspace_root: context.workspace_root.clone().into_owned(),
         agent_id: context.agent_id.to_string(),
         tool_use_id: tool_use_id.to_string(),
@@ -539,10 +541,15 @@ fn prepared_rc_tool_command(
     subcommand: &str,
     writable_roots: &WritableRoots,
 ) -> tokio::process::Command {
-    let mut cmd = seatbelt::sandboxed_command(
+    let read_roots = seatbelt::service_read_roots(
+        StdPath::new(prepared.config_root.as_str()),
+        StdPath::new(prepared.executable_path.as_str()),
+    );
+    let mut cmd = seatbelt::sandboxed_command_with_read_roots(
         prepared.executable_path.as_str(),
         &[subcommand],
         writable_roots,
+        &read_roots,
     );
     cmd.current_dir(prepared.workspace_root.as_str())
         .envs(&prepared.runtime.bindings)
