@@ -1100,8 +1100,13 @@ impl Agent for SidAgent {
                             Ok(outcome)
                         }
                         Err(err) => {
+                            eprintln!("API error (conversation preserved): {err}");
                             top_up_cancelled_tool_results(messages);
-                            Err(err)
+                            Ok(TurnOutcome {
+                                stop_reason: StopReason::EndTurn,
+                                usage: usage_total,
+                                request_count,
+                            })
                         }
                     };
                 }
@@ -1210,9 +1215,18 @@ impl Agent for SidAgent {
                         return Ok(outcome);
                     }
                     Err(err) => {
+                        renderer.print_error(
+                            &context,
+                            &format!("API error (conversation preserved): {err}"),
+                        );
                         top_up_cancelled_tool_results(messages);
-                        renderer.finish_agent(&context, None);
-                        return Err(err);
+                        let stop_reason = StopReason::EndTurn;
+                        renderer.finish_agent(&context, Some(&stop_reason));
+                        return Ok(TurnOutcome {
+                            stop_reason,
+                            usage: usage_total,
+                            request_count,
+                        });
                     }
                 },
             }
