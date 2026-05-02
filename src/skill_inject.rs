@@ -1,5 +1,23 @@
+//! Skill-reference injection into user messages.
+//!
+//! When a user message contains `$skill-name` references, this module reads
+//! the corresponding skill content from disk and wraps it in `<skill>` XML
+//! blocks for injection into the conversation.
+
 use std::fs;
 
+/// Expand `$skill-name` references in `user_message` into XML skill blocks.
+///
+/// `manifest` is a tab-separated table where each line has three fields:
+/// `<id>\t<virtual_path>\t<content_path>`.  For every skill whose `$id`
+/// appears in `user_message`, the file at `content_path` is read and wrapped
+/// in a `<skill>` element.  Common environment-variable names (e.g. `$PATH`,
+/// `$HOME`) are never treated as skill references.
+///
+/// # Errors
+///
+/// Returns a human-readable error string when a manifest line is malformed or
+/// a content file cannot be read.
 pub fn render_skill_blocks(user_message: &str, manifest: &str) -> Result<String, String> {
     let mut output = String::new();
     for (line_idx, line) in manifest.lines().enumerate() {

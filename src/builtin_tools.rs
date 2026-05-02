@@ -1,3 +1,10 @@
+//! Built-in tool implementations shipped with sid.
+//!
+//! Currently provides the `sid-editor-tool` binary entry point, which handles
+//! both the full text-editor tool and the read-only file-viewer tool.  The
+//! binary communicates with the harness through the sid tool protocol (JSON
+//! request/result envelopes on the filesystem).
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -174,6 +181,17 @@ struct ResolvedReadOnlyRequest {
     end_line: Option<i64>,
 }
 
+/// Entry point for the `sid-editor-tool` binary.
+///
+/// Reads a tool-protocol request envelope from the environment, executes the
+/// requested editor or read-only command, and writes the result envelope back
+/// to disk.  In confirmation mode, a human-readable preview is printed to
+/// stdout instead.
+///
+/// # Errors
+///
+/// Returns an I/O error when the request cannot be read, the result cannot
+/// be written, or an unsupported protocol version is encountered.
 pub async fn run_sid_editor_tool() -> io::Result<()> {
     let (flavor, mode) = parse_sid_editor_tool_args()?;
     let invocation = ToolInvocation::from_env()?;

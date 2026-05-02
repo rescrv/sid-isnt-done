@@ -1,10 +1,30 @@
+//! A UNIX-inspired coding agent for Anthropic-compatible APIs.
+//!
+//! `sid-isnt-done` combines an rc-conf configuration system with the Anthropic
+//! messages API to produce an interactive, tool-using coding agent.  Agents,
+//! tools, and skills are defined through plain configuration files rather than
+//! hard-coded tool lists, and the runtime manages sessions, sandboxing, and
+//! tool invocation lifecycle.
+//!
+//! The primary entry point is [`SidAgent`], which assembles a chat
+//! configuration, tool bindings, filesystem mounts, and sandbox policy into a
+//! single [`claudius::Agent`] implementation.
+
+#![deny(missing_docs)]
+
+/// Built-in tool implementations (editor, read-only viewer).
 pub mod builtin_tools;
+/// Workspace configuration loading and types.
 pub mod config;
 mod filesystem;
 mod retry;
+/// macOS Seatbelt sandbox integration.
 pub mod seatbelt;
+/// Session lifecycle: creation, resumption, journalling, and transcripts.
 pub mod session;
+/// Semantic diff rendering with syntax-aware annotations.
 pub mod sidiff;
+/// Skill-reference injection into user messages.
 pub mod skill_inject;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -68,6 +88,7 @@ const DEFAULT_COMPACTOR_SYSTEM_PROMPT: &str = concat!(
     "State uncertainty explicitly.\n",
     "Do not ask follow-up questions.\n",
 );
+/// User-facing prompt sent to the compactor agent to trigger session compaction.
 pub const COMPACTION_REQUEST_PROMPT: &str = concat!(
     "Compact this conversation into a standalone handoff summary for the next session.\n",
     "Write only the summary.\n",
@@ -120,6 +141,11 @@ pub struct SidAgent {
 }
 
 impl SidAgent {
+    /// Create a new agent with default settings rooted at `workspace_root`.
+    ///
+    /// The workspace root is used as both the configuration root and the
+    /// filesystem root.  No rc.conf files are loaded; the agent operates
+    /// with the supplied [`ChatConfig`] only.
     pub fn new(config: ChatConfig, workspace_root: Path<'static>) -> Self {
         Self::new_with_roots(config, workspace_root.clone(), workspace_root)
     }
@@ -166,10 +192,29 @@ impl SidAgent {
         )
     }
 
+    /// Load the default agent from a workspace's configuration files.
+    ///
+    /// When no configuration exists at `root`, the `fallback` chat config is
+    /// used with default settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration exists but is malformed, or
+    /// when the default agent cannot be resolved.
     pub fn from_workspace(root: &Path, fallback: ChatConfig) -> Result<Self, SError> {
         Self::from_workspace_with_config_root(root, root, fallback)
     }
 
+    /// Load the default agent using separate workspace and configuration roots.
+    ///
+    /// The `config_root` is the directory containing `agents.conf` and
+    /// `tools.conf`, while `workspace_root` is the directory exposed to tool
+    /// invocations and sandbox policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration exists but is malformed, or
+    /// when the default agent cannot be resolved.
     pub fn from_workspace_with_config_root(
         workspace_root: &Path,
         config_root: &Path,
@@ -194,6 +239,12 @@ impl SidAgent {
         )
     }
 
+    /// Load a named agent from a workspace's configuration files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent does not exist in the configuration or
+    /// is disabled.
     pub fn from_workspace_agent(
         root: &Path,
         agent: &str,
@@ -202,6 +253,12 @@ impl SidAgent {
         Self::from_workspace_agent_with_config_root(root, root, agent, fallback)
     }
 
+    /// Load a named agent using separate workspace and configuration roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent does not exist in the configuration or
+    /// is disabled.
     pub fn from_workspace_agent_with_config_root(
         workspace_root: &Path,
         config_root: &Path,
@@ -230,6 +287,16 @@ impl SidAgent {
         )
     }
 
+    /// Load the compaction agent using separate workspace and configuration roots.
+    ///
+    /// If a `compact` agent is declared in the configuration it is used;
+    /// otherwise a default compactor is built from `fallback` with the
+    /// built-in compaction system prompt.  The returned agent exposes
+    /// memory-only tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration exists but is malformed.
     pub fn from_workspace_compactor_with_config_root(
         workspace_root: &Path,
         config_root: &Path,
@@ -261,6 +328,12 @@ impl SidAgent {
         .with_tool_scope(SidToolScope::MemoryOnly))
     }
 
+    /// Build an agent directly from a pre-loaded [`Config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent does not exist in the configuration or
+    /// is disabled.
     pub fn from_config(
         config: &Config,
         agent: &str,
@@ -269,10 +342,12 @@ impl SidAgent {
         Self::from_loaded_config(config, agent, None, filesystem)
     }
 
+    /// Return the agent's identifier.
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// Return `true` when the agent's enablement switch is [`SwitchPosition::Manual`].
     pub fn requires_confirmation(&self) -> bool {
         self.enabled == SwitchPosition::Manual
     }
@@ -380,6 +455,7 @@ impl SidAgent {
         }
     }
 
+    /// Attach a session to this agent, making the session root writable.
     pub fn with_session(mut self, session: Arc<SidSession>) -> Self {
         append_writable_root(&mut self.writable_roots, session.root());
         if self.memory_source.is_none() {
@@ -389,6 +465,7 @@ impl SidAgent {
         self
     }
 
+    /// Override the compaction provenance used for ask-an-expert memory chains.
     pub fn with_memory_source(mut self, memory_source: Option<CompactionProvenance>) -> Self {
         self.memory_source = memory_source;
         self
@@ -408,6 +485,7 @@ impl SidAgent {
         self
     }
 
+    /// Snapshot the agent's identity and model for use as a compaction expert.
     pub fn compaction_snapshot(&self) -> CompactionExpertConfig {
         CompactionExpertConfig {
             agent_id: Some(self.id.clone()),
@@ -425,6 +503,15 @@ impl SidAgent {
             .await
     }
 
+    /// Execute a bash command in the agent's PTY session, streaming output to `renderer`.
+    ///
+    /// When `restart` is `true` the existing PTY is torn down and a fresh
+    /// session is started before executing `command`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the PTY cannot be created or the command
+    /// fails to execute.
     pub async fn bash_with_renderer(
         &self,
         command: &str,
@@ -2570,6 +2657,15 @@ impl Renderer for NullRenderer {
     fn finish_response(&mut self, _context: &dyn StreamContext) {}
 }
 
+/// Deserialize a transcript file into a sequence of message parameters.
+///
+/// The file must be a version-1 transcript snapshot written by the session
+/// runtime.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, is not valid JSON, or has
+/// an unsupported transcript version.
 pub fn load_transcript_messages(path: &std::path::Path) -> Result<Vec<MessageParam>, SError> {
     let payload = std::fs::read(path).map_err(|err| {
         SError::new("sid-transcript")
@@ -2595,6 +2691,11 @@ pub fn load_transcript_messages(path: &std::path::Path) -> Result<Vec<MessagePar
     Ok(snapshot.messages)
 }
 
+/// Build a two-message transcript representing a compacted session.
+///
+/// The first message is a user message containing the compaction context
+/// template, and the second is an assistant message carrying the handoff
+/// `summary`.
 pub fn compacted_transcript(parent_session_id: &str, summary: &str) -> Vec<MessageParam> {
     vec![
         MessageParam::user(
@@ -2893,6 +2994,10 @@ fn latest_user_message_text(messages: &[MessageParam]) -> Option<String> {
     }
 }
 
+/// Extract the concatenated text blocks from the last assistant message.
+///
+/// Returns `None` when the slice contains no assistant messages or the last
+/// assistant message has no text content.
 pub fn extract_last_assistant_text(messages: &[MessageParam]) -> Option<String> {
     let message = messages
         .iter()

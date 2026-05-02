@@ -1,3 +1,10 @@
+//! Semantic diff renderer with syntax-aware annotations.
+//!
+//! Parses git-style or plain unified diffs into an intermediate representation
+//! ([`Diff`], [`DiffFile`], [`Hunk`], [`DiffLine`]), optionally annotates
+//! hunks with tree-sitter role information, and renders the result with ANSI
+//! truecolor highlighting.
+
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -15,17 +22,25 @@ const ROLE_GLYPHS: [&str; MAX_ROLE_GROUPS] = [
 
 const RESET: &str = "\x1b[0m";
 
+/// Controls how trailing whitespace changes are displayed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WhitespaceMode {
+    /// Suppress whitespace-only diff lines entirely.
     Hide,
+    /// Render whitespace changes in a subdued color.
     Muted,
+    /// Render whitespace changes like any other change.
     Normal,
 }
 
+/// Controls the background-tint intensity for add/remove line highlighting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TintIntensity {
+    /// Subtle background tint.
     Low,
+    /// Moderate background tint (default).
     Medium,
+    /// Pronounced background tint.
     High,
 }
 
@@ -39,10 +54,14 @@ impl TintIntensity {
     }
 }
 
+/// Rendering options for [`render_diff`] and [`run_pager`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SidiffOptions {
+    /// Enable ANSI truecolor output.
     pub use_color: bool,
+    /// Whitespace display policy.
     pub whitespace_mode: WhitespaceMode,
+    /// Background-tint strength for added/removed lines.
     pub tint_intensity: TintIntensity,
 }
 
@@ -56,44 +75,70 @@ impl Default for SidiffOptions {
     }
 }
 
+/// Top-level unified diff, potentially covering multiple files.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Diff {
+    /// Lines that appear before any file header (e.g. `diff --stat` output).
     pub preamble: Vec<String>,
+    /// Per-file diff sections.
     pub files: Vec<DiffFile>,
 }
 
+/// A single file's portion of a unified diff.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiffFile {
+    /// Path from the `---` header line, if present.
     pub old_path: Option<String>,
+    /// Path from the `+++` header line, if present.
     pub new_path: Option<String>,
+    /// Raw header lines (e.g. `diff --git`, `index`, `---`, `+++`).
     pub header: Vec<String>,
+    /// Hunks within this file's diff.
     pub hunks: Vec<Hunk>,
 }
 
+/// A contiguous region of changed lines within a file diff.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Hunk {
+    /// Raw `@@ ... @@` header line.
     pub header: String,
+    /// Starting line number in the old file.
     pub old_start: usize,
+    /// Number of lines from the old file in this hunk.
     pub old_count: usize,
+    /// Starting line number in the new file.
     pub new_start: usize,
+    /// Number of lines from the new file in this hunk.
     pub new_count: usize,
+    /// Optional section name extracted from the hunk header (e.g. function name).
     pub section: String,
+    /// Individual diff lines within the hunk.
     pub lines: Vec<DiffLine>,
 }
 
+/// A single line within a [`Hunk`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffLine {
+    /// Whether this line is context, added, removed, or a note.
     pub op: DiffOp,
+    /// The line's text content (without the leading `+`/`-`/` ` marker).
     pub content: String,
+    /// Line number in the old file, if applicable.
     pub old_lineno: Option<usize>,
+    /// Line number in the new file, if applicable.
     pub new_lineno: Option<usize>,
 }
 
+/// The operation a [`DiffLine`] represents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffOp {
+    /// Unchanged context line present in both old and new files.
     Context,
+    /// Line added in the new file.
     Add,
+    /// Line removed from the old file.
     Remove,
+    /// Informational annotation (e.g. `\ No newline at end of file`).
     Note,
 }
 
@@ -385,6 +430,15 @@ pub fn render_diff_preview(input: &str) -> io::Result<String> {
     render_diff_preview_with_value(input, env::var_os("DIFF"))
 }
 
+/// Render a unified diff preview using an explicit `DIFF` environment override.
+///
+/// When `value` is `None`, sidiff's built-in renderer is used.  An empty
+/// `OsString` disables styling and returns the raw diff.  Any other value is
+/// interpreted as a shell command to pipe the diff through.
+///
+/// # Errors
+///
+/// Returns an I/O error when the external filter command fails.
 pub fn render_diff_preview_with_value(input: &str, value: Option<OsString>) -> io::Result<String> {
     match diff_preview_command_from_value(value) {
         DiffPreviewCommand::Raw => Ok(input.to_string()),

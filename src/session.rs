@@ -1,3 +1,11 @@
+//! Session lifecycle management.
+//!
+//! A [`SidSession`] represents a single interactive run of the agent.  Each
+//! session occupies a timestamped directory under the workspace's sessions
+//! root and maintains append-only journals for events, API calls, and tool
+//! stream fragments.  Sessions can be created fresh, created as compacted
+//! continuations of an earlier session, or resumed from their on-disk state.
+
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -14,11 +22,17 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use utf8path::Path;
 
+/// Default subdirectory name under the config root where sessions are stored.
 pub const SESSIONS_DIR: &str = "sessions";
+/// Environment variable that overrides the sessions root directory.
 pub const SID_SESSIONS_ENV: &str = "SID_SESSIONS";
+/// Environment variable exported to tools with the active session directory.
 pub const SID_SESSION_DIR_ENV: &str = "SID_SESSION_DIR";
+/// Environment variable exported to tools with the active session identifier.
 pub const SID_SESSION_ID_ENV: &str = "SID_SESSION_ID";
+/// When set, tool scratch directories are preserved after successful invocations.
 pub const SID_KEEP_TOOL_SCRATCH_ENV: &str = "SID_KEEP_TOOL_SCRATCH";
+/// When set, tool scratch directories are preserved after failed invocations.
 pub const SID_KEEP_FAILED_TOOL_SCRATCH_ENV: &str = "SID_KEEP_FAILED_TOOL_SCRATCH";
 
 const SESSION_METADATA_FILE: &str = "session.json";
@@ -28,22 +42,37 @@ const API_JOURNAL_FILE: &str = "api.jsonl";
 const TOOL_STREAMS_JOURNAL_FILE: &str = "tool-streams.jsonl";
 const BASH_STATE_FILE: &str = "bash-state.sh";
 
+/// Identity snapshot of the agent that produced a compacted session summary.
+///
+/// Stored in the session metadata so that a resumed session can reconstruct
+/// a memory-expert agent for follow-up questions.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CompactionExpertConfig {
+    /// Agent identifier at the time of compaction, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Model that produced the compacted summary.
     pub model: String,
+    /// System prompt the compacting agent was using.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
 }
 
+/// Pointer back to the parent session from which a compacted session was derived.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CompactionProvenance {
+    /// Session identifier of the parent session.
     pub session_id: String,
+    /// Filesystem path to the parent session directory.
     pub session_dir: String,
+    /// Expert configuration for the agent that wrote the summary.
     pub expert: CompactionExpertConfig,
 }
 
+/// On-disk representation of a single interactive agent session.
+///
+/// See the [module-level documentation](self) for an overview of the session
+/// lifecycle.
 #[derive(Debug)]
 pub struct SidSession {
     id: String,
@@ -184,10 +213,22 @@ struct ApiJournalState {
 }
 
 impl SidSession {
+    /// Create a fresh session under the default sessions root for `config_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions directory cannot be created or a
+    /// unique session identifier cannot be allocated.
     pub fn create(config_root: &Path) -> Result<Self, SError> {
         Self::create_in(resolve_sessions_root(config_root)?)
     }
 
+    /// Create a compacted continuation session linked to a parent via `provenance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions directory cannot be created or a
+    /// unique session identifier cannot be allocated.
     pub fn create_compacted(
         config_root: &Path,
         provenance: CompactionProvenance,
@@ -195,6 +236,16 @@ impl SidSession {
         Self::create_compacted_in(resolve_sessions_root(config_root)?, provenance)
     }
 
+    /// Resume an existing session identified by `spec`.
+    ///
+    /// `spec` can be an absolute path to a session directory, a path to its
+    /// `session.json` metadata file, or a bare session name relative to the
+    /// default sessions root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session directory does not exist or its
+    /// metadata cannot be read.
     pub fn resume(config_root: &Path, spec: &str) -> Result<Self, SError> {
         let default_sessions_root = resolve_sessions_root(config_root)?;
         let root = resolve_existing_session_root(&default_sessions_root, spec)?;
@@ -335,22 +386,27 @@ impl SidSession {
         Ok(session)
     }
 
+    /// Return the session's unique identifier (a timestamp-based string).
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// Return the parent directory that contains all session directories.
     pub fn sessions_root(&self) -> &PathBuf {
         &self.sessions_root
     }
 
+    /// Return the on-disk root directory for this session.
     pub fn root(&self) -> &PathBuf {
         &self.root
     }
 
+    /// Return the compaction provenance if this session was created via compaction.
     pub fn compaction_provenance(&self) -> Option<&CompactionProvenance> {
         self.compaction_provenance.as_ref()
     }
 
+    /// Return the path to the transcript JSON file for this session.
     pub fn transcript_path(&self) -> PathBuf {
         self.root.join(TRANSCRIPT_FILE)
     }
@@ -363,6 +419,13 @@ impl SidSession {
         &self.bash_state_path
     }
 
+    /// Read the saved bash session state, if any.
+    ///
+    /// Returns `Ok(None)` when no state file exists or the file is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
     pub fn read_bash_state(&self) -> Result<Option<String>, SError> {
         match fs::read_to_string(&self.bash_state_path) {
             Ok(state) if state.trim().is_empty() => Ok(None),
@@ -374,6 +437,11 @@ impl SidSession {
         }
     }
 
+    /// Persist bash session state to disk for later resumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
     pub fn write_bash_state(&self, state: &str) -> Result<(), SError> {
         fs::write(&self.bash_state_path, state).map_err(|err| {
             session_error("io_error", "failed to write bash state")
@@ -693,10 +761,18 @@ fn env_truthy(name: &str) -> bool {
     }
 }
 
+/// Return the transcript file path for a given session directory.
 pub fn transcript_path_for_session_dir(root: &StdPath) -> PathBuf {
     root.join(TRANSCRIPT_FILE)
 }
 
+/// Read compaction provenance from a session directory's metadata file.
+///
+/// Returns `Ok(None)` when the session was not created via compaction.
+///
+/// # Errors
+///
+/// Returns an error when the metadata file cannot be read or parsed.
 pub fn read_compaction_provenance_from_dir(
     root: &StdPath,
 ) -> Result<Option<CompactionProvenance>, SError> {

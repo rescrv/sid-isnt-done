@@ -1,3 +1,11 @@
+//! Configuration loading for sid workspaces.
+//!
+//! A sid workspace keeps its configuration in a directory tree with two rc.conf
+//! files ([`AGENTS_CONF_FILE`] and [`TOOLS_CONF_FILE`]) and companion
+//! subdirectories for agent prompts, tool executables, and skill markdown
+//! files.  [`Config::load`] reads these files and produces a strongly typed
+//! configuration that the rest of the agent runtime consumes.
+
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -11,29 +19,59 @@ use serde::Deserialize;
 use shvar::VariableProvider;
 use utf8path::Path;
 
+/// Default token budget for extended thinking.
 pub const DEFAULT_THINKING_BUDGET: u32 = 1024;
+/// Filename for the agent declarations rc.conf file.
 pub const AGENTS_CONF_FILE: &str = "agents.conf";
+/// Filename for the tool declarations rc.conf file.
 pub const TOOLS_CONF_FILE: &str = "tools.conf";
+/// Subdirectory that holds per-agent prompt and configuration files.
 pub const AGENTS_DIR: &str = "agents";
+/// Subdirectory that holds per-tool executables and manifest JSON files.
 pub const TOOLS_DIR: &str = "tools";
+/// Subdirectory that holds skill markdown files.
 pub const SKILLS_DIR: &str = "skills";
+/// Conventional filename for a skill definition.
 pub const SKILL_FILE: &str = "SKILL.md";
+/// Conventional filename for agent-level markdown instructions.
 pub const AGENTS_MD_FILE: &str = "AGENTS.md";
+/// Environment variable that overrides the path to the AGENTS.md file.
 pub const AGENTS_MD_PATH_ENV: &str = "AGENTS_MD_PATH";
+/// Current version of the sid tool protocol.
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 
+/// Fully resolved workspace configuration.
+///
+/// Contains all agents, tools, and skills discovered during [`Config::load`],
+/// together with the parsed rc.conf backing stores.
 #[derive(Debug)]
 pub struct Config {
+    /// Root directory from which the configuration was loaded.
     pub root: Path<'static>,
+    /// Explicit default agent, if one was declared in the agents rc.conf.
     pub default_agent: Option<String>,
+    /// Agent configurations keyed by agent identifier.
     pub agents: BTreeMap<String, AgentConfig>,
+    /// Tool configurations keyed by tool identifier.
     pub tools: BTreeMap<String, ToolConfig>,
+    /// Skill configurations keyed by skill identifier.
     pub skills: BTreeMap<String, SkillConfig>,
     pub(crate) agents_rc_conf: RcConf,
     pub(crate) tools_rc_conf: RcConf,
 }
 
 impl Config {
+    /// Load a workspace configuration from `root`.
+    ///
+    /// Reads `agents.conf` and `tools.conf` from the given directory, resolves
+    /// every agent, tool, and skill referenced in those files, and validates
+    /// tool manifests and executables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required configuration file is missing, a
+    /// referenced tool executable or manifest cannot be found, or an rc.conf
+    /// entry is malformed.
     pub fn load(root: &Path) -> Result<Self, SError> {
         let root = root.clone().into_owned();
         let agents_conf_path = root.join(AGENTS_CONF_FILE);
@@ -91,20 +129,38 @@ impl Config {
     }
 }
 
+/// Configuration for a single agent declared in `agents.conf`.
+///
+/// Each agent has an identity, an enablement switch, a system prompt, a list
+/// of tools it may invoke, and tuning knobs for user-instruction injection
+/// and extended-thinking budgets.
 #[derive(Debug)]
 pub struct AgentConfig {
+    /// Unique identifier for this agent (the rc.conf service name).
     pub id: String,
+    /// Whether the agent is enabled, disabled, or requires manual confirmation.
     pub enabled: SwitchPosition,
+    /// Human-readable display name, if specified.
     pub display_name: Option<String>,
+    /// Short prose description of the agent's purpose.
     pub description: Option<String>,
+    /// Tool identifiers this agent is allowed to invoke.
     pub tools: Vec<String>,
+    /// Skill identifiers this agent has access to.
     pub skills: Vec<String>,
+    /// Filesystem path to the agent's system prompt markdown file.
     pub prompt_path: Path<'static>,
+    /// Loaded system prompt markdown content, or `None` when the file is absent.
     pub prompt_markdown: Option<String>,
+    /// Merged chat configuration (model, thinking budget, etc.).
     pub chat_config: ChatConfig,
+    /// Whether user-instruction injection is enabled for this agent.
     pub user_instructions_enabled: bool,
+    /// Whether the AGENTS.md file should be appended to the system prompt.
     pub agents_md_enabled: bool,
+    /// Explicit override path for the AGENTS.md file, if set.
     pub agents_md_path: Option<String>,
+    /// Shell command executed as a hook to produce additional user instructions.
     pub user_instructions_hook: Option<String>,
 }
 
@@ -161,20 +217,40 @@ impl AgentConfig {
     }
 }
 
+/// Configuration for a single tool declared in `tools.conf`.
+///
+/// Tools are external executables that speak the sid tool protocol.  The
+/// manifest JSON supplies the Anthropic API with a description and JSON-Schema
+/// input definition, while the executable path locates the binary that
+/// actually runs each invocation.
 #[derive(Debug)]
 pub struct ToolConfig {
+    /// Tool identifier (the rc.conf service name after alias resolution).
     pub id: String,
+    /// Whether the tool is enabled, disabled, or requires manual confirmation.
     pub enabled: SwitchPosition,
+    /// When `true`, the harness shows a diff preview before executing write operations.
     pub confirm_preview: bool,
+    /// Filesystem path to the tool executable, or `None` for built-in tools.
     pub executable_path: Option<Path<'static>>,
+    /// Filesystem path to the tool's manifest JSON file.
     pub manifest_path: Path<'static>,
+    /// Parsed manifest, or `None` when the manifest is optional and absent.
     pub manifest: Option<ToolManifest>,
 }
 
+/// Parsed content of a tool manifest JSON file.
+///
+/// The manifest supplies the Anthropic messages API with the information it
+/// needs to present the tool to the model: a human-readable description and
+/// the JSON-Schema that validates tool-use inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolManifest {
+    /// Protocol version this manifest was written for.
     pub protocol_version: u32,
+    /// Human-readable description shown to the model.
     pub description: String,
+    /// JSON-Schema describing the tool's input parameters.
     pub input_schema: serde_json::Value,
 }
 
