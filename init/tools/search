@@ -1,0 +1,162 @@
+#!/bin/sh
+set -eu
+
+# search — search the workspace with ripgrep.
+#
+# Read-only tool.  Returns matching lines with paths and line numbers.
+
+lookup() {
+    printenv "$1"
+}
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_REQUEST_FILE" \
+        "${PREFIX}_RESULT_FILE" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_SESSION_ID" \
+        "${PREFIX}_SESSION_DIR" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_TOOL_ID" \
+        "${PREFIX}_TOOL_NAME" \
+        "${PREFIX}_TOOL_PROTOCOL" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+confirm)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    pattern=$(jq -r '.invocation.input.pattern // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+    include=$(jq -r '.invocation.input.include // empty' "$REQUEST_FILE")
+    fixed=$(jq -r '.invocation.input.fixed_strings // false' "$REQUEST_FILE")
+    desc="Search for '${pattern}'"
+    if [ -n "$path" ]; then desc="${desc} in ${path}"; fi
+    if [ -n "$include" ]; then desc="${desc} (${include})"; fi
+    if [ "$fixed" = "true" ]; then desc="${desc} [literal]"; fi
+    printf '%s\n' "$desc"
+    ;;
+run)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
+    WORKSPACE_ROOT="$(lookup "${PREFIX}_WORKSPACE_ROOT")"
+
+    request_id=$(jq -r '.request_id' "$REQUEST_FILE")
+    pattern=$(jq -r '.invocation.input.pattern // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+    fixed=$(jq -r '.invocation.input.fixed_strings // false' "$REQUEST_FILE")
+    include=$(jq -r '.invocation.input.include // empty' "$REQUEST_FILE")
+    max_results=$(jq -r '.invocation.input.max_results // 200' "$REQUEST_FILE")
+
+    write_success() {
+        text="$1"
+        jq -n --arg rid "$request_id" --arg txt "$text" \
+            '{"protocol_version":1,"request_id":$rid,"ok":true,"output":{"kind":"text","text":$txt},"error":null}' \
+            > "$RESULT_FILE"
+    }
+
+    write_error() {
+        code="$1"; msg="$2"
+        jq -n --arg rid "$request_id" --arg c "$code" --arg m "$msg" \
+            '{"protocol_version":1,"request_id":$rid,"ok":false,"output":null,"error":{"code":$c,"message":$m}}' \
+            > "$RESULT_FILE"
+    }
+
+    if [ -z "$pattern" ]; then
+        write_error "invalid_input" "missing required field: pattern"
+        exit 0
+    fi
+
+    case "$max_results" in
+    ''|*[!0-9]*)
+        write_error "invalid_input" "max_results must be a positive integer"
+        exit 0
+        ;;
+    esac
+    if [ "$max_results" -le 0 ]; then
+        write_error "invalid_input" "max_results must be a positive integer"
+        exit 0
+    fi
+
+    # Build search path
+    if [ -n "$path" ]; then
+        if ! search_root=$(sid-path-join "$WORKSPACE_ROOT" "$path"); then
+            write_error "unsupported" "path must be workspace-relative and must not contain '..': ${path}"
+            exit 0
+        fi
+        search_target="$path"
+    else
+        search_root="$WORKSPACE_ROOT"
+        search_target="."
+    fi
+
+    if [ ! -e "$search_root" ]; then
+        write_error "not_found" "path not found: ${path}"
+        exit 0
+    fi
+
+    output_file=$(mktemp "${TMPDIR:-/tmp}/search.output.XXXXXX")
+    error_file=$(mktemp "${TMPDIR:-/tmp}/search.error.XXXXXX")
+    trap 'rm -f "$output_file" "$error_file"' EXIT HUP INT TERM
+
+    set -- rg --line-number --no-heading --color never --with-filename
+    if [ "$fixed" = "true" ]; then
+        set -- "$@" --fixed-strings
+    fi
+    if [ -n "$include" ]; then
+        set -- "$@" --glob "$include"
+    fi
+    set -- "$@" -- "$pattern" "$search_target"
+
+    if (
+        cd "$WORKSPACE_ROOT"
+        "$@" >"$output_file" 2>"$error_file"
+    ); then
+        rg_status=0
+    else
+        rg_status=$?
+    fi
+
+    case "$rg_status" in
+    0)
+        ;;
+    1)
+        write_success "No matches found."
+        exit 0
+        ;;
+    *)
+        msg=$(cat "$error_file")
+        if [ -z "$msg" ]; then
+            msg="ripgrep failed"
+        fi
+        code="search_failed"
+        case "$msg" in
+        "rg: regex parse error:"*)
+            code="invalid_input"
+            ;;
+        esac
+        write_error "$code" "$msg"
+        exit 0
+        ;;
+    esac
+
+    total_count=$(wc -l < "$output_file" | tr -d ' ')
+    output=$(sed -n "1,${max_results}p" "$output_file" | sed 's|^\./||')
+
+    if [ "$total_count" -gt "$max_results" ]; then
+        output="${output}
+... (results truncated at ${max_results} matches)"
+    fi
+
+    write_success "$output"
+    ;;
+*)
+    echo "usage: $0 [rcvar|confirm|run]" >&2
+    exit 129
+    ;;
+esac

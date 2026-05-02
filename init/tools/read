@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+# This is a tool wrapper that implements the sid tool protocol.
+# It exports environment variables and delegates to sid-editor-tool in readonly mode.
+
+lookup() {
+    printenv "$1"
+}
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_REQUEST_FILE" \
+        "${PREFIX}_RESULT_FILE" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_SESSION_ID" \
+        "${PREFIX}_SESSION_DIR" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_TOOL_ID" \
+        "${PREFIX}_TOOL_NAME" \
+        "${PREFIX}_TOOL_PROTOCOL" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+confirm|run)
+    MODE="$1"
+    shift
+    export REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    export RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
+    export SCRATCH_DIR="$(lookup "${PREFIX}_SCRATCH_DIR")"
+    export TEMP_DIR="$(lookup "${PREFIX}_TEMP_DIR")"
+    export TMPDIR="$(lookup "${PREFIX}_TMPDIR")"
+    export WORKSPACE_ROOT="$(lookup "${PREFIX}_WORKSPACE_ROOT")"
+    export SESSION_ID="$(lookup "${PREFIX}_SESSION_ID")"
+    export SESSION_DIR="$(lookup "${PREFIX}_SESSION_DIR")"
+    export AGENT_ID="$(lookup "${PREFIX}_AGENT_ID")"
+    export TOOL_ID="$(lookup "${PREFIX}_TOOL_ID")"
+    export TOOL_NAME="$(lookup "${PREFIX}_TOOL_NAME")"
+    export TOOL_PROTOCOL="$(lookup "${PREFIX}_TOOL_PROTOCOL")"
+    export RC_CONF_PATH="$(lookup "${PREFIX}_RC_CONF_PATH")"
+    export RC_D_PATH="$(lookup "${PREFIX}_RC_D_PATH")"
+    exec sid-editor-tool --readonly "$MODE" "$@"
+    ;;
+*)
+    echo "usage: $0 [rcvar|confirm|run]" >&2
+    exit 129
+    ;;
+esac

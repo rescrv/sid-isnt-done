@@ -1,0 +1,13 @@
+{
+  "protocol_version": 1,
+  "description": "Show the working tree status of the git repository. Read-only; never modifies the repository.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "short": {
+        "type": "boolean",
+        "description": "When true, show short-format output. Defaults to false."
+      }
+    }
+  }
+}

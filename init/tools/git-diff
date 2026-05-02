@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+# git_diff — show git diffs.
+#
+# Read-only wrapper around `git diff`.
+
+lookup() {
+    printenv "$1"
+}
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_REQUEST_FILE" \
+        "${PREFIX}_RESULT_FILE" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_SESSION_ID" \
+        "${PREFIX}_SESSION_DIR" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_TOOL_ID" \
+        "${PREFIX}_TOOL_NAME" \
+        "${PREFIX}_TOOL_PROTOCOL" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+confirm)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    staged=$(jq -r '.invocation.input.staged // false' "$REQUEST_FILE")
+    ref=$(jq -r '.invocation.input.ref // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+    desc="git diff"
+    if [ "x$staged" = "xtrue" ]; then desc="${desc} --cached"; fi
+    if [ -n "$ref" ]; then desc="${desc} ${ref}"; fi
+    if [ -n "$path" ]; then desc="${desc} -- ${path}"; fi
+    printf '%s\n' "$desc"
+    ;;
+run)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
+    WORKSPACE_ROOT="$(lookup "${PREFIX}_WORKSPACE_ROOT")"
+
+    request_id=$(jq -r '.request_id' "$REQUEST_FILE")
+    staged=$(jq -r '.invocation.input.staged // false' "$REQUEST_FILE")
+    ref=$(jq -r '.invocation.input.ref // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+
+    write_success() {
+        text="$1"
+        jq -n --arg rid "$request_id" --arg txt "$text" \
+            '{"protocol_version":1,"request_id":$rid,"ok":true,"output":{"kind":"text","text":$txt},"error":null}' \
+            > "$RESULT_FILE"
+    }
+
+    write_error() {
+        code="$1"; msg="$2"
+        jq -n --arg rid "$request_id" --arg c "$code" --arg m "$msg" \
+            '{"protocol_version":1,"request_id":$rid,"ok":false,"output":null,"error":{"code":$c,"message":$m}}' \
+            > "$RESULT_FILE"
+    }
+
+    cd "$WORKSPACE_ROOT"
+
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        write_error "not_a_repo" "not a git repository: ${WORKSPACE_ROOT}"
+        exit 0
+    fi
+
+    # Build git diff command
+    git_args="diff"
+    if [ "$staged" = "true" ]; then
+        git_args="${git_args} --cached"
+    fi
+    if [ -n "$ref" ]; then
+        git_args="${git_args} ${ref}"
+    fi
+    if [ -n "$path" ]; then
+        git_args="${git_args} -- ${path}"
+    fi
+
+    output=$(git $git_args 2>&1) || true
+
+    if [ -z "$output" ]; then
+        write_success "No differences found."
+    else
+        write_success "$output"
+    fi
+    ;;
+*)
+    echo "usage: $0 [rcvar|confirm|run]" >&2
+    exit 129
+    ;;
+esac

@@ -40,6 +40,10 @@ name = "sid-editor-tool"
 path = "src/bin/sid-editor-tool.rs"
 
 [[bin]]
+name = "sid-path-join"
+path = "src/bin/sid-path-join.rs"
+
+[[bin]]
 name = "sid-seatbelt"
 path = "src/bin/sid-seatbelt.rs"
 

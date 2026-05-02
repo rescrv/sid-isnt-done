@@ -424,6 +424,39 @@ format_ALIASES="fmt"
   `tools/edit.json` manifest is optional because the model-visible schema comes
   from the built-in Anthropic text-editor tool definition.
 
+`read`
+: Read a file or a line range from the workspace.  This is a narrower,
+  read-only alternative to the editor's `view` command.  The starter
+  `tools/read` script delegates to `sid-editor-tool --readonly`.  It accepts
+  `path`, and optional `start_line`/`end_line` parameters (1-indexed,
+  inclusive; `-1` means end of file).  Output includes line numbers.
+  Directories are listed instead of read.  Enabled `YES` by default because
+  it is read-only.
+
+`search`
+: Search the workspace for a pattern using ripgrep.  Returns matching lines with
+  file paths and line numbers.  Accepts `pattern` (regex by default),
+  optional `path` to restrict scope, `fixed_strings` for literal matching,
+  `include` for glob-based file filtering, and `max_results` (default 200).
+  Enabled `YES` by default because it is read-only.
+
+`glob`
+: List workspace files matching a glob pattern.  Accepts `pattern` (e.g.
+  `*.rs`, `Cargo.*`) and optional `path` to restrict to a subdirectory.
+  Ignores `.git`, `node_modules`, and `target` directories.  Enabled `YES`
+  by default because it is read-only.
+
+`git_status`
+: Show the working tree status of the git repository.  Accepts an optional
+  `short` boolean for `--short` format.  Enabled `YES` by default because
+  it is read-only.
+
+`git_diff`
+: Show changes in the git working tree or between commits.  Accepts optional
+  `staged` boolean for `--cached`, `path` to restrict scope, and `ref` to
+  diff against a specific commit or branch.  Enabled `YES` by default because
+  it is read-only.
+
 External tools must provide both files below for the canonical tool id:
 
 ```text
@@ -879,23 +912,30 @@ sid-editor-tool - execute the sid text-editor tool protocol
 
 ```text
 sid-editor-tool
+sid-editor-tool --readonly
 tools/edit confirm
 tools/edit run
+tools/read confirm
+tools/read run
 ```
 
 ## DESCRIPTION
 
-`sid-editor-tool` is the helper used by the configured `edit` tool.  It is not
-an interactive editor.  In `confirm` mode it simulates mutating editor
-operations in memory and prints a diff preview to standard output.  In `run`
-mode it reads a sid tool request from `REQUEST_FILE`, executes one filesystem
-edit operation relative to `WORKSPACE_ROOT`, and writes a sid tool result to
-`RESULT_FILE`.  The helper process is not chrooted, but editor paths are
-workspace-rooted by the protocol implementation.
+`sid-editor-tool` is the helper used by the configured `edit` and `read`
+tools.  It is not an interactive editor.  In its default mode, `confirm`
+simulates mutating editor operations in memory and prints a diff preview to
+standard output, while `run` reads a sid tool request from `REQUEST_FILE`,
+executes one filesystem edit operation relative to `WORKSPACE_ROOT`, and
+writes a sid tool result to `RESULT_FILE`.  With `--readonly`, the helper
+serves the `read` tool: it previews read requests, formats file contents with
+line numbers, lists directories, and rejects mutating editor commands.  The
+helper process is not chrooted, but editor paths are workspace-rooted by the
+protocol implementation.
 
-The starter `init/tools/edit` script is the normal entrypoint.  It receives
-prefixed rc-conf variables from `sid`, exports the unprefixed environment used
-by `sid-editor-tool`, then execs `sid-editor-tool`.
+The starter `init/tools/edit` and `init/tools/read` scripts are the normal
+entrypoints.  They receive prefixed rc-conf variables from `sid`, export the
+unprefixed environment used by `sid-editor-tool`, then exec `sid-editor-tool`
+with the appropriate mode flags.
 
 ## COMMANDS
 

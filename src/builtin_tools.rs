@@ -138,6 +138,15 @@ struct CreateRequest {
     file_text: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReadOnlyRequest {
+    path: String,
+    command: Option<String>,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    view_range: Option<(u32, u32)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChangedLineRange {
     old_start: usize,
@@ -146,7 +155,27 @@ struct ChangedLineRange {
     new_end: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidEditorToolFlavor {
+    Editor,
+    ReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidEditorToolMode {
+    Confirm,
+    Run,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ResolvedReadOnlyRequest {
+    path: String,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+}
+
 pub async fn run_sid_editor_tool() -> io::Result<()> {
+    let (flavor, mode) = parse_sid_editor_tool_args()?;
     let invocation = ToolInvocation::from_env()?;
     let request = invocation.read_request()?;
     if request.protocol_version != TOOL_PROTOCOL_VERSION {
@@ -162,28 +191,70 @@ pub async fn run_sid_editor_tool() -> io::Result<()> {
         );
     }
 
-    let mode = env::args().nth(1).unwrap_or_else(|| "run".to_string());
-    if mode == "confirm" {
-        let preview = preview_editor_command(
-            &invocation.workspace_root,
-            &invocation.temp_dir,
-            &request.invocation.input,
-        )
+    if mode == SidEditorToolMode::Confirm {
+        let preview = match flavor {
+            SidEditorToolFlavor::Editor => preview_editor_command(
+                &invocation.workspace_root,
+                &invocation.temp_dir,
+                &request.invocation.input,
+            ),
+            SidEditorToolFlavor::ReadOnly => preview_readonly_command(&request.invocation.input),
+        }
         .map_err(|failure| io::Error::new(io::ErrorKind::InvalidInput, failure.message))?;
         println!("{preview}");
         return Ok(());
     }
-    if mode != "run" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported sid-editor-tool mode: {mode}"),
-        ));
-    }
 
-    match execute_editor_command(&invocation.workspace_root, &request.invocation.input).await {
+    let output = match flavor {
+        SidEditorToolFlavor::Editor => {
+            execute_editor_command(&invocation.workspace_root, &request.invocation.input).await
+        }
+        SidEditorToolFlavor::ReadOnly => {
+            execute_readonly_command(&invocation.workspace_root, &request.invocation.input)
+        }
+    };
+    match output {
         Ok(output) => invocation.write_success(&request.request_id, output),
         Err(failure) => invocation.write_failure(&request.request_id, failure),
     }
+}
+
+fn parse_sid_editor_tool_args() -> io::Result<(SidEditorToolFlavor, SidEditorToolMode)> {
+    let mut flavor = SidEditorToolFlavor::Editor;
+    let mut mode = SidEditorToolMode::Run;
+    let mut seen_mode = false;
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--readonly" => {
+                flavor = SidEditorToolFlavor::ReadOnly;
+            }
+            "confirm" => {
+                if seen_mode {
+                    return Err(invalid_sid_editor_tool_usage());
+                }
+                mode = SidEditorToolMode::Confirm;
+                seen_mode = true;
+            }
+            "run" => {
+                if seen_mode {
+                    return Err(invalid_sid_editor_tool_usage());
+                }
+                mode = SidEditorToolMode::Run;
+                seen_mode = true;
+            }
+            _ => return Err(invalid_sid_editor_tool_usage()),
+        }
+    }
+
+    Ok((flavor, mode))
+}
+
+fn invalid_sid_editor_tool_usage() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "usage: sid-editor-tool [--readonly] [confirm|run]",
+    )
 }
 
 fn preview_editor_command(
@@ -272,6 +343,15 @@ fn preview_editor_command_with_diff_command(
             format!("{} is not a supported editor command", command.command),
         )),
     }
+}
+
+fn preview_readonly_command(input: &Map<String, Value>) -> Result<String, ToolFailure> {
+    let request = resolve_readonly_request(input)?;
+    Ok(format!(
+        "Read workspace file: {}{}",
+        request.path,
+        format_readonly_preview_range(request.start_line, request.end_line)
+    ))
 }
 
 fn render_mutating_preview(
@@ -634,6 +714,151 @@ fn map_filesystem_error(err: io::Error) -> ToolFailure {
     ToolFailure::new(code, err.to_string())
 }
 
+fn resolve_readonly_request(
+    input: &Map<String, Value>,
+) -> Result<ResolvedReadOnlyRequest, ToolFailure> {
+    let request = parse_request_input::<ReadOnlyRequest>(input)?;
+    if let Some(command) = request.command.as_deref()
+        && command != "view"
+    {
+        return Err(ToolFailure::new(
+            "unsupported_command",
+            format!("{command} is not a supported readonly command"),
+        ));
+    }
+    if request.view_range.is_some() && (request.start_line.is_some() || request.end_line.is_some())
+    {
+        return Err(ToolFailure::new(
+            "invalid_input",
+            "view_range cannot be combined with start_line or end_line",
+        ));
+    }
+
+    let (start_line, end_line) = if let Some((start, end)) = request.view_range {
+        if start == 0 || end == 0 {
+            return Err(ToolFailure::new(
+                "invalid_input",
+                "view_range values must be >= 1",
+            ));
+        }
+        (Some(i64::from(start)), Some(i64::from(end)))
+    } else {
+        (request.start_line, request.end_line)
+    };
+
+    Ok(ResolvedReadOnlyRequest {
+        path: request.path,
+        start_line,
+        end_line,
+    })
+}
+
+fn format_readonly_preview_range(start_line: Option<i64>, end_line: Option<i64>) -> String {
+    if start_line.is_none() && end_line.is_none() {
+        return String::new();
+    }
+
+    let start = start_line.unwrap_or(1);
+    let end = match end_line {
+        None | Some(-1) => "end".to_string(),
+        Some(end) => end.to_string(),
+    };
+    format!(" lines {start}-{end}")
+}
+
+fn execute_readonly_command(
+    workspace_root: &Path<'_>,
+    input: &Map<String, Value>,
+) -> Result<String, ToolFailure> {
+    let request = resolve_readonly_request(input)?;
+    let path = sanitize_editor_path(workspace_root, &request.path)?;
+    if !path.exists() {
+        return Err(ToolFailure::new(
+            "not_found",
+            format!("file not found: {}", request.path),
+        ));
+    }
+    if path.is_dir() {
+        return list_workspace_directory(&path).map_err(map_filesystem_error);
+    }
+    if !path.is_file() {
+        return Err(ToolFailure::new(
+            "unsupported",
+            format!("not a regular file: {}", request.path),
+        ));
+    }
+
+    let content = fs::read_to_string(path).map_err(map_filesystem_error)?;
+    render_readonly_file(&content, request.start_line, request.end_line)
+}
+
+fn list_workspace_directory(path: &StdPath) -> io::Result<String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        entries.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    entries.sort();
+
+    let mut output = String::new();
+    for entry in entries {
+        output.push_str(&entry);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn render_readonly_file(
+    content: &str,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+) -> Result<String, ToolFailure> {
+    let lines = content.split_terminator('\n').collect::<Vec<_>>();
+    let range = resolve_readonly_line_range(start_line, end_line, lines.len())?;
+    let mut output = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let line_number = idx + 1;
+        if range
+            .map(|(start, end)| (start..=end).contains(&line_number))
+            .unwrap_or(true)
+        {
+            output.push_str(&format!("{line_number:<6}\t{line}\n"));
+        }
+    }
+    Ok(output)
+}
+
+fn resolve_readonly_line_range(
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    total_lines: usize,
+) -> Result<Option<(usize, usize)>, ToolFailure> {
+    if start_line.is_none() && end_line.is_none() {
+        return Ok(None);
+    }
+
+    let mut start = start_line.unwrap_or(1);
+    if start < 1 {
+        start = 1;
+    }
+
+    let mut end = end_line.unwrap_or(-1);
+    if end == -1 {
+        end = total_lines as i64;
+    }
+    if end > total_lines as i64 {
+        end = total_lines as i64;
+    }
+    if start > end {
+        return Err(ToolFailure::new(
+            "invalid_input",
+            format!("start_line ({start}) is greater than end_line ({end})"),
+        ));
+    }
+
+    Ok(Some((start as usize, end as usize)))
+}
+
 fn required_env_var(name: &str) -> io::Result<String> {
     env::var(name)
         .map_err(|err| io::Error::new(io::ErrorKind::NotFound, format!("missing {name}: {err}")))
@@ -843,6 +1068,101 @@ mod tests {
         });
         let preview = preview_editor_command(&root, temp_dir, input.as_object().unwrap()).unwrap();
         assert_eq!(preview, "View workspace file: file.txt lines 2-4");
+    }
+
+    #[test]
+    fn editor_tool_readonly_previews_line_range() {
+        let input = json!({
+            "path": "file.txt",
+            "start_line": 2,
+            "end_line": -1
+        });
+        let preview = preview_readonly_command(input.as_object().unwrap()).unwrap();
+        assert_eq!(preview, "Read workspace file: file.txt lines 2-end");
+    }
+
+    #[test]
+    fn editor_tool_readonly_views_workspace_file_with_line_numbers() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("file.txt").as_str(), "line one\nline two\n").unwrap();
+
+        let input = json!({
+            "path": "file.txt"
+        });
+        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        assert_eq!(output, "1     \tline one\n2     \tline two\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_readonly_views_requested_line_range() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("file.txt").as_str(), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let input = json!({
+            "path": "file.txt",
+            "start_line": 2,
+            "end_line": 3
+        });
+        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        assert_eq!(output, "2     \ttwo\n3     \tthree\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_readonly_accepts_view_range_requests() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("file.txt").as_str(), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let input = json!({
+            "command": "view",
+            "path": "file.txt",
+            "view_range": [2, 4]
+        });
+        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        assert_eq!(output, "2     \ttwo\n3     \tthree\n4     \tfour\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_readonly_lists_directories() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.join("dir").as_str()).unwrap();
+        fs::write(root.join("dir/b.txt").as_str(), "bbb\n").unwrap();
+        fs::write(root.join("dir/a.txt").as_str(), "aaa\n").unwrap();
+
+        let input = json!({
+            "path": "dir"
+        });
+        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        assert_eq!(output, "a.txt\nb.txt\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_readonly_rejects_mutating_commands() {
+        let input = json!({
+            "command": "insert",
+            "path": "file.txt",
+            "insert_line": 1,
+            "insert_text": "hello"
+        });
+        let err =
+            execute_readonly_command(&Path::new("."), input.as_object().unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            ToolFailure::new(
+                "unsupported_command",
+                "insert is not a supported readonly command",
+            )
+        );
     }
 
     #[test]

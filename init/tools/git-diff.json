@@ -1,0 +1,21 @@
+{
+  "protocol_version": 1,
+  "description": "Show changes in the git working tree or between commits. Read-only; never modifies the repository.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "staged": {
+        "type": "boolean",
+        "description": "When true, show only staged (cached) changes. Defaults to false (show unstaged changes)."
+      },
+      "path": {
+        "type": "string",
+        "description": "Optional path to restrict the diff to a specific file or directory."
+      },
+      "ref": {
+        "type": "string",
+        "description": "Optional git ref (commit, branch, tag) to diff against. Defaults to the working tree vs index, or index vs HEAD when staged is true."
+      }
+    }
+  }
+}

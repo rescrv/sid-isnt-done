@@ -1,0 +1,22 @@
+{
+  "protocol_version": 1,
+  "description": "Read a file or a line range from a workspace file. Use this instead of bash when you only need to see file contents.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative path to the file to read."
+      },
+      "start_line": {
+        "type": "integer",
+        "description": "Optional first line to read (1-indexed, inclusive). Omit to read from the beginning."
+      },
+      "end_line": {
+        "type": "integer",
+        "description": "Optional last line to read (1-indexed, inclusive). Use -1 to read to end of file. Omit to read to end."
+      }
+    },
+    "required": ["path"]
+  }
+}

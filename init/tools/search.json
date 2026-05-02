@@ -1,0 +1,30 @@
+{
+  "protocol_version": 1,
+  "description": "Search the workspace for a pattern using ripgrep. Returns matching lines with file paths and line numbers. Use this instead of bash when you need to find occurrences of a string or regex.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Search pattern (regular expression, or a literal string when fixed_strings is true)."
+      },
+      "path": {
+        "type": "string",
+        "description": "Optional directory or file to search within, relative to workspace root. Defaults to the entire workspace."
+      },
+      "fixed_strings": {
+        "type": "boolean",
+        "description": "When true, treat the pattern as a literal string rather than a regex. Defaults to false."
+      },
+      "include": {
+        "type": "string",
+        "description": "Optional glob to restrict searched files, e.g. '*.rs' or '*.py'."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of matching lines to return. Defaults to 200."
+      }
+    },
+    "required": ["pattern"]
+  }
+}

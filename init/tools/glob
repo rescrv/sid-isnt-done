@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+# glob — list workspace files matching a glob pattern.
+#
+# Read-only tool.  Returns matching file paths relative to the workspace root.
+
+lookup() {
+    printenv "$1"
+}
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_REQUEST_FILE" \
+        "${PREFIX}_RESULT_FILE" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_SESSION_ID" \
+        "${PREFIX}_SESSION_DIR" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_TOOL_ID" \
+        "${PREFIX}_TOOL_NAME" \
+        "${PREFIX}_TOOL_PROTOCOL" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+confirm)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    pattern=$(jq -r '.invocation.input.pattern // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+    desc="List files matching '${pattern}'"
+    if [ -n "$path" ]; then desc="${desc} in ${path}"; fi
+    printf '%s\n' "$desc"
+    ;;
+run)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
+    WORKSPACE_ROOT="$(lookup "${PREFIX}_WORKSPACE_ROOT")"
+
+    request_id=$(jq -r '.request_id' "$REQUEST_FILE")
+    pattern=$(jq -r '.invocation.input.pattern // empty' "$REQUEST_FILE")
+    path=$(jq -r '.invocation.input.path // empty' "$REQUEST_FILE")
+
+    write_success() {
+        text="$1"
+        jq -n --arg rid "$request_id" --arg txt "$text" \
+            '{"protocol_version":1,"request_id":$rid,"ok":true,"output":{"kind":"text","text":$txt},"error":null}' \
+            > "$RESULT_FILE"
+    }
+
+    write_error() {
+        code="$1"; msg="$2"
+        jq -n --arg rid "$request_id" --arg c "$code" --arg m "$msg" \
+            '{"protocol_version":1,"request_id":$rid,"ok":false,"output":null,"error":{"code":$c,"message":$m}}' \
+            > "$RESULT_FILE"
+    }
+
+    if [ -z "$pattern" ]; then
+        write_error "invalid_input" "missing required field: pattern"
+        exit 0
+    fi
+
+    # Build search path
+    if [ -n "$path" ]; then
+        if ! search_root=$(sid-path-join "$WORKSPACE_ROOT" "$path"); then
+            write_error "unsupported" "path must be workspace-relative and must not contain '..': ${path}"
+            exit 0
+        fi
+    else
+        search_root="$WORKSPACE_ROOT"
+    fi
+
+    if [ ! -d "$search_root" ]; then
+        write_error "not_found" "directory not found: ${path}"
+        exit 0
+    fi
+
+    # Use find with -name for the glob pattern
+    output=$(cd "$search_root" && find . -name "$pattern" -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/target/*' 2>/dev/null | sed 's|^\./||' | sort)
+
+    if [ -z "$output" ]; then
+        write_success "No files matching '${pattern}' found."
+    else
+        count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+        write_success "${count} files found:
+${output}"
+    fi
+    ;;
+*)
+    echo "usage: $0 [rcvar|confirm|run]" >&2
+    exit 129
+    ;;
+esac

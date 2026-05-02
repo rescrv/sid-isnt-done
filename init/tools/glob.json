@@ -1,0 +1,18 @@
+{
+  "protocol_version": 1,
+  "description": "List workspace files matching a glob pattern. Use this to discover files by name pattern without running bash.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Glob pattern to match file paths against, e.g. '*.rs', 'src/**/*.py', 'Cargo.*'."
+      },
+      "path": {
+        "type": "string",
+        "description": "Optional subdirectory to search within, relative to workspace root. Defaults to the entire workspace."
+      }
+    },
+    "required": ["pattern"]
+  }
+}
