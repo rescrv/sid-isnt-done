@@ -353,6 +353,7 @@ struct SidRuntimeSession {
     current_agent_id: String,
     overrides: SessionOverrides,
     rolled_up_stats: SessionStatsRollup,
+    auto_compact_tokens: Option<u64>,
 }
 
 impl SidRuntimeSession {
@@ -365,6 +366,7 @@ impl SidRuntimeSession {
         config_root: Path<'static>,
         sid_session: Arc<SidSession>,
         current_agent_id: String,
+        auto_compact_tokens: Option<u64>,
     ) -> Self {
         Self {
             client,
@@ -376,6 +378,7 @@ impl SidRuntimeSession {
             current_agent_id,
             overrides: SessionOverrides::default(),
             rolled_up_stats: SessionStatsRollup::default(),
+            auto_compact_tokens,
         }
     }
 
@@ -391,6 +394,15 @@ impl SidRuntimeSession {
         let mut stats = self.chat.stats();
         self.rolled_up_stats.apply(&mut stats);
         stats
+    }
+
+    /// Return `true` when auto-compaction is configured and the session has
+    /// generated at least that many output tokens.
+    fn should_auto_compact(&self) -> bool {
+        match self.auto_compact_tokens {
+            Some(threshold) => self.stats().total_output_tokens >= threshold,
+            None => false,
+        }
     }
 
     async fn send_message(
@@ -549,6 +561,7 @@ impl SidRuntimeSession {
         .with_session(self.sid_session.clone());
         self.overrides.apply_to(next_agent.config_mut());
 
+        self.auto_compact_tokens = next_agent.auto_compact_tokens();
         self.roll_up_current_stats();
 
         let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
@@ -635,6 +648,7 @@ impl SidRuntimeSession {
         .with_session(next_sid_session.clone());
         self.overrides.apply_to(next_agent.config_mut());
         next_agent.config_mut().transcript_path = Some(transcript_path);
+        self.auto_compact_tokens = next_agent.auto_compact_tokens();
 
         let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
         next_chat.replace_messages(compacted_transcript(&parent_session_id, &summary));
@@ -804,6 +818,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         )
         .with_string_field("cause", &err.to_string())
     })?;
+    let auto_compact_tokens = agent.auto_compact_tokens();
     let chat = ChatSession::with_agent(client.clone(), agent);
     let mut session = SidRuntimeSession::new(
         client,
@@ -813,6 +828,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         config_root.clone(),
         sid_session.clone(),
         agent_id.clone(),
+        auto_compact_tokens,
     );
     session.load_resumed_transcript(resumed)?;
 
@@ -856,6 +872,8 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                             let message = claudius::MessageParam::user(content);
                             if let Err(err) = session.send_message(message, &mut terminal).await {
                                 terminal.print_error(&context, &err.to_string());
+                            } else {
+                                maybe_auto_compact(&mut session, &mut terminal, &context).await;
                             }
                         }
                         Ok(None) => {
@@ -1098,6 +1116,8 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                 let message = claudius::MessageParam::user(line);
                 if let Err(err) = session.send_message(message, &mut terminal).await {
                     terminal.print_error(&context, &err.to_string());
+                } else {
+                    maybe_auto_compact(&mut session, &mut terminal, &context).await;
                 }
             }
             Ok(OperatorLine::Interrupted) => {
@@ -1211,6 +1231,34 @@ fn format_agent_label(summary: &AgentSummary) -> String {
     match summary.display_name.as_deref() {
         Some(name) => format!("{} ({name})", summary.id),
         None => summary.id.clone(),
+    }
+}
+
+/// Trigger compaction automatically when the output token threshold is reached.
+async fn maybe_auto_compact(
+    session: &mut SidRuntimeSession,
+    terminal: &mut SidTerminal,
+    context: &(),
+) {
+    if !session.should_auto_compact() {
+        return;
+    }
+    terminal.print_info(
+        context,
+        &format!(
+            "Auto-compacting: output token threshold ({}) reached.",
+            session.auto_compact_tokens.unwrap_or(0),
+        ),
+    );
+    match session.compact().await {
+        Ok(result) => terminal.print_info(
+            context,
+            &format!(
+                "Compacted session {} into {} ({})",
+                result.parent_session_id, result.new_session_id, result.new_session_root
+            ),
+        ),
+        Err(err) => terminal.print_error(context, &format!("Auto-compaction failed: {err}")),
     }
 }
 
@@ -1773,6 +1821,7 @@ mod tests {
         }
         .with_session(sid_session.clone());
         let current_agent_id = agent.id().to_string();
+        let auto_compact_tokens = agent.auto_compact_tokens();
         let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
         let chat = ChatSession::with_agent(client.clone(), agent);
         SidRuntimeSession::new(
@@ -1783,6 +1832,7 @@ mod tests {
             config_root.clone().into_owned(),
             sid_session,
             current_agent_id,
+            auto_compact_tokens,
         )
     }
 

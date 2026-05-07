@@ -198,6 +198,8 @@ pub struct AgentConfig {
     pub agents_md_path: Option<String>,
     /// Shell command executed as a hook to produce additional user instructions.
     pub user_instructions_hook: Option<String>,
+    /// When set, automatically compact the session after this many output tokens.
+    pub auto_compact_tokens: Option<u64>,
 }
 
 impl AgentConfig {
@@ -226,6 +228,10 @@ impl AgentConfig {
         let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
         let user_instructions_hook =
             lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
+        let auto_compact_tokens = match lookup_expanded(&provider, agent, "AUTO_COMPACT")? {
+            Some(value) => Some(parse_u64_field(agent, "AUTO_COMPACT", &value)?),
+            None => None,
+        };
         let prompts =
             load_named_prompts(config_root, rc_conf, agent, KNOWN_AGENT_PROMPTS, "agent")?;
 
@@ -276,6 +282,7 @@ impl AgentConfig {
             agents_md_enabled,
             agents_md_path,
             user_instructions_hook,
+            auto_compact_tokens,
         })
     }
 }

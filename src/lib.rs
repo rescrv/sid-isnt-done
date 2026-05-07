@@ -136,6 +136,7 @@ pub struct SidAgent {
     memory_source: Option<CompactionProvenance>,
     tool_scope: SidToolScope,
     memory_depth: usize,
+    auto_compact_tokens: Option<u64>,
     bash_session: Mutex<Option<BashPtySession>>,
     tool_cancellation_pending: AtomicBool,
     token_usage_totals: StdMutex<TokenUsageTotals>,
@@ -191,6 +192,7 @@ impl SidAgent {
             None,
             SidToolScope::Normal,
             0,
+            None,
         )
     }
 
@@ -354,6 +356,11 @@ impl SidAgent {
         self.enabled == SwitchPosition::Manual
     }
 
+    /// Return the auto-compact threshold in output tokens, if configured.
+    pub fn auto_compact_tokens(&self) -> Option<u64> {
+        self.auto_compact_tokens
+    }
+
     fn append_agents_md_to_system_prompt(&mut self) -> Result<(), SError> {
         append_agents_md_to_system_prompt(
             &mut self.config,
@@ -420,6 +427,7 @@ impl SidAgent {
             None,
             SidToolScope::Normal,
             0,
+            agent_config.auto_compact_tokens,
         ))
     }
 
@@ -441,6 +449,7 @@ impl SidAgent {
         memory_source: Option<CompactionProvenance>,
         tool_scope: SidToolScope,
         memory_depth: usize,
+        auto_compact_tokens: Option<u64>,
     ) -> Self {
         Self {
             id,
@@ -459,6 +468,7 @@ impl SidAgent {
             memory_source,
             tool_scope,
             memory_depth,
+            auto_compact_tokens,
             bash_session: Mutex::new(None),
             tool_cancellation_pending: AtomicBool::new(false),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
