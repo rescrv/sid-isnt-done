@@ -195,7 +195,20 @@ build_THINKING="on"
 : Space-split list of skills to mount.  Use `*` to mount every loaded skill.
 
 `<agent>_MODEL`, `<agent>_SYSTEM`, `<agent>_MAX_TOKENS`
-: Optional model, system prompt, and response-token overrides.
+: Optional model, inline system-prompt override, and response-token overrides.
+
+`<agent>_PROMPT`
+: Optional colon-separated list of markdown files.  Relative paths are resolved
+  under the config root, `~/` expands from `HOME`, all listed files must
+  exist, and their contents are concatenated in order with blank lines.  This
+  becomes the agent's base system prompt before `<agent>_SYSTEM` overrides are
+  applied.
+
+`<agent>_PROMPT_COMPACTION`, `<agent>_PROMPT_MEMORY_EXPERT`
+: Optional named prompt bundles resolved the same way as `<agent>_PROMPT`.
+  `sid` uses `COMPACTION` for the `/compact` request sent to that agent and
+  `MEMORY_EXPERT` for the follow-up addendum used by `ask_an_expert` on
+  compacted sessions.  Other `PROMPT_*` keys are ignored by `sid`.
 
 `<agent>_TEMPERATURE`, `<agent>_TOP_P`, `<agent>_TOP_K`
 : Optional sampling controls.
@@ -238,10 +251,11 @@ build_THINKING="on"
   user turn and appends the hook's standard output to the injected user
   instructions.  The executable must answer `rcvar` and `run`.
 
-The prompt file for an agent is `agents/<agent>.md`.  If the agent is an alias,
-`sid` follows the rc-conf alias lookup order and uses the first matching prompt
-file.  Prompt-file content becomes the agent's system prompt unless overridden
-by `<agent>_SYSTEM`.
+If `<agent>_PROMPT` is unset, the prompt file for an agent is
+`agents/<agent>.md`.  If the agent is an alias, `sid` follows the rc-conf
+alias lookup order and uses the first matching prompt file.  Prompt-file
+content becomes the agent's system prompt unless overridden by
+`<agent>_SYSTEM`.
 
 If `DEFAULT_AGENT` is unset, `sid` starts the first enabled agent.  If no agent
 is enabled, it starts the first manual agent after confirmation.
@@ -264,8 +278,11 @@ in effect after an agent switch until they are changed again.
 `/compact` runs the reserved `compact` agent when it is configured in
 `agents.conf`; otherwise `sid` uses a built-in compaction prompt.  The command
 creates a new child session whose initial transcript is a summary of the prior
-session.  Compacted sessions expose an `ask_an_expert` tool that can consult
-the earlier summary writer by contextual memory.
+session.  Set `compact_PROMPT_COMPACTION` to override the request sent to the
+compactor and `compact_PROMPT_MEMORY_EXPERT` to override the follow-up memory
+mode prompt captured into compacted-session provenance.  Compacted sessions
+expose an `ask_an_expert` tool that can consult the earlier summary writer by
+contextual memory.
 
 ## USER INSTRUCTIONS
 
@@ -406,6 +423,12 @@ format_ALIASES="fmt"
   `view` previews compact, but mutating editor commands render a file summary
   plus a diff preview.  Set `DIFF` to a shell command to filter that unified
   diff, or set `DIFF` empty to show the raw unified diff text.
+
+`<tool>_PROMPT`
+: Optional colon-separated markdown bundle resolved under the config root and
+  concatenated in order.  `sid` loads it into tool config metadata.  Other
+  prompt-shaped tool variables remain available to your rc-style tool scripts,
+  but `sid` does not ingest them unless they become host-owned keys.
 
 `bash`
 : Built-in bash capability.  It is exposed to the model as Anthropic's bash

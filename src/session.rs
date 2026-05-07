@@ -56,6 +56,9 @@ pub struct CompactionExpertConfig {
     /// System prompt the compacting agent was using.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Prompt appended when replaying the summary writer as a memory expert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expert_prompt: Option<String>,
 }
 
 /// Pointer back to the parent session from which a compacted session was derived.
@@ -1106,6 +1109,7 @@ mod tests {
                 agent_id: Some("compact".to_string()),
                 model: "claude-sonnet-4-5".to_string(),
                 system_prompt: Some("Summarize carefully.".to_string()),
+                memory_expert_prompt: Some("Answer from memory only.".to_string()),
             },
         };
 

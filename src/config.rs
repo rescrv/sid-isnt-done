@@ -39,6 +39,38 @@ pub const AGENTS_MD_FILE: &str = "AGENTS.md";
 pub const AGENTS_MD_PATH_ENV: &str = "AGENTS_MD_PATH";
 /// Current version of the sid tool protocol.
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
+/// Conventional name for the primary system prompt in a prompt set.
+pub const SYSTEM_PROMPT_ID: &str = "SYSTEM";
+/// Conventional name for the compaction request prompt in an agent prompt set.
+pub const COMPACTION_PROMPT_ID: &str = "COMPACTION";
+/// Conventional name for the memory-expert addendum prompt in an agent prompt set.
+pub const MEMORY_EXPERT_PROMPT_ID: &str = "MEMORY_EXPERT";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KnownPromptField {
+    id: &'static str,
+    field: &'static str,
+}
+
+const KNOWN_AGENT_PROMPTS: &[KnownPromptField] = &[
+    KnownPromptField {
+        id: SYSTEM_PROMPT_ID,
+        field: "PROMPT",
+    },
+    KnownPromptField {
+        id: COMPACTION_PROMPT_ID,
+        field: "PROMPT_COMPACTION",
+    },
+    KnownPromptField {
+        id: MEMORY_EXPERT_PROMPT_ID,
+        field: "PROMPT_MEMORY_EXPERT",
+    },
+];
+
+const KNOWN_TOOL_PROMPTS: &[KnownPromptField] = &[KnownPromptField {
+    id: SYSTEM_PROMPT_ID,
+    field: "PROMPT",
+}];
 
 /// Fully resolved workspace configuration.
 ///
@@ -111,11 +143,11 @@ impl Config {
 
         let mut agents = BTreeMap::new();
         for agent_name in agent_names {
-            let agent = AgentConfig::from_rc_conf(&agents_dir, &agents_rc_conf, agent_name)?;
+            let agent = AgentConfig::from_rc_conf(&root, &agents_dir, &agents_rc_conf, agent_name)?;
             agents.insert(agent_name.clone(), agent);
         }
 
-        let tools = resolve_tool_configs(&tools_dir, &tools_rc_conf, tool_names)?;
+        let tools = resolve_tool_configs(&root, &tools_dir, &tools_rc_conf, tool_names)?;
 
         Ok(Self {
             root,
@@ -150,8 +182,12 @@ pub struct AgentConfig {
     pub skills: Vec<String>,
     /// Filesystem path to the agent's system prompt markdown file.
     pub prompt_path: Path<'static>,
+    /// Filesystem paths that contributed to the agent's system prompt.
+    pub prompt_paths: Vec<Path<'static>>,
     /// Loaded system prompt markdown content, or `None` when the file is absent.
     pub prompt_markdown: Option<String>,
+    /// Additional named markdown prompts loaded for the agent.
+    pub prompts: BTreeMap<String, PromptConfig>,
     /// Merged chat configuration (model, thinking budget, etc.).
     pub chat_config: ChatConfig,
     /// Whether user-instruction injection is enabled for this agent.
@@ -165,7 +201,12 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    fn from_rc_conf(agents_dir: &Path, rc_conf: &RcConf, agent: &str) -> Result<Self, SError> {
+    fn from_rc_conf(
+        config_root: &Path,
+        agents_dir: &Path,
+        rc_conf: &RcConf,
+        agent: &str,
+    ) -> Result<Self, SError> {
         let provider = rc_conf.variable_provider_for(agent).map_err(|err| {
             SError::new("config")
                 .with_code("rc_conf_error")
@@ -185,13 +226,33 @@ impl AgentConfig {
         let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
         let user_instructions_hook =
             lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
+        let prompts =
+            load_named_prompts(config_root, rc_conf, agent, KNOWN_AGENT_PROMPTS, "agent")?;
 
-        let prompt_path = resolve_agent_prompt_path(agents_dir, rc_conf, agent);
-        let prompt_markdown = if prompt_path.exists() {
-            Some(read_utf8_file(&prompt_path, agent, "prompt")?)
-        } else {
-            None
-        };
+        let default_prompt_path = resolve_agent_prompt_path(agents_dir, rc_conf, agent);
+        let (prompt_path, prompt_paths, prompt_markdown) =
+            if let Some(system_prompt) = prompts.get(SYSTEM_PROMPT_ID) {
+                (
+                    system_prompt
+                        .paths
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| default_prompt_path.clone()),
+                    system_prompt.paths.clone(),
+                    Some(system_prompt.markdown.clone()),
+                )
+            } else if default_prompt_path.exists() {
+                (
+                    default_prompt_path.clone(),
+                    vec![default_prompt_path.clone()],
+                    Some(read_utf8_file(&default_prompt_path, agent, "prompt")?),
+                )
+            } else {
+                (default_prompt_path, vec![], None)
+            };
+
+        let mut non_system_prompts = prompts;
+        non_system_prompts.remove(SYSTEM_PROMPT_ID);
 
         let mut chat_config = ChatConfig::new();
         if let Some(prompt) = prompt_markdown.as_ref() {
@@ -207,7 +268,9 @@ impl AgentConfig {
             tools,
             skills,
             prompt_path,
+            prompt_paths,
             prompt_markdown,
+            prompts: non_system_prompts,
             chat_config,
             user_instructions_enabled,
             agents_md_enabled,
@@ -237,6 +300,8 @@ pub struct ToolConfig {
     pub manifest_path: Path<'static>,
     /// Parsed manifest, or `None` when the manifest is optional and absent.
     pub manifest: Option<ToolManifest>,
+    /// Additional named markdown prompts loaded for the tool.
+    pub prompts: BTreeMap<String, PromptConfig>,
 }
 
 /// Parsed content of a tool manifest JSON file.
@@ -252,6 +317,17 @@ pub struct ToolManifest {
     pub description: String,
     /// JSON-Schema describing the tool's input parameters.
     pub input_schema: serde_json::Value,
+}
+
+/// Parsed content of a named prompt assembled from one or more markdown files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptConfig {
+    /// Prompt identifier such as `SYSTEM` or `COMPACTION`.
+    pub id: String,
+    /// Absolute paths to the markdown files that were concatenated.
+    pub paths: Vec<Path<'static>>,
+    /// Concatenated markdown content.
+    pub markdown: String,
 }
 
 /// Per-skill configuration loaded from a markdown file in the skills directory.
@@ -273,6 +349,7 @@ struct ToolManifestFile {
 }
 
 fn resolve_tool_configs(
+    config_root: &Path,
     tools_dir: &Path,
     rc_conf: &RcConf,
     tool_names: &[String],
@@ -319,6 +396,8 @@ fn resolve_tool_configs(
     for tool_id in tool_names {
         let enabled = resolve_tool_switch(rc_conf, tool_id)?;
         let confirm_preview = resolve_tool_confirm_preview(rc_conf, tool_id)?;
+        let prompts =
+            load_named_prompts(config_root, rc_conf, tool_id, KNOWN_TOOL_PROMPTS, "tool")?;
         let canonical_id = resolved_ids
             .get(tool_id)
             .expect("resolved tool id should exist")
@@ -335,6 +414,7 @@ fn resolve_tool_configs(
                 executable_path: executable_path.clone(),
                 manifest_path: manifest_path.clone(),
                 manifest: manifest.clone(),
+                prompts,
             },
         );
     }
@@ -693,6 +773,38 @@ fn read_utf8_file(path: &Path, name: &str, field: &str) -> Result<String, SError
     })
 }
 
+fn load_named_prompts(
+    config_root: &Path,
+    rc_conf: &RcConf,
+    service: &str,
+    known_prompts: &[KnownPromptField],
+    scope_kind: &str,
+) -> Result<BTreeMap<String, PromptConfig>, SError> {
+    let provider = rc_conf.variable_provider_for(service).map_err(|err| {
+        SError::new("config")
+            .with_code("rc_conf_error")
+            .with_message("failed to derive config from rc_conf")
+            .with_string_field("scope", service)
+            .with_string_field("kind", scope_kind)
+            .with_string_field("cause", &format!("{err:?}"))
+    })?;
+
+    let mut prompts = BTreeMap::new();
+    for (prompt, value) in collect_prompt_fields(&provider, service, known_prompts)? {
+        let paths = resolve_prompt_paths(config_root, service, prompt.field, &value)?;
+        let markdown = read_markdown_files(&paths, service, prompt.field)?;
+        prompts.insert(
+            prompt.id.to_string(),
+            PromptConfig {
+                id: prompt.id.to_string(),
+                paths,
+                markdown,
+            },
+        );
+    }
+    Ok(prompts)
+}
+
 fn resolve_agent_prompt_path(agents_dir: &Path, rc_conf: &RcConf, agent: &str) -> Path<'static> {
     for candidate in rc_conf.alias_lookup_order(agent).0 {
         let path = agents_dir.join(format!("{candidate}.md")).into_owned();
@@ -701,6 +813,96 @@ fn resolve_agent_prompt_path(agents_dir: &Path, rc_conf: &RcConf, agent: &str) -
         }
     }
     agents_dir.join(format!("{agent}.md")).into_owned()
+}
+
+fn collect_prompt_fields(
+    provider: &impl VariableProvider,
+    scope: &str,
+    known_prompts: &[KnownPromptField],
+) -> Result<Vec<(KnownPromptField, String)>, SError> {
+    let mut prompts = Vec::new();
+    for prompt in known_prompts {
+        if let Some(value) = lookup_expanded(provider, scope, prompt.field)? {
+            prompts.push((*prompt, value));
+        }
+    }
+    Ok(prompts)
+}
+
+fn resolve_prompt_paths(
+    config_root: &Path,
+    scope: &str,
+    field: &str,
+    value: &str,
+) -> Result<Vec<Path<'static>>, SError> {
+    let mut paths = Vec::new();
+    for component in value.split(':') {
+        let component = component.trim();
+        if component.is_empty() {
+            continue;
+        }
+        let path = resolve_prompt_path_component(config_root, component);
+        let path = Path::try_from(path).map_err(|err| {
+            invalid_config_field(
+                scope,
+                field,
+                value,
+                format!("prompt path {component:?} is not valid UTF-8: {err:?}"),
+            )
+        })?;
+        if !path.is_file() {
+            return Err(SError::new("config")
+                .with_code("missing_prompt_file")
+                .with_message("configured prompt markdown file does not exist")
+                .with_string_field("scope", scope)
+                .with_string_field("field", field)
+                .with_string_field("path", path.as_str()));
+        }
+        paths.push(path.into_owned());
+    }
+    if paths.is_empty() {
+        return Err(invalid_config_field(
+            scope,
+            field,
+            value,
+            "expected one or more colon-separated markdown file paths",
+        ));
+    }
+    Ok(paths)
+}
+
+fn resolve_prompt_path_component(config_root: &Path, component: &str) -> std::path::PathBuf {
+    if let Some(rest) = component.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+
+    let path = std::path::PathBuf::from(component);
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::PathBuf::from(config_root.as_str()).join(path)
+    }
+}
+
+fn read_markdown_files(
+    paths: &[Path<'static>],
+    scope: &str,
+    field: &str,
+) -> Result<String, SError> {
+    let mut output = String::new();
+    for path in paths {
+        let content = read_utf8_file(path, scope, field)?;
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(content.trim_end());
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 fn lookup_expanded(
@@ -1094,6 +1296,143 @@ format_ALIASES="fmt"
         assert_eq!(bash.enabled, SwitchPosition::Yes);
         assert!(!bash.confirm_preview);
         assert!(bash.executable_path.is_none());
+    }
+
+    #[test]
+    fn named_prompt_sets_load_from_markdown_files() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("prompts").as_str()).unwrap();
+        fs::create_dir_all(root.join("tool-prompts").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+build_ENABLED="YES"
+build_PROMPT='agents/base.md:agents/build.md'
+build_PROMPT_COMPACTION='prompts/common.md:prompts/compact.md'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            r#"
+fmt_ENABLED="YES"
+fmt_PROMPT='tool-prompts/base.md:tool-prompts/review.md'
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("agents/base.md").as_str(), "# Base\n").unwrap();
+        fs::write(
+            root.join("agents/build.md").as_str(),
+            "Use the build plan.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("prompts/common.md").as_str(),
+            "Summarize the session.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("prompts/compact.md").as_str(),
+            "Write only the handoff.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tool-prompts/base.md").as_str(),
+            "Review output.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tool-prompts/review.md").as_str(),
+            "Focus on bugs.\n",
+        )
+        .unwrap();
+        write_tool_contract(&root, "fmt", "Format files.");
+
+        let config = Config::load(&root).unwrap();
+
+        let build = config.agents.get("build").unwrap();
+        assert_eq!(
+            build.prompt_paths,
+            vec![root.join("agents/base.md"), root.join("agents/build.md")]
+        );
+        assert_eq!(
+            build.prompt_markdown.as_deref(),
+            Some("# Base\n\nUse the build plan.\n")
+        );
+        let compaction = build.prompts.get("COMPACTION").unwrap();
+        assert_eq!(
+            compaction.paths,
+            vec![
+                root.join("prompts/common.md"),
+                root.join("prompts/compact.md"),
+            ]
+        );
+        assert_eq!(
+            compaction.markdown,
+            "Summarize the session.\n\nWrite only the handoff.\n"
+        );
+
+        let fmt = config.tools.get("fmt").unwrap();
+        let tool_prompt = fmt.prompts.get(SYSTEM_PROMPT_ID).unwrap();
+        assert_eq!(
+            tool_prompt.paths,
+            vec![
+                root.join("tool-prompts/base.md"),
+                root.join("tool-prompts/review.md"),
+            ]
+        );
+        assert_eq!(tool_prompt.markdown, "Review output.\n\nFocus on bugs.\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn unknown_prompt_keys_are_ignored() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+build_ENABLED="YES"
+build_PROMPT_REVIEW='agents/missing.md'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tools.conf").as_str(),
+            r#"
+fmt_ENABLED="YES"
+fmt_PROMPT_REVIEW='tool-prompts/missing.md'
+"#,
+        )
+        .unwrap();
+        write_tool_contract(&root, "fmt", "Format files.");
+
+        let config = Config::load(&root).unwrap();
+        assert!(config.agents.get("build").unwrap().prompts.is_empty());
+        assert!(config.tools.get("fmt").unwrap().prompts.is_empty());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn missing_named_prompt_file_is_reported() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_PROMPT='agents/missing.md'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let err = Config::load(&root).unwrap_err().to_string();
+        assert!(err.contains("missing_prompt_file"));
+        assert!(err.contains("agents/missing.md"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]

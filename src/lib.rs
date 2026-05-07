@@ -54,8 +54,8 @@ use tokio::sync::Mutex;
 use utf8path::Path;
 
 use crate::config::{
-    AGENTS_CONF_FILE, AgentConfig, Config, SkillConfig, TOOLS_CONF_FILE, ToolConfig,
-    is_valid_anthropic_tool_name, resolve_canonical_tool_id,
+    AGENTS_CONF_FILE, AgentConfig, Config, MEMORY_EXPERT_PROMPT_ID, SYSTEM_PROMPT_ID, SkillConfig,
+    TOOLS_CONF_FILE, ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
 use crate::seatbelt::WritableRoots;
@@ -123,6 +123,7 @@ pub struct SidAgent {
     id: String,
     enabled: SwitchPosition,
     config: ChatConfig,
+    named_prompts: BTreeMap<String, String>,
     tools: Vec<Arc<dyn Tool<Self>>>,
     builtin_bindings: BuiltinToolBindings,
     skills: Vec<SkillConfig>,
@@ -177,6 +178,7 @@ impl SidAgent {
             id,
             SwitchPosition::Yes,
             config,
+            BTreeMap::new(),
             vec![],
             BuiltinToolBindings::default(),
             Vec::new(),
@@ -386,6 +388,11 @@ impl SidAgent {
 
         let built_tools = build_tools(config, agent_config)?;
         let mut chat_config = merged_chat_config(agent_config, fallback);
+        let named_prompts = agent_config
+            .prompts
+            .iter()
+            .map(|(id, prompt)| (id.clone(), prompt.markdown.clone()))
+            .collect();
         let skills = resolve_agent_skills(config, agent_config)?;
         let agent_skills = skills.iter().map(|skill| (*skill).clone()).collect();
         let filesystem = build_agent_filesystem(&workspace_root, config, agent_config)?;
@@ -400,6 +407,7 @@ impl SidAgent {
             agent.to_string(),
             agent_config.enabled,
             chat_config,
+            named_prompts,
             built_tools.tools,
             built_tools.builtin_bindings,
             agent_skills,
@@ -420,6 +428,7 @@ impl SidAgent {
         id: String,
         enabled: SwitchPosition,
         config: ChatConfig,
+        named_prompts: BTreeMap<String, String>,
         tools: Vec<Arc<dyn Tool<Self>>>,
         builtin_bindings: BuiltinToolBindings,
         skills: Vec<SkillConfig>,
@@ -437,6 +446,7 @@ impl SidAgent {
             id,
             enabled,
             config,
+            named_prompts,
             tools,
             builtin_bindings,
             skills,
@@ -491,6 +501,11 @@ impl SidAgent {
             agent_id: Some(self.id.clone()),
             model: self.config.model().to_string(),
             system_prompt: self.config.system_prompt_text().map(str::to_string),
+            memory_expert_prompt: Some(
+                self.named_prompt_markdown(MEMORY_EXPERT_PROMPT_ID)
+                    .unwrap_or(MEMORY_EXPERT_PROMPT_ADDENDUM)
+                    .to_string(),
+            ),
         }
     }
 
@@ -787,10 +802,14 @@ impl SidAgent {
             .parse()
             .unwrap_or_else(|_| Model::Custom(snapshot.model.clone()));
         config.set_model(model);
+        let memory_expert_prompt = snapshot
+            .memory_expert_prompt
+            .as_deref()
+            .unwrap_or(MEMORY_EXPERT_PROMPT_ADDENDUM);
         config.set_system_prompt(Some(format!(
             "{}{}",
             snapshot.system_prompt.as_deref().unwrap_or_default(),
-            MEMORY_EXPERT_PROMPT_ADDENDUM
+            memory_expert_prompt
         )));
 
         Self::new_custom(
@@ -858,6 +877,14 @@ impl SidAgent {
             tool_use_id,
             input,
         )
+    }
+
+    /// Return the markdown for a resolved named prompt.
+    pub fn named_prompt_markdown(&self, prompt_id: &str) -> Option<&str> {
+        if prompt_id == SYSTEM_PROMPT_ID {
+            return self.config.system_prompt_text();
+        }
+        self.named_prompts.get(prompt_id).map(String::as_str)
     }
 
     async fn invoke_rc_tool(
@@ -3273,6 +3300,54 @@ mod tests {
     }
 
     #[test]
+    fn from_config_exposes_named_agent_prompts_and_snapshot_memory_prompt() {
+        let root = temp_config_root("agent-prompts");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+build_ENABLED="YES"
+build_PROMPT_COMPACTION='agents/compact-request.md'
+build_PROMPT_MEMORY_EXPERT='agents/memory-expert.md'
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        fs::write(
+            root.join("agents/compact-request.md").as_str(),
+            "Write the summary as bullets.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("agents/memory-expert.md").as_str(),
+            "\n\n# Memory mode\n\nAnswer from the saved summary only.\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        assert_eq!(
+            agent.named_prompt_markdown("COMPACTION"),
+            Some("Write the summary as bullets.\n")
+        );
+        assert_eq!(
+            agent.named_prompt_markdown("MEMORY_EXPERT"),
+            Some("\n\n# Memory mode\n\nAnswer from the saved summary only.\n")
+        );
+        assert_eq!(agent.named_prompt_markdown("MISSING"), None);
+
+        let snapshot = agent.compaction_snapshot();
+        assert_eq!(
+            snapshot.memory_expert_prompt.as_deref(),
+            Some("\n\n# Memory mode\n\nAnswer from the saved summary only.\n")
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn from_workspace_prefers_workspace_agent_and_fills_from_fallback() {
         let root = temp_config_root("agent");
         write_sample_config(&root);
@@ -3588,6 +3663,7 @@ compact_TOOLS='bash'
                     agent_id: Some(DEFAULT_COMPACTOR_AGENT_ID.to_string()),
                     model: "claude-sonnet-4-5".to_string(),
                     system_prompt: Some("Summarize carefully.".to_string()),
+                    memory_expert_prompt: Some("Answer from memory only.".to_string()),
                 },
             },
         )

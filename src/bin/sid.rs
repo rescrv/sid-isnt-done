@@ -18,7 +18,9 @@ use claudius::chat::{
 use claudius::{Anthropic, Model};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
-use sid_isnt_done::config::{AGENTS_CONF_FILE, Config as SidConfig, TOOLS_CONF_FILE};
+use sid_isnt_done::config::{
+    AGENTS_CONF_FILE, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
+};
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
     seatbelt, session, session::SidSession,
@@ -560,13 +562,17 @@ impl SidRuntimeSession {
             .apply_to_without_system_prompt(compactor.config_mut());
 
         let expert = compactor.compaction_snapshot();
+        let compaction_prompt = compactor
+            .named_prompt_markdown(COMPACTION_PROMPT_ID)
+            .unwrap_or(COMPACTION_REQUEST_PROMPT)
+            .to_string();
         let mut compactor_chat = ChatSession::with_agent(self.client.clone(), compactor);
         compactor_chat.replace_messages(messages);
 
         let mut renderer = QuietRenderer;
         compactor_chat
             .send_message(
-                claudius::MessageParam::user(COMPACTION_REQUEST_PROMPT),
+                claudius::MessageParam::user(compaction_prompt),
                 &mut renderer,
             )
             .await
