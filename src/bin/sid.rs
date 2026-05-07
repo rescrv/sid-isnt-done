@@ -15,7 +15,7 @@ use claudius::chat::{
     ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, SessionStats,
     help_text, parse_command,
 };
-use claudius::{Anthropic, Model};
+use claudius::{Anthropic, Effort, Model};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{
@@ -277,6 +277,8 @@ struct SessionOverrides {
     top_k: Option<Option<u32>>,
     stop_sequences: Option<Option<Vec<String>>>,
     thinking_budget: Option<Option<u32>>,
+    thinking_adaptive: Option<Option<Effort>>,
+    effort: Option<Option<Effort>>,
     session_budget: Option<Option<u64>>,
     caching_enabled: Option<bool>,
 }
@@ -306,6 +308,12 @@ impl SessionOverrides {
         }
         if let Some(thinking_budget) = self.thinking_budget {
             config.set_thinking_budget(thinking_budget);
+        }
+        if let Some(effort) = self.thinking_adaptive {
+            config.set_thinking_adaptive(effort);
+        }
+        if let Some(effort) = self.effort {
+            config.set_effort(effort);
         }
         if let Some(session_budget) = self.session_budget {
             config.set_session_budget(session_budget);
@@ -486,6 +494,16 @@ impl SidRuntimeSession {
     fn set_thinking_budget(&mut self, thinking_budget: Option<u32>) {
         self.chat.config_mut().set_thinking_budget(thinking_budget);
         self.overrides.thinking_budget = Some(thinking_budget);
+    }
+
+    fn set_thinking_adaptive(&mut self, effort: Option<Effort>) {
+        self.chat.config_mut().set_thinking_adaptive(effort);
+        self.overrides.thinking_adaptive = Some(effort);
+    }
+
+    fn set_effort(&mut self, effort: Option<Effort>) {
+        self.chat.config_mut().set_effort(effort);
+        self.overrides.effort = Some(effort);
     }
 
     fn set_session_budget(&mut self, session_budget: Option<u64>) {
@@ -996,6 +1014,27 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                                 }
                             }
                         }
+                        ChatCommand::ThinkingAdaptive => {
+                            let effort = session.config().effort();
+                            session.set_thinking_adaptive(effort);
+                            terminal.print_info(&context, "Adaptive thinking enabled.");
+                        }
+                        ChatCommand::Effort(effort) => {
+                            session.set_effort(Some(effort));
+                            let label = match effort {
+                                Effort::Low => "low",
+                                Effort::Medium => "medium",
+                                Effort::High => "high",
+                            };
+                            terminal.print_info(
+                                &context,
+                                &format!("Effort level set to {label}."),
+                            );
+                        }
+                        ChatCommand::ClearEffort => {
+                            session.set_effort(None);
+                            terminal.print_info(&context, "Effort level cleared.");
+                        }
                         ChatCommand::Budget(tokens) => {
                             session.set_session_budget(Some(tokens));
                             terminal.print_info(
@@ -1324,6 +1363,22 @@ fn parse_confirmation(input: &str) -> Option<bool> {
     }
 }
 
+fn describe_thinking(stats: &SessionStats) -> String {
+    if stats.thinking_adaptive {
+        match stats.effort {
+            Some(Effort::Low) => "adaptive (effort: low)".to_string(),
+            Some(Effort::Medium) => "adaptive (effort: medium)".to_string(),
+            Some(Effort::High) => "adaptive (effort: high)".to_string(),
+            None => "adaptive".to_string(),
+        }
+    } else {
+        match stats.thinking_budget {
+            Some(budget) => format!("enabled ({budget} tokens)"),
+            None => "disabled".to_string(),
+        }
+    }
+}
+
 fn print_stats(stats: &SessionStats) {
     println!("    Session Statistics:");
     println!("      Model: {}", stats.model);
@@ -1337,13 +1392,7 @@ fn print_stats(stats: &SessionStats) {
     } else {
         println!("      System prompt: (none)");
     }
-    println!(
-        "      Thinking: {}",
-        match stats.thinking_budget {
-            Some(budget) => format!("enabled ({budget} tokens)"),
-            None => "disabled".to_string(),
-        }
-    );
+    println!("      Thinking: {}", describe_thinking(stats));
     print_stop_sequences(&stats.stop_sequences);
     println!(
         "      Total tokens: {} in / {} out ({} requests)",
@@ -1377,13 +1426,7 @@ fn print_config(stats: &SessionStats) {
     println!("      Temperature: {}", describe_float(stats.temperature));
     println!("      Top-p: {}", describe_float(stats.top_p));
     println!("      Top-k: {}", describe_top_k(stats.top_k));
-    println!(
-        "      Thinking: {}",
-        match stats.thinking_budget {
-            Some(budget) => format!("enabled ({budget} tokens)"),
-            None => "disabled".to_string(),
-        }
-    );
+    println!("      Thinking: {}", describe_thinking(stats));
     println!(
         "      Caching: {}",
         if stats.caching_enabled {
