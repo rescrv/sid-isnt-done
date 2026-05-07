@@ -1131,22 +1131,19 @@ fn detect_moves(diff: &Diff, analysis: &mut Analysis) {
         .collect();
     let mut used_adds = HashSet::new();
 
-    for remove in removes {
+    for add in &adds {
+        let add_key = (add.file, add.hunk, add.start);
         let mut best: Option<(&RunRef, f32)> = None;
-        for add in &adds {
-            let add_key = (add.file, add.hunk, add.start);
-            if used_adds.contains(&add_key) {
-                continue;
-            }
+        for remove in &removes {
             let score = run_similarity(&remove.normalized, &add.normalized);
             if score >= 0.68 && best.is_none_or(|(_, best_score)| score > best_score) {
-                best = Some((*add, score));
+                best = Some((*remove, score));
             }
         }
-        let Some((add, _score)) = best else {
+        let Some((remove, _score)) = best else {
             continue;
         };
-        used_adds.insert((add.file, add.hunk, add.start));
+        used_adds.insert(add_key);
         let len = min(remove.len, add.len);
         let move_id = analysis.moves.len();
         analysis.moves.push(MoveBlock {
@@ -1218,7 +1215,7 @@ fn run_similarity(remove: &[String], add: &[String]) -> f32 {
     if common < MOVE_MIN_LINES {
         return 0.0;
     }
-    common as f32 / max(remove.len(), add.len()) as f32
+    common as f32 / min(remove.len(), add.len()) as f32
 }
 
 fn detect_roles(pairs: &[ChangePair]) -> Vec<RoleGroup> {
@@ -1877,10 +1874,15 @@ fn render_diff_line(
     if meta.is_some_and(|meta| meta.paired_with.is_none())
         && matches!(line.op, DiffOp::Add | DiffOp::Remove)
     {
-        let path = match line.op {
-            DiffOp::Add => display_new_path(&diff.files[id.file]),
-            DiffOp::Remove => display_old_path(&diff.files[id.file]),
-            DiffOp::Context | DiffOp::Note => display_path(&diff.files[id.file]),
+        let move_block = meta
+            .and_then(|meta| meta.move_id)
+            .and_then(|move_id| analysis.moves.get(move_id));
+        let path = match (line.op, move_block) {
+            (DiffOp::Add, Some(block)) => display_old_path(&diff.files[block.remove_file]),
+            (DiffOp::Remove, Some(block)) => display_new_path(&diff.files[block.add_file]),
+            (DiffOp::Add, None) => display_new_path(&diff.files[id.file]),
+            (DiffOp::Remove, None) => display_old_path(&diff.files[id.file]),
+            (DiffOp::Context | DiffOp::Note, _) => display_path(&diff.files[id.file]),
         };
         line_out.push_str(&paint_fg(
             &format!("  [{path}]"),
@@ -1902,6 +1904,8 @@ fn render_content(
     if content.is_empty() {
         return String::new();
     }
+    let mute_moved_addition = op == DiffOp::Add
+        && meta.is_some_and(|meta| meta.move_id.is_some() && meta.paired_with.is_none());
     let boundaries = span_boundaries(content, meta, syntax);
     let mut out = String::new();
     for pair in boundaries.windows(2) {
@@ -1926,6 +1930,7 @@ fn render_content(
             novelty,
             syntax_class,
             role.and_then(|idx| roles.get(idx)),
+            mute_moved_addition,
             options,
         ));
     }
@@ -1986,23 +1991,29 @@ fn style_span(
     novelty: NoveltyWeight,
     syntax: Option<SyntaxClass>,
     role: Option<&RoleGroup>,
+    mute_moved_addition: bool,
     options: SidiffOptions,
 ) -> String {
     if !options.use_color {
         return text.to_string();
     }
-    let mut fg = match (op, novelty) {
-        (DiffOp::Add, NoveltyWeight::Full) => Rgb::new(80, 235, 150),
-        (DiffOp::Remove, NoveltyWeight::Full) => Rgb::new(255, 105, 115),
-        (DiffOp::Add, NoveltyWeight::Muted) | (DiffOp::Remove, NoveltyWeight::Muted) => {
-            Rgb::new(125, 125, 125)
+    let mut fg = if mute_moved_addition {
+        Rgb::new(125, 125, 125)
+    } else {
+        match (op, novelty) {
+            (DiffOp::Add, NoveltyWeight::Full) => Rgb::new(80, 235, 150),
+            (DiffOp::Remove, NoveltyWeight::Full) => Rgb::new(255, 105, 115),
+            (DiffOp::Add, NoveltyWeight::Muted) | (DiffOp::Remove, NoveltyWeight::Muted) => {
+                Rgb::new(125, 125, 125)
+            }
+            (DiffOp::Add, NoveltyWeight::Unchanged) => Rgb::new(100, 155, 120),
+            (DiffOp::Remove, NoveltyWeight::Unchanged) => Rgb::new(165, 95, 100),
+            (DiffOp::Context, _) => syntax_color(syntax).unwrap_or(Rgb::new(205, 205, 205)),
+            (DiffOp::Note, _) => Rgb::new(150, 150, 150),
         }
-        (DiffOp::Add, NoveltyWeight::Unchanged) => Rgb::new(100, 155, 120),
-        (DiffOp::Remove, NoveltyWeight::Unchanged) => Rgb::new(165, 95, 100),
-        (DiffOp::Context, _) => syntax_color(syntax).unwrap_or(Rgb::new(205, 205, 205)),
-        (DiffOp::Note, _) => Rgb::new(150, 150, 150),
     };
-    if matches!(op, DiffOp::Add | DiffOp::Remove)
+    if !mute_moved_addition
+        && matches!(op, DiffOp::Add | DiffOp::Remove)
         && novelty == NoveltyWeight::Unchanged
         && let Some(syntax_color) = syntax_color(syntax)
     {
@@ -2190,6 +2201,48 @@ diff --git a/a.rs b/a.rs
                 .count()
                 >= 6
         );
+    }
+
+    #[test]
+    fn moved_additions_render_muted_instead_of_bright_green() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,4 +1,1 @@
+-moved alpha
+-moved beta
+-moved gamma
+ stay
+@@ -10,1 +7,4 @@
+ elsewhere
++moved alpha
++moved beta
++moved gamma
+";
+        let diff = parse_unified_diff(input);
+        let analysis = analyze_diff(&diff);
+        let hunk = &diff.files[0].hunks[1];
+        let (line_idx, line) = hunk
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.op == DiffOp::Add && line.content == "moved alpha")
+            .unwrap();
+        let rendered = render_diff_line(
+            &diff,
+            &analysis,
+            LineId {
+                file: 0,
+                hunk: 1,
+                line: line_idx,
+            },
+            line,
+            SidiffOptions::default(),
+        );
+        assert!(rendered.contains(" + "));
+        assert!(rendered.contains("\x1b[38;2;125;125;125mmoved alpha\x1b[0m"));
+        assert!(!rendered.contains("\x1b[38;2;80;235;150mmoved alpha\x1b[0m"));
     }
 
     #[test]
