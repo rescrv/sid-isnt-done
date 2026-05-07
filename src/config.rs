@@ -671,7 +671,7 @@ fn apply_chat_config_overrides(
     }
     if let Some(thinking) = lookup_expanded(provider, agent, "THINKING")? {
         chat_config.template.thinking =
-            parse_thinking_budget(agent, "THINKING", &thinking)?.map(ThinkingConfig::enabled);
+            parse_thinking_budget(agent, "THINKING", &thinking)?;
     }
     if let Some(use_color) = lookup_expanded(provider, agent, "USE_COLOR")? {
         chat_config.use_color = parse_bool_field(agent, "USE_COLOR", &use_color)?;
@@ -1002,11 +1002,18 @@ fn parse_bool_field(scope: &str, field: &str, value: &str) -> Result<bool, SErro
     }
 }
 
-fn parse_thinking_budget(scope: &str, field: &str, value: &str) -> Result<Option<u32>, SError> {
+fn parse_thinking_budget(
+    scope: &str,
+    field: &str,
+    value: &str,
+) -> Result<Option<ThinkingConfig>, SError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "off" | "false" | "no" | "disable" | "disabled" => Ok(None),
-        "on" | "true" | "yes" | "enable" | "enabled" => Ok(Some(DEFAULT_THINKING_BUDGET)),
-        _ => parse_u32_field(scope, field, value).map(Some),
+        "on" | "true" | "yes" | "enable" | "enabled" => {
+            Ok(Some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET)))
+        }
+        "adaptive" => Ok(Some(ThinkingConfig::adaptive())),
+        _ => parse_u32_field(scope, field, value).map(|v| Some(ThinkingConfig::enabled(v))),
     }
 }
 
