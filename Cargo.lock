@@ -1220,6 +1220,7 @@ dependencies = [
  "ctrlc",
  "getopts",
  "handled",
+ "libc",
  "rc_conf",
  "rustyline",
  "serde",

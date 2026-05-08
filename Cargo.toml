@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+libc = "0.2"
 ctrlc = { version = "3.5", features = ["termination"] }
 getopts = "0.2.24"
 rustyline = "17.0"

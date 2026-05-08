@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 
 use claudius::chat::ChatConfig;
 use claudius::{Model, ThinkingConfig};
@@ -287,6 +288,13 @@ impl AgentConfig {
     }
 }
 
+/// Default tool execution timeout: 2 minutes.
+///
+/// Applied to all tools that do not specify an explicit `TIMEOUT` in
+/// `tools.conf`.  A per-tool `TIMEOUT` of `"0"` disables the timeout for
+/// that tool.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Configuration for a single tool declared in `tools.conf`.
 ///
 /// Tools are external executables that speak the sid tool protocol.  The
@@ -309,6 +317,11 @@ pub struct ToolConfig {
     pub manifest: Option<ToolManifest>,
     /// Additional named markdown prompts loaded for the tool.
     pub prompts: BTreeMap<String, PromptConfig>,
+    /// Maximum execution time, or `None` for no timeout.
+    ///
+    /// Defaults to [`DEFAULT_TOOL_TIMEOUT`] when omitted in `tools.conf`.
+    /// Set `TIMEOUT="0"` in `tools.conf` to disable the timeout for a tool.
+    pub timeout: Option<Duration>,
 }
 
 /// Parsed content of a tool manifest JSON file.
@@ -403,6 +416,7 @@ fn resolve_tool_configs(
     for tool_id in tool_names {
         let enabled = resolve_tool_switch(rc_conf, tool_id)?;
         let confirm_preview = resolve_tool_confirm_preview(rc_conf, tool_id)?;
+        let timeout = resolve_tool_timeout(rc_conf, tool_id)?;
         let prompts =
             load_named_prompts(config_root, rc_conf, tool_id, KNOWN_TOOL_PROMPTS, "tool")?;
         let canonical_id = resolved_ids
@@ -422,6 +436,7 @@ fn resolve_tool_configs(
                 manifest_path: manifest_path.clone(),
                 manifest: manifest.clone(),
                 prompts,
+                timeout,
             },
         );
     }
@@ -459,6 +474,35 @@ fn resolve_tool_confirm_preview(rc_conf: &RcConf, tool: &str) -> Result<bool, SE
         return Ok(false);
     };
     parse_bool_field(tool, "CONFIRM", &value)
+}
+
+/// Resolve the execution timeout for a tool.
+///
+/// Returns `Some(duration)` when a timeout should be enforced, or `None` when
+/// the tool should run without a time limit.  The lookup order is:
+///
+/// 1. `<tool>_TIMEOUT` — per-tool override.
+/// 2. `TIMEOUT` — top-level default in `tools.conf`.
+/// 3. [`DEFAULT_TOOL_TIMEOUT`] — compiled-in 2-minute default.
+///
+/// A value of `"0"` at any level disables the timeout (`None`).
+fn resolve_tool_timeout(rc_conf: &RcConf, tool: &str) -> Result<Option<Duration>, SError> {
+    let provider = rc_conf.variable_provider_for(tool).map_err(|err| {
+        SError::new("config")
+            .with_code("rc_conf_error")
+            .with_message("failed to derive tool config from rc_conf")
+            .with_string_field("tool", tool)
+            .with_string_field("cause", &format!("{err:?}"))
+    })?;
+    let Some(value) = lookup_expanded(&provider, tool, "TIMEOUT")? else {
+        return Ok(Some(DEFAULT_TOOL_TIMEOUT));
+    };
+    let seconds = parse_u64_field(tool, "TIMEOUT", &value)?;
+    if seconds == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(Duration::from_secs(seconds)))
+    }
 }
 
 pub(crate) fn is_valid_anthropic_tool_name(name: &str) -> bool {

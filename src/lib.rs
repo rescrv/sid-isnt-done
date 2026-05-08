@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use claudius::chat::{ChatAgent, ChatConfig};
 use claudius::{
@@ -886,6 +887,7 @@ impl SidAgent {
             &context,
             tool_use_id,
             input,
+            binding.timeout,
         )
     }
 
@@ -912,6 +914,7 @@ impl SidAgent {
             &context,
             tool_use_id,
             input,
+            binding.timeout,
         )
         .await
         .map_err(std::io::Error::other)
@@ -1789,6 +1792,7 @@ struct RcToolBinding {
     enabled: SwitchPosition,
     confirm_preview: bool,
     executable_path: Path<'static>,
+    timeout: Option<Duration>,
 }
 
 struct BuiltTools {
@@ -2305,6 +2309,7 @@ struct ExternalTool {
     executable_path: Path<'static>,
     description: String,
     input_schema: serde_json::Value,
+    timeout: Option<Duration>,
 }
 
 impl ExternalTool {
@@ -2325,6 +2330,7 @@ impl ExternalTool {
             executable_path,
             description: manifest.description.clone(),
             input_schema: manifest.input_schema.clone(),
+            timeout: tool.timeout,
         }
     }
 }
@@ -2420,6 +2426,7 @@ async fn invoke_external_tool(
                 &context,
                 &tool_use.id,
                 input,
+                tool.timeout,
             ) {
                 Ok(prepared) => prepared,
                 Err(message) => return tool_error_result(&tool_use.id, message),
@@ -2479,6 +2486,7 @@ async fn invoke_external_tool(
         &context,
         &tool_use.id,
         input,
+        tool.timeout,
     )
     .await
     {
@@ -2905,6 +2913,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
                             .executable_path
                             .clone()
                             .expect("built-in edit tool requires an executable path"),
+                        timeout: tool_config.timeout,
                     });
                 }
                 _ => {}
@@ -5205,6 +5214,7 @@ esac
             &context,
             "toolu_confirm_123",
             serde_json::Map::from_iter([("paths".to_string(), json!(["src/lib.rs"]))]),
+            tool.timeout,
         )
         .unwrap();
 

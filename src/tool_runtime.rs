@@ -70,6 +70,8 @@ pub(crate) struct PreparedRcToolInvocation {
     session_dir: Option<PathBuf>,
     sessions_root: Option<PathBuf>,
     runtime: ToolRcRuntime,
+    /// Maximum execution time, or `None` for no timeout.
+    timeout: Option<Duration>,
 }
 
 struct ToolOverlayContext<'a> {
@@ -85,6 +87,7 @@ struct ToolOverlayContext<'a> {
 ///
 /// Constructs a request envelope, writes it to a scratch directory, launches the
 /// tool process with the appropriate rc-conf bindings, and reads back the result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn invoke_rc_tool_text(
     display_name: &str,
     rc_service_name: &str,
@@ -93,6 +96,7 @@ pub(crate) async fn invoke_rc_tool_text(
     context: &ToolRuntimeContext<'_>,
     tool_use_id: &str,
     input: serde_json::Map<String, serde_json::Value>,
+    timeout: Option<Duration>,
 ) -> Result<String, String> {
     let prepared = prepare_rc_tool_invocation(
         display_name,
@@ -102,10 +106,12 @@ pub(crate) async fn invoke_rc_tool_text(
         context,
         tool_use_id,
         input,
+        timeout,
     )?;
     run_prepared_rc_tool_text(&prepared, context.writable_roots, context.session).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_rc_tool_invocation(
     display_name: &str,
     rc_service_name: &str,
@@ -114,6 +120,7 @@ pub(crate) fn prepare_rc_tool_invocation(
     context: &ToolRuntimeContext<'_>,
     tool_use_id: &str,
     input: serde_json::Map<String, serde_json::Value>,
+    timeout: Option<Duration>,
 ) -> Result<PreparedRcToolInvocation, String> {
     let request_id = next_request_id();
     let invocation_dirs = create_tool_invocation_dirs(context, &request_id).map_err(|err| {
@@ -195,6 +202,7 @@ pub(crate) fn prepare_rc_tool_invocation(
             .session
             .map(|session| session.sessions_root().clone()),
         runtime,
+        timeout,
     })
 }
 
@@ -290,6 +298,34 @@ pub(crate) async fn run_prepared_rc_tool_text(
     result
 }
 
+/// Attempt a graceful shutdown of a tool child process.
+///
+/// Sends SIGTERM first, waits up to 5 seconds for voluntary exit, then
+/// falls back to SIGKILL.  This gives tools a chance to clean up temporary
+/// files, release locks, or flush partial output before being forcefully
+/// terminated.
+async fn kill_gracefully(child: &mut tokio::process::Child) {
+    const GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+    if let Some(pid) = child.id() {
+        #[cfg(unix)]
+        {
+            // SAFETY: sending a signal to a known-live process id is safe.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        match tokio::time::timeout(GRACE_PERIOD, child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                child.kill().await.ok();
+            }
+        }
+    } else {
+        child.kill().await.ok();
+    }
+}
+
 async fn run_prepared_rc_tool_text_inner(
     prepared: &PreparedRcToolInvocation,
     writable_roots: &WritableRoots,
@@ -301,6 +337,7 @@ async fn run_prepared_rc_tool_text_inner(
         return (Err(err), report);
     }
     let mut cmd = prepared_rc_tool_command(prepared, "run", writable_roots);
+    cmd.kill_on_drop(true);
     let mut child = match cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -342,9 +379,24 @@ async fn run_prepared_rc_tool_text_inner(
         "stderr",
     ));
 
-    let status = match child.wait().await {
-        Ok(status) => status,
-        Err(err) => {
+    let wait_result = match prepared.timeout {
+        Some(limit) => {
+            tokio::time::timeout(limit, child.wait())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "tool '{}' timed out after {}s",
+                        prepared.display_name,
+                        limit.as_secs(),
+                    )
+                })
+        }
+        None => Ok(child.wait().await),
+    };
+
+    let status = match wait_result {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
             return (
                 Err(format!(
                     "tool '{}' failed to wait: {}",
@@ -352,6 +404,14 @@ async fn run_prepared_rc_tool_text_inner(
                 )),
                 report,
             );
+        }
+        Err(timeout_msg) => {
+            kill_gracefully(&mut child).await;
+            // Pipes close when child is killed; let tee tasks finish.
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            report.status = Some("timeout".to_string());
+            return (Err(timeout_msg), report);
         }
     };
     report.status = Some(status.to_string());
