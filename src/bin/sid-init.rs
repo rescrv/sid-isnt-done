@@ -111,14 +111,14 @@ fn main() -> ExitCode {
             continue;
         }
 
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!(
-                    "sid-init: cannot create directory {}: {e}",
-                    parent.display()
-                );
-                return ExitCode::from(1);
-            }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "sid-init: cannot create directory {}: {e}",
+                parent.display()
+            );
+            return ExitCode::from(1);
         }
 
         if let Err(e) = fs::write(&dest, file.contents) {
@@ -126,14 +126,14 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
 
-        if file.executable {
-            if let Err(e) = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)) {
-                eprintln!(
-                    "sid-init: cannot set permissions on {}: {e}",
-                    dest.display()
-                );
-                return ExitCode::from(1);
-            }
+        if file.executable
+            && let Err(e) = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
+        {
+            eprintln!(
+                "sid-init: cannot set permissions on {}: {e}",
+                dest.display()
+            );
+            return ExitCode::from(1);
         }
 
         eprintln!("create: {}", dest.display());

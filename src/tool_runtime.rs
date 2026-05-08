@@ -380,17 +380,15 @@ async fn run_prepared_rc_tool_text_inner(
     ));
 
     let wait_result = match prepared.timeout {
-        Some(limit) => {
-            tokio::time::timeout(limit, child.wait())
-                .await
-                .map_err(|_| {
-                    format!(
-                        "tool '{}' timed out after {}s",
-                        prepared.display_name,
-                        limit.as_secs(),
-                    )
-                })
-        }
+        Some(limit) => tokio::time::timeout(limit, child.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "tool '{}' timed out after {}s",
+                    prepared.display_name,
+                    limit.as_secs(),
+                )
+            }),
         None => Ok(child.wait().await),
     };
 

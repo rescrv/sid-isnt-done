@@ -1360,7 +1360,11 @@ impl Agent for SidAgent {
         let cost_suffix = match rates {
             Some(rates) => {
                 let turn_cost = compute_cost_micro_cents(resp.usage, rates);
-                format!(" turn={} total={}", format_cost(turn_cost), format_cost(totals.cost_micro_cents))
+                format!(
+                    " turn={} total={}",
+                    format_cost(turn_cost),
+                    format_cost(totals.cost_micro_cents)
+                )
             }
             None => String::new(),
         };
@@ -1793,8 +1797,8 @@ impl TokenUsageTotals {
 fn compute_cost_micro_cents(usage: Usage, rates: TokenRates) -> u64 {
     let input = tokens_to_u64(usage.input_tokens).saturating_mul(rates.input);
     let output = tokens_to_u64(usage.output_tokens).saturating_mul(rates.output);
-    let cache_creation =
-        optional_tokens_to_u64(usage.cache_creation_input_tokens).saturating_mul(rates.cache_creation);
+    let cache_creation = optional_tokens_to_u64(usage.cache_creation_input_tokens)
+        .saturating_mul(rates.cache_creation);
     let cache_read =
         optional_tokens_to_u64(usage.cache_read_input_tokens).saturating_mul(rates.cache_read);
     input
@@ -3023,8 +3027,8 @@ fn merged_chat_config(agent_config: &AgentConfig, fallback: Option<&ChatConfig>)
     if agent.use_color != defaults.use_color {
         merged.use_color = agent.use_color;
     }
-    if agent.session_budget.is_some() {
-        merged.session_budget = agent.session_budget.clone();
+    if agent.session_spend.is_some() {
+        merged.session_spend = agent.session_spend.clone();
     }
     if agent.caching_enabled != defaults.caching_enabled {
         merged.caching_enabled = agent.caching_enabled;

@@ -714,8 +714,7 @@ fn apply_chat_config_overrides(
         }
     }
     if let Some(thinking) = lookup_expanded(provider, agent, "THINKING")? {
-        chat_config.template.thinking =
-            parse_thinking_budget(agent, "THINKING", &thinking)?;
+        chat_config.template.thinking = parse_thinking_budget(agent, "THINKING", &thinking)?;
     }
     if let Some(use_color) = lookup_expanded(provider, agent, "USE_COLOR")? {
         chat_config.use_color = parse_bool_field(agent, "USE_COLOR", &use_color)?;
@@ -723,11 +722,11 @@ fn apply_chat_config_overrides(
     if let Some(no_color) = lookup_expanded(provider, agent, "NO_COLOR")? {
         chat_config.use_color = !parse_bool_field(agent, "NO_COLOR", &no_color)?;
     }
-    if let Some(session_budget) = lookup_expanded(provider, agent, "SESSION_BUDGET")? {
-        chat_config.set_session_budget(Some(parse_u64_field(
+    if let Some(session_spend) = lookup_expanded(provider, agent, "SESSION_SPEND")? {
+        chat_config.set_session_spend(Some(parse_f64_field(
             agent,
-            "SESSION_BUDGET",
-            &session_budget,
+            "SESSION_SPEND",
+            &session_spend,
         )?));
     }
     if let Some(caching_enabled) = lookup_expanded(provider, agent, "CACHING_ENABLED")? {
@@ -1016,6 +1015,23 @@ fn parse_u64_field(scope: &str, field: &str, value: &str) -> Result<u64, SError>
         .map_err(|err| invalid_config_field(scope, field, value, err.to_string()))
 }
 
+fn parse_f64_field(scope: &str, field: &str, value: &str) -> Result<f64, SError> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|err| invalid_config_field(scope, field, value, err.to_string()))?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err(invalid_config_field(
+            scope,
+            field,
+            value,
+            "expected a positive dollar amount",
+        ))
+    }
+}
+
 fn parse_unit_interval_field(scope: &str, field: &str, value: &str) -> Result<f32, SError> {
     let parsed = value
         .trim()
@@ -1241,7 +1257,7 @@ plan_TOP_K=40
 plan_STOP_SEQUENCES='END "two words"'
 plan_THINKING=on
 plan_NO_COLOR=yes
-plan_SESSION_BUDGET=50000
+plan_SESSION_SPEND=5.00
 plan_CACHING_ENABLED=off
 "#,
         )
@@ -1316,7 +1332,7 @@ format_ALIASES="fmt"
             Some(DEFAULT_THINKING_BUDGET)
         );
         assert!(!plan.chat_config.use_color);
-        assert!(plan.chat_config.session_budget.is_some());
+        assert!(plan.chat_config.session_spend.is_some());
         assert!(!plan.chat_config.caching_enabled);
 
         let evil = config.agents.get("evil").unwrap();

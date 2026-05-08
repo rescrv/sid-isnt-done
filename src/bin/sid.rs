@@ -279,7 +279,7 @@ struct SessionOverrides {
     thinking_budget: Option<Option<u32>>,
     thinking_adaptive: Option<Option<Effort>>,
     effort: Option<Option<Effort>>,
-    session_budget: Option<Option<u64>>,
+    session_spend: Option<Option<f64>>,
     caching_enabled: Option<bool>,
 }
 
@@ -315,8 +315,8 @@ impl SessionOverrides {
         if let Some(effort) = self.effort {
             config.set_effort(effort);
         }
-        if let Some(session_budget) = self.session_budget {
-            config.set_session_budget(session_budget);
+        if let Some(session_spend) = self.session_spend {
+            config.set_session_spend(session_spend);
         }
         if let Some(caching_enabled) = self.caching_enabled {
             config.caching_enabled = caching_enabled;
@@ -518,9 +518,9 @@ impl SidRuntimeSession {
         self.overrides.effort = Some(effort);
     }
 
-    fn set_session_budget(&mut self, session_budget: Option<u64>) {
-        self.chat.config_mut().set_session_budget(session_budget);
-        self.overrides.session_budget = Some(session_budget);
+    fn set_session_spend(&mut self, dollars: Option<f64>) {
+        self.chat.config_mut().set_session_spend(dollars);
+        self.overrides.session_spend = Some(dollars);
     }
 
     fn set_caching_enabled(&mut self, enabled: bool) {
@@ -1044,25 +1044,22 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                                 Effort::Medium => "medium",
                                 Effort::High => "high",
                             };
-                            terminal.print_info(
-                                &context,
-                                &format!("Effort level set to {label}."),
-                            );
+                            terminal.print_info(&context, &format!("Effort level set to {label}."));
                         }
                         ChatCommand::ClearEffort => {
                             session.set_effort(None);
                             terminal.print_info(&context, "Effort level cleared.");
                         }
-                        ChatCommand::Budget(tokens) => {
-                            session.set_session_budget(Some(tokens));
+                        ChatCommand::Spend(dollars) => {
+                            session.set_session_spend(Some(dollars));
                             terminal.print_info(
                                 &context,
-                                &format!("Session budget set to {tokens} tokens."),
+                                &format!("Session spend limit set to ${dollars:.2}."),
                             );
                         }
-                        ChatCommand::ClearBudget => {
-                            session.set_session_budget(None);
-                            terminal.print_info(&context, "Session budget cleared.");
+                        ChatCommand::ClearSpend => {
+                            session.set_session_spend(None);
+                            terminal.print_info(&context, "Session spend limit cleared.");
                         }
                         ChatCommand::Caching(enabled) => {
                             session.set_caching_enabled(enabled);
@@ -1456,14 +1453,13 @@ fn print_stats(stats: &SessionStats) {
         let output = stats.last_turn_output_tokens.unwrap_or(0);
         println!("      Last turn tokens: {input} in / {output} out");
     }
-    if let Some(limit) = stats.session_budget_tokens {
-        let remaining = limit.saturating_sub(stats.budget_spent_tokens);
-        println!(
-            "      Budget: {}/{} tokens ({} remaining)",
-            stats.budget_spent_tokens, limit, remaining
-        );
+    if let Some(limit) = stats.session_spend_micro_cents {
+        let spent = stats.spend_used_micro_cents as f64 / 100_000_000.0;
+        let total = limit as f64 / 100_000_000.0;
+        let remaining = limit.saturating_sub(stats.spend_used_micro_cents) as f64 / 100_000_000.0;
+        println!("      Spend limit: ${spent:.4}/${total:.2} (${remaining:.4} remaining)",);
     } else {
-        println!("      Budget: (not set)");
+        println!("      Spend limit: (not set)");
     }
 }
 
@@ -1579,7 +1575,7 @@ mod tests {
         model: claudius::Model,
         temperature: Option<f32>,
         stop_sequences: Vec<String>,
-        session_budget_tokens: Option<u64>,
+        has_session_spend: bool,
     }
 
     #[derive(Debug, Deserialize, PartialEq)]
@@ -1727,7 +1723,7 @@ mod tests {
         session.set_model("claude-sonnet-4-0");
         session.set_temperature(Some(0.5));
         session.add_stop_sequence("END".to_string());
-        session.set_session_budget(Some(1234));
+        session.set_session_spend(Some(5.0));
 
         assert_eq!(
             session.switch_agent("review").unwrap(),
@@ -1747,7 +1743,7 @@ mod tests {
                 model: "claude-sonnet-4-0".parse().unwrap(),
                 temperature: Some(0.5),
                 stop_sequences: vec!["END".to_string()],
-                session_budget_tokens: Some(1234),
+                has_session_spend: true,
             }
         );
         assert!(
@@ -1875,7 +1871,7 @@ mod tests {
             model: session.config().model(),
             temperature: session.config().template.temperature,
             stop_sequences: session.config().stop_sequences().to_vec(),
-            session_budget_tokens: stats.session_budget_tokens,
+            has_session_spend: stats.session_spend_micro_cents.is_some(),
         }
     }
 
