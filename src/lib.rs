@@ -45,9 +45,10 @@ use claudius::{
     Agent, AgentStreamContext, Anthropic, BashPtyConfig, BashPtyResult, BashPtySession, Budget,
     Content, ContentBlock, Error, FileSystem, IntermediateToolResult, Message, MessageParam,
     MessageParamContent, MessageRole, Metadata, Model, MountHierarchy, OperatorLine, Renderer,
-    StopReason, StreamContext, SystemPrompt, TextBlock, ThinkingConfig, Tool, ToolBash20250124,
-    ToolCallback, ToolChoice, ToolParam, ToolResult, ToolResultBlock, ToolResultBlockContent,
-    ToolTextEditor20250728, ToolUnionParam, ToolUseBlock, TurnOutcome, Usage,
+    StopReason, StreamContext, SystemPrompt, TextBlock, ThinkingConfig, TokenRates, Tool,
+    ToolBash20250124, ToolCallback, ToolChoice, ToolParam, ToolResult, ToolResultBlock,
+    ToolResultBlockContent, ToolTextEditor20250728, ToolUnionParam, ToolUseBlock, TurnOutcome,
+    Usage,
 };
 use handled::SError;
 use rc_conf::SwitchPosition;
@@ -1355,9 +1356,17 @@ impl Agent for SidAgent {
                 .map_err(|err| Error::unknown(format!("failed to log API response: {err}")))?;
         }
         let totals = self.record_token_usage(resp.usage);
+        let rates = self.token_rates();
+        let cost_suffix = match rates {
+            Some(rates) => {
+                let turn_cost = compute_cost_micro_cents(resp.usage, rates);
+                format!(" turn={} total={}", format_cost(turn_cost), format_cost(totals.cost_micro_cents))
+            }
+            None => String::new(),
+        };
         println!(
-            "[tokens: input={} cached_input={} output={}]",
-            totals.input, totals.cached_input, totals.output
+            "[tokens: input={} cached_input={} output={}{}]",
+            totals.input, totals.cached_input, totals.output, cost_suffix
         );
         println!("[usage: {:?}]", resp.usage);
         Ok(())
@@ -1510,12 +1519,20 @@ impl ChatAgent for SidAgent {
 
 impl SidAgent {
     fn record_token_usage(&self, usage: Usage) -> TokenUsageTotals {
+        let rates = self.token_rates();
         let mut totals = self
             .token_usage_totals
             .lock()
             .expect("token usage totals lock poisoned");
-        totals.add(usage);
+        totals.add(usage, rates);
         *totals
+    }
+
+    fn token_rates(&self) -> Option<TokenRates> {
+        match self.config.model() {
+            Model::Known(km) => Some(km.token_rates()),
+            Model::Custom(_) => None,
+        }
     }
 }
 
@@ -1752,10 +1769,11 @@ struct TokenUsageTotals {
     input: u64,
     cached_input: u64,
     output: u64,
+    cost_micro_cents: u64,
 }
 
 impl TokenUsageTotals {
-    fn add(&mut self, usage: Usage) {
+    fn add(&mut self, usage: Usage, rates: Option<TokenRates>) {
         self.input = self.input.saturating_add(tokens_to_u64(usage.input_tokens));
         self.cached_input = self
             .cached_input
@@ -1763,7 +1781,40 @@ impl TokenUsageTotals {
         self.output = self
             .output
             .saturating_add(tokens_to_u64(usage.output_tokens));
+        if let Some(rates) = rates {
+            self.cost_micro_cents = self
+                .cost_micro_cents
+                .saturating_add(compute_cost_micro_cents(usage, rates));
+        }
     }
+}
+
+/// Compute the cost in micro-cents for a single Usage at the given TokenRates.
+fn compute_cost_micro_cents(usage: Usage, rates: TokenRates) -> u64 {
+    let input = tokens_to_u64(usage.input_tokens).saturating_mul(rates.input);
+    let output = tokens_to_u64(usage.output_tokens).saturating_mul(rates.output);
+    let cache_creation =
+        optional_tokens_to_u64(usage.cache_creation_input_tokens).saturating_mul(rates.cache_creation);
+    let cache_read =
+        optional_tokens_to_u64(usage.cache_read_input_tokens).saturating_mul(rates.cache_read);
+    input
+        .saturating_add(output)
+        .saturating_add(cache_creation)
+        .saturating_add(cache_read)
+}
+
+/// Format a cost in micro-cents as a human-readable dollar string.
+///
+/// Micro-cents are 1/1,000,000 of a cent, so 100,000,000 micro-cents = $1.00.
+fn format_cost(micro_cents: u64) -> String {
+    // Convert to cents (integer division, then show fractional cents).
+    // micro_cents / 100_000_000 = dollars
+    let dollars = micro_cents / 100_000_000;
+    let remainder = micro_cents % 100_000_000;
+    // Convert remainder to fractional dollars with 4 decimal places.
+    // remainder / 10_000 gives ten-thousandths of a dollar.
+    let frac = remainder / 10_000;
+    format!("${}.{:04}", dollars, frac)
 }
 
 fn tokens_to_u64(tokens: i32) -> u64 {
@@ -3990,8 +4041,8 @@ compact_TOOLS='bash'
     #[test]
     fn token_usage_totals_accumulate_input_cached_input_and_output() {
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(10, 4).with_cache_read_input_tokens(6));
-        totals.add(Usage::new(20, 8).with_cache_read_input_tokens(7));
+        totals.add(Usage::new(10, 4).with_cache_read_input_tokens(6), None);
+        totals.add(Usage::new(20, 8).with_cache_read_input_tokens(7), None);
 
         assert_eq!(
             totals,
@@ -3999,6 +4050,7 @@ compact_TOOLS='bash'
                 input: 30,
                 cached_input: 13,
                 output: 12,
+                cost_micro_cents: 0,
             }
         );
     }
@@ -4006,9 +4058,41 @@ compact_TOOLS='bash'
     #[test]
     fn token_usage_totals_treat_negative_counts_as_zero() {
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(-10, -4).with_cache_read_input_tokens(-6));
+        totals.add(Usage::new(-10, -4).with_cache_read_input_tokens(-6), None);
 
         assert_eq!(totals, TokenUsageTotals::default());
+    }
+
+    #[test]
+    fn token_usage_totals_accumulate_cost_with_rates() {
+        let rates = TokenRates {
+            input: 300,
+            output: 1500,
+            cache_creation: 375,
+            cache_read: 30,
+        };
+        let mut totals = TokenUsageTotals::default();
+        totals.add(Usage::new(100, 50), Some(rates));
+
+        // 100 input * 300 + 50 output * 1500 = 30_000 + 75_000 = 105_000
+        assert_eq!(totals.cost_micro_cents, 105_000);
+    }
+
+    #[test]
+    fn token_usage_totals_no_cost_without_rates() {
+        let mut totals = TokenUsageTotals::default();
+        totals.add(Usage::new(100, 50), None);
+
+        assert_eq!(totals.cost_micro_cents, 0);
+    }
+
+    #[test]
+    fn format_cost_renders_dollars_and_fractional_cents() {
+        assert_eq!(format_cost(0), "$0.0000");
+        assert_eq!(format_cost(100_000_000), "$1.0000");
+        assert_eq!(format_cost(50_000_000), "$0.5000");
+        assert_eq!(format_cost(1_230_000), "$0.0123");
+        assert_eq!(format_cost(250_000_000), "$2.5000");
     }
 
     #[test]
