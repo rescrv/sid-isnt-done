@@ -40,31 +40,37 @@ the persisted bash shell state for future `bash` tool calls.
 
 ## QUICKSTART
 
-Build the binaries from a checkout:
+Install and initialize:
 
 ```sh
-cargo build
+cargo install sid-isnt-done
+SID_HOME=~/.sid sid-init
 ```
 
-Run with the bundled starter configuration:
+`sid-init` copies the bundled starter configuration (agents, tools, and
+prompts) into `SID_HOME`.  It requires `SID_HOME` to be set.  Files that
+already exist are skipped, so it is safe to re-run after upgrading.
+
+Start a session:
 
 ```sh
 export CLAUDIUS_API_KEY="..."
-SID_HOME=init cargo run --bin sid
+SID_HOME=~/.sid sid
 ```
 
 Run one bash command through the configured bash tool and exit:
 
 ```sh
-SID_HOME=init cargo run --bin sid -- --bash-debug 'pwd && ls'
+SID_HOME=~/.sid sid --bash-debug 'pwd && ls'
 ```
 
-After installing the binaries, the same examples can be run as:
+From a source checkout, you can skip `sid-init` and point `SID_HOME` directly
+at the bundled `init/` directory:
 
 ```sh
-SID_HOME=init sid
-SID_HOME=init sid --bash-debug 'pwd && ls'
-SID_HOME=init sid --resume 2026-04-20T18-42-13.123456-0700
+cargo build
+SID_HOME=init cargo run --bin sid
+SID_HOME=init cargo run --bin sid -- --bash-debug 'pwd && ls'
 ```
 
 ## BUILDING

@@ -53,6 +53,10 @@ name = "sid-skill-inject"
 path = "src/bin/sid-skill-inject.rs"
 
 [[bin]]
+name = "sid-init"
+path = "src/bin/sid-init.rs"
+
+[[bin]]
 name = "sidiff"
 path = "src/bin/sidiff.rs"
 
