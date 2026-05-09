@@ -17,6 +17,10 @@ pub mod builtin_tools;
 /// Workspace configuration loading and types.
 pub mod config;
 mod filesystem;
+/// JSONL transport utilities for `sid --raw`.
+pub mod raw_mode;
+/// JSONL protocol types and raw-mode support hooks.
+pub mod raw_protocol;
 mod retry;
 /// macOS Seatbelt sandbox integration.
 pub mod seatbelt;
@@ -2607,7 +2611,13 @@ fn confirm_manual_tool_call(
         match parse_tool_confirmation(&buf) {
             Some(true) => return Ok(ManualToolConfirmation::Allow),
             Some(false) => return Ok(ManualToolConfirmation::Deny),
-            None => println!("Please answer yes or no."),
+            None => {
+                if let Some(renderer) = renderer.as_deref_mut() {
+                    renderer.print_info(&(), "Please answer yes or no.");
+                } else {
+                    println!("Please answer yes or no.");
+                }
+            }
         }
     }
 }
@@ -2625,10 +2635,7 @@ fn read_operator_line(
     {
         return match line {
             OperatorLine::Line(line) => Ok(ManualToolInput::Line(line)),
-            OperatorLine::Eof | OperatorLine::Interrupted => {
-                println!();
-                Ok(ManualToolInput::Cancel)
-            }
+            OperatorLine::Eof | OperatorLine::Interrupted => Ok(ManualToolInput::Cancel),
         };
     }
 

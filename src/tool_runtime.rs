@@ -12,12 +12,17 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use handled::SError;
 use rc_conf::{RcConf, var_name_from_service, var_prefix_from_service};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use utf8path::Path;
 
 use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
+use crate::raw_protocol::{
+    ToolOutputEvent, has_active_tool_output_observer, notify_tool_output_observer,
+};
 use crate::seatbelt;
 use crate::seatbelt::WritableRoots;
 use crate::session::{self, SidSession, ToolFinishEvent, ToolStartEvent, ToolStreamJournal};
@@ -364,19 +369,36 @@ async fn run_prepared_rc_tool_text_inner(
         .take()
         .expect("child stderr should be piped before spawn");
     let journal = session.map(SidSession::tool_stream_journal);
+    let suppress_terminal_output = has_active_tool_output_observer();
+    let stdout_terminal: Box<dyn AsyncWrite + Unpin + Send> = if suppress_terminal_output {
+        Box::new(tokio::io::sink())
+    } else {
+        Box::new(tokio::io::stdout())
+    };
+    let stderr_terminal: Box<dyn AsyncWrite + Unpin + Send> = if suppress_terminal_output {
+        Box::new(tokio::io::sink())
+    } else {
+        Box::new(tokio::io::stderr())
+    };
     let stdout_task = tokio::spawn(tee_child_output(
         stdout,
-        tokio::io::stdout(),
+        stdout_terminal,
         journal.clone(),
         prepared.sequence,
         "stdout",
+        prepared.request_id.clone(),
+        prepared.display_name.clone(),
+        prepared.tool_use_id.clone(),
     ));
     let stderr_task = tokio::spawn(tee_child_output(
         stderr,
-        tokio::io::stderr(),
+        stderr_terminal,
         journal,
         prepared.sequence,
         "stderr",
+        prepared.request_id.clone(),
+        prepared.display_name.clone(),
+        prepared.tool_use_id.clone(),
     ));
 
     let wait_result = match prepared.timeout {
@@ -554,6 +576,9 @@ async fn tee_child_output<R, W>(
     journal: Option<ToolStreamJournal>,
     tool_seq: u64,
     stream: &'static str,
+    request_id: String,
+    tool_name: String,
+    tool_use_id: String,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -572,6 +597,18 @@ where
                 .append(tool_seq, stream, &buffer[..read])
                 .map_err(|err| io::Error::other(err.to_string()))?;
         }
+        let (text, data_b64) = match std::str::from_utf8(&buffer[..read]) {
+            Ok(text) => (Some(text.to_string()), None),
+            Err(_) => (None, Some(BASE64_STANDARD.encode(&buffer[..read]))),
+        };
+        notify_tool_output_observer(&ToolOutputEvent {
+            request_id: request_id.clone(),
+            tool_name: tool_name.clone(),
+            tool_use_id: tool_use_id.clone(),
+            stream: stream.to_string(),
+            text,
+            data_b64,
+        });
     }
     Ok(())
 }

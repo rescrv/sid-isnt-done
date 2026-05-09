@@ -9,6 +9,7 @@ use rc_conf::SwitchPosition;
 use rustyline::DefaultEditor;
 use rustyline::config::{Config, EditMode};
 use rustyline::error::ReadlineError;
+use serde_json::{Value, json};
 use utf8path::Path;
 
 use claudius::chat::{
@@ -20,6 +21,11 @@ use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{
     AGENTS_CONF_FILE, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
+};
+use sid_isnt_done::raw_mode::{RawServer, RawToolOutputObserver};
+use sid_isnt_done::raw_protocol::{
+    RAW_PROTOCOL_VERSION, RawHello, RawRequest, RawRequestEnvelope, RawServerMessage,
+    install_tool_output_observer,
 };
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
@@ -160,6 +166,9 @@ struct SidArgs {
 
     #[arrrg(optional, "Resume an existing session by ID or directory", "SESSION")]
     resume: Option<String>,
+
+    #[arrrg(flag, "Run a JSONL protocol server on stdin/stdout")]
+    raw: bool,
 }
 
 /// Data computed synchronously before the tokio runtime starts.
@@ -171,6 +180,7 @@ struct PreRuntimeSetup {
     workspace_display: String,
     session_display: String,
     bash_debug: Option<String>,
+    raw: bool,
     resumed: bool,
 }
 
@@ -699,6 +709,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         param,
         bash_debug,
         resume,
+        raw,
     } = parse_sid_args()?;
     let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
@@ -752,6 +763,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
             session_display
         },
         bash_debug,
+        raw,
         resumed,
     })
 }
@@ -780,8 +792,16 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         workspace_display,
         session_display,
         bash_debug,
+        raw,
         resumed,
     } = setup;
+
+    if raw && bash_debug.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--raw cannot be combined with --bash-debug",
+        ));
+    }
 
     warn_if_sandbox_unavailable();
 
@@ -789,13 +809,45 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
             .with_session(sid_session.clone());
     let agent_id = agent.id().to_string();
+    let startup_confirmation_required = agent.requires_confirmation();
     let use_color = agent.config().use_color;
+
+    if raw {
+        let client = Anthropic::new(None).map_err(|err| {
+            cli_error(
+                "client_init_failed",
+                "failed to initialize the Anthropic client",
+            )
+            .with_string_field("cause", &err.to_string())
+        })?;
+        let auto_compact_tokens = agent.auto_compact_tokens();
+        let chat = ChatSession::with_agent(client.clone(), agent);
+        let mut session = SidRuntimeSession::new(
+            client,
+            chat,
+            config,
+            workspace_root.clone(),
+            config_root.clone(),
+            sid_session.clone(),
+            agent_id,
+            auto_compact_tokens,
+        );
+        session.load_resumed_transcript(resumed)?;
+        return run_raw_session(
+            session,
+            workspace_display,
+            session_display,
+            resumed,
+            startup_confirmation_required,
+        )
+        .await;
+    }
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let mut terminal = SidTerminal::new(use_color, interrupted.clone())?;
     let context = ();
 
-    if agent.requires_confirmation() && !confirm_manual_agent(&mut terminal, &agent_id)? {
+    if startup_confirmation_required && !confirm_manual_agent(&mut terminal, &agent_id)? {
         println!("Aborted.");
         return Ok(());
     }
@@ -1234,7 +1286,7 @@ fn format_agent_label(summary: &AgentSummary) -> String {
 /// Trigger compaction automatically when the output token threshold is reached.
 async fn maybe_auto_compact(
     session: &mut SidRuntimeSession,
-    terminal: &mut SidTerminal,
+    terminal: &mut dyn Renderer,
     context: &(),
 ) {
     if !session.should_auto_compact() {
@@ -1257,6 +1309,359 @@ async fn maybe_auto_compact(
         ),
         Err(err) => terminal.print_error(context, &format!("Auto-compaction failed: {err}")),
     }
+}
+
+async fn run_raw_session(
+    mut session: SidRuntimeSession,
+    workspace_display: String,
+    session_display: String,
+    resumed: bool,
+    startup_confirmation_required: bool,
+) -> Result<(), SError> {
+    let mut server = RawServer::stdio();
+    server
+        .write_message(&RawServerMessage::Hello(RawHello {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            session_id: session.sid_session.id().to_string(),
+            session_dir: session_display,
+            workspace_root: workspace_display,
+            current_agent: session.current_agent_id().to_string(),
+            model: session.config().model().to_string(),
+            resumed,
+            startup_confirmation_required,
+            sandbox_available: sid_isnt_done::seatbelt::sandbox_available(),
+        }))
+        .map_err(|err| raw_io_error("failed to write raw hello", &err))?;
+
+    if startup_confirmation_required {
+        server.set_request_id("startup".to_string());
+        let allowed = confirm_manual_agent(&mut server, session.current_agent_id())?;
+        if allowed {
+            server
+                .write_ok_result("startup", Some(json!({ "started": true })))
+                .map_err(|err| raw_io_error("failed to write raw startup result", &err))?;
+        } else {
+            server
+                .write_error_result(
+                    "startup",
+                    Some("manual_agent_denied"),
+                    "manual agent start denied",
+                )
+                .map_err(|err| raw_io_error("failed to write raw startup error", &err))?;
+            server.clear_request_id();
+            return Ok(());
+        }
+        server.clear_request_id();
+    }
+
+    while let Some(request) = server
+        .read_request()
+        .map_err(|err| raw_io_error("failed to read raw request", &err))?
+    {
+        let request_id = request.request_id.clone();
+        if request.protocol_version != RAW_PROTOCOL_VERSION {
+            server
+                .write_error_result(
+                    &request_id,
+                    Some("unsupported_protocol_version"),
+                    &format!(
+                        "unsupported raw protocol version {}",
+                        request.protocol_version
+                    ),
+                )
+                .map_err(|err| raw_io_error("failed to write raw protocol error", &err))?;
+            continue;
+        }
+        server.set_request_id(request_id.clone());
+        let result = handle_raw_request(&mut session, &mut server, request).await;
+        server.clear_request_id();
+        match result {
+            Ok(RequestDisposition::Continue(data)) => {
+                server
+                    .write_ok_result(&request_id, data)
+                    .map_err(|err| raw_io_error("failed to write raw result", &err))?;
+            }
+            Ok(RequestDisposition::Shutdown(data)) => {
+                server
+                    .write_ok_result(&request_id, data)
+                    .map_err(|err| raw_io_error("failed to write raw shutdown result", &err))?;
+                break;
+            }
+            Err(err) => {
+                server
+                    .write_error_result(&request_id, None, &err.to_string())
+                    .map_err(|io_err| raw_io_error("failed to write raw error result", &io_err))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum RequestDisposition {
+    Continue(Option<Value>),
+    Shutdown(Option<Value>),
+}
+
+async fn handle_raw_request<R, W>(
+    session: &mut SidRuntimeSession,
+    server: &mut RawServer<R, W>,
+    request: RawRequestEnvelope,
+) -> Result<RequestDisposition, SError>
+where
+    R: std::io::BufRead + Send,
+    W: std::io::Write + Send + 'static,
+{
+    match request.request {
+        RawRequest::UserTurn { text } => {
+            let observer = Arc::new(RawToolOutputObserver::new(server.output()));
+            let _observer = install_tool_output_observer(Some(observer));
+            session
+                .send_message(claudius::MessageParam::user(text), server)
+                .await
+                .map_err(|err| cli_error("send_message_failed", &err.to_string()))?;
+            maybe_auto_compact(session, server, &()).await;
+            Ok(RequestDisposition::Continue(Some(session_identity_json(
+                session,
+            ))))
+        }
+        RawRequest::PromptResponse { .. } => Err(cli_error(
+            "unexpected_prompt_response",
+            "prompt_response is only valid while the server is waiting on a prompt",
+        )),
+        RawRequest::ShowAgent => Ok(RequestDisposition::Continue(Some(agent_summary_json(
+            &session.current_agent_summary()?,
+            session,
+        )))),
+        RawRequest::ListAgents => Ok(RequestDisposition::Continue(Some(json!({
+            "agents": session
+                .list_agents()?
+                .iter()
+                .map(agent_json)
+                .collect::<Vec<_>>()
+        })))),
+        RawRequest::SwitchAgent { agent } => {
+            match session.agent_summary(&agent)? {
+                Some(summary) if summary.enabled == SwitchPosition::Manual => {
+                    if !confirm_manual_agent(server, &summary.id)? {
+                        return Err(cli_error(
+                            "manual_agent_denied",
+                            "manual agent switch denied",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            session.switch_agent(&agent)?;
+            Ok(RequestDisposition::Continue(Some(agent_summary_json(
+                &session.current_agent_summary()?,
+                session,
+            ))))
+        }
+        RawRequest::Compact => {
+            let result = session.compact().await?;
+            Ok(RequestDisposition::Continue(Some(json!({
+                "parent_session_id": result.parent_session_id,
+                "new_session_id": result.new_session_id,
+                "new_session_root": result.new_session_root,
+                "current_agent": session.current_agent_id(),
+            }))))
+        }
+        RawRequest::Clear => {
+            session.clear()?;
+            Ok(RequestDisposition::Continue(Some(session_identity_json(
+                session,
+            ))))
+        }
+        RawRequest::SetModel { model } => {
+            session.set_model(&model);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetSystemPrompt { prompt } => {
+            session.set_system_prompt(prompt);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetMaxTokens { max_tokens } => {
+            session.set_max_tokens(max_tokens);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetTemperature { temperature } => {
+            session.set_temperature(temperature);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetTopP { top_p } => {
+            session.set_top_p(top_p);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetTopK { top_k } => {
+            session.set_top_k(top_k);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::AddStopSequence { sequence } => {
+            session.add_stop_sequence(sequence);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::ClearStopSequences => {
+            session.clear_stop_sequences();
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::ListStopSequences => Ok(RequestDisposition::Continue(Some(json!({
+            "stop_sequences": session.config().stop_sequences(),
+        })))),
+        RawRequest::SetThinkingBudget { tokens } => {
+            session.set_thinking_budget(tokens);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetThinkingAdaptive => {
+            session.set_thinking_adaptive(session.config().effort());
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetEffort { effort } => {
+            session.set_effort(effort);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetSpend { dollars } => {
+            session.set_session_spend(dollars);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SetCaching { enabled } => {
+            session.set_caching_enabled(enabled);
+            Ok(RequestDisposition::Continue(Some(config_json(
+                &session.stats(),
+            ))))
+        }
+        RawRequest::SaveTranscript { path } => {
+            session.save_transcript_to(&path)?;
+            Ok(RequestDisposition::Continue(Some(json!({ "path": path }))))
+        }
+        RawRequest::LoadTranscript { path } => {
+            session.load_transcript_from(&path)?;
+            Ok(RequestDisposition::Continue(Some(session_identity_json(
+                session,
+            ))))
+        }
+        RawRequest::Stats => Ok(RequestDisposition::Continue(Some(stats_json(
+            &session.stats(),
+        )))),
+        RawRequest::ShowConfig => Ok(RequestDisposition::Continue(Some(config_json(
+            &session.stats(),
+        )))),
+        RawRequest::Shutdown => Ok(RequestDisposition::Shutdown(Some(json!({
+            "session_id": session.sid_session.id(),
+        })))),
+    }
+}
+
+fn agent_summary_json(summary: &AgentSummary, session: &SidRuntimeSession) -> Value {
+    let mut agent = agent_json(summary);
+    if let Some(object) = agent.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            json!(session.config().model().to_string()),
+        );
+    }
+    agent
+}
+
+fn agent_json(summary: &AgentSummary) -> Value {
+    json!({
+        "id": summary.id,
+        "display_name": summary.display_name,
+        "description": summary.description,
+        "enabled": describe_agent_enabled(summary.enabled),
+        "current": summary.current,
+    })
+}
+
+fn session_identity_json(session: &SidRuntimeSession) -> Value {
+    json!({
+        "session_id": session.sid_session.id(),
+        "session_dir": session.sid_session.root().display().to_string(),
+        "current_agent": session.current_agent_id(),
+        "model": session.config().model().to_string(),
+    })
+}
+
+fn stats_json(stats: &SessionStats) -> Value {
+    json!({
+        "model": stats.model.to_string(),
+        "message_count": stats.message_count,
+        "max_tokens": stats.max_tokens,
+        "system_prompt": stats.system_prompt,
+        "temperature": stats.temperature,
+        "top_p": stats.top_p,
+        "top_k": stats.top_k,
+        "stop_sequences": stats.stop_sequences,
+        "thinking_budget": stats.thinking_budget,
+        "thinking": describe_thinking(stats),
+        "thinking_adaptive": stats.thinking_adaptive,
+        "effort": stats.effort.map(effort_name),
+        "session_spend_micro_cents": stats.session_spend_micro_cents,
+        "spend_used_micro_cents": stats.spend_used_micro_cents,
+        "transcript_path": stats.transcript_path.as_ref().map(|path| path.display().to_string()),
+        "total_input_tokens": stats.total_input_tokens,
+        "total_output_tokens": stats.total_output_tokens,
+        "total_requests": stats.total_requests,
+        "last_turn_input_tokens": stats.last_turn_input_tokens,
+        "last_turn_output_tokens": stats.last_turn_output_tokens,
+        "caching_enabled": stats.caching_enabled,
+        "total_cache_creation_tokens": stats.total_cache_creation_tokens,
+        "total_cache_read_tokens": stats.total_cache_read_tokens,
+    })
+}
+
+fn config_json(stats: &SessionStats) -> Value {
+    json!({
+        "model": stats.model.to_string(),
+        "max_tokens": stats.max_tokens,
+        "system_prompt": stats.system_prompt,
+        "temperature": stats.temperature,
+        "top_p": stats.top_p,
+        "top_k": stats.top_k,
+        "stop_sequences": stats.stop_sequences,
+        "thinking": describe_thinking(stats),
+        "thinking_budget": stats.thinking_budget,
+        "thinking_adaptive": stats.thinking_adaptive,
+        "effort": stats.effort.map(effort_name),
+        "caching_enabled": stats.caching_enabled,
+        "transcript_path": stats.transcript_path.as_ref().map(|path| path.display().to_string()),
+    })
+}
+
+fn effort_name(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+    }
+}
+
+fn raw_io_error(context: &str, err: &io::Error) -> SError {
+    cli_error("io_error", context).with_string_field("cause", &err.to_string())
 }
 
 fn print_agent_summary(summary: &AgentSummary, config: &ChatConfig) {
@@ -1378,19 +1783,25 @@ fn resolve_sid_home(workspace_root: &Path) -> Result<Path<'static>, SError> {
     }
 }
 
-fn confirm_manual_agent(terminal: &mut SidTerminal, agent_id: &str) -> Result<bool, SError> {
+fn confirm_manual_agent(renderer: &mut dyn Renderer, agent_id: &str) -> Result<bool, SError> {
     loop {
         let prompt = format!("Agent '{agent_id}' is MANUAL. Continue? [yes/no]: ");
-        let input = match terminal.read_line(&prompt).map_err(|err| {
-            cli_error("io_error", "failed to read manual-agent confirmation input")
+        let input = match renderer
+            .read_operator_line(&prompt)
+            .map_err(|err| {
+                cli_error("io_error", "failed to read manual-agent confirmation input")
+                    .with_string_field("agent", agent_id)
+                    .with_string_field("cause", &err.to_string())
+            })?
+            .ok_or_else(|| {
+                cli_error(
+                    "io_error",
+                    "manual-agent confirmation requires an interactive renderer",
+                )
                 .with_string_field("agent", agent_id)
-                .with_string_field("cause", &err.to_string())
-        })? {
+            })? {
             OperatorLine::Line(input) => input,
-            OperatorLine::Eof | OperatorLine::Interrupted => {
-                println!();
-                return Ok(false);
-            }
+            OperatorLine::Eof | OperatorLine::Interrupted => return Ok(false),
         };
 
         match parse_confirmation(&input) {
@@ -1619,6 +2030,14 @@ mod tests {
             args.resume.as_deref(),
             Some("2026-04-20T18-42-13.123456-0700")
         );
+    }
+
+    #[test]
+    fn parse_args_accept_raw_option() {
+        let (args, free, status, messages) = parse_args(&["--raw"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert!(args.raw);
     }
 
     #[test]

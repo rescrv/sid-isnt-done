@@ -9,6 +9,7 @@ sid - run a small, rc-configured coding agent in the current workspace
 ```text
 sid [OPTIONS]
 sid --resume SESSION [OPTIONS]
+sid --raw [--resume SESSION] [OPTIONS]
 SID_HOME=DIR sid [OPTIONS]
 sid --bash-debug COMMAND
 sid-seatbelt [--writable-roots DIR[:DIR...]] -- COMMAND [ARG...]
@@ -37,6 +38,12 @@ or loading transcripts, clearing context, and printing session stats.  Use
 `--resume <session-id-or-dir>` to reopen an earlier session directory,
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
+
+Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
+mode the process owns session state and emits typed events, prompts, and
+terminal results instead of the human-oriented terminal UI.  Requests are
+semantic operations such as user turns, agent switches, compaction, and config
+updates.  Raw mode is intended for alternative frontends and local automation.
 
 ## QUICKSTART
 
@@ -125,6 +132,10 @@ warning.
 `--bash-debug COMMAND`
 : Run `COMMAND` through the configured built-in bash tool and exit.  This is
   useful for checking tool configuration without starting an interactive chat.
+
+`--raw`
+: Run a JSONL protocol server on stdin/stdout instead of the interactive
+  readline UI.  Stdout is reserved for protocol messages in this mode.
 
 `--resume SESSION`
 : Resume an existing session by timestamp id or by session directory path.
