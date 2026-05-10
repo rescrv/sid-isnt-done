@@ -152,6 +152,101 @@ impl Renderer for SidTerminal {
     }
 }
 
+struct PromptRenderer {
+    renderer: PlainTextRenderer,
+}
+
+impl PromptRenderer {
+    fn new(use_color: bool, interrupted: Arc<AtomicBool>) -> Self {
+        Self {
+            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+        }
+    }
+}
+
+impl Renderer for PromptRenderer {
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.renderer.start_agent(context);
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.renderer.finish_agent(context, stop_reason);
+    }
+
+    fn print_text(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_thinking(&mut self, _context: &dyn StreamContext, _text: &str) {}
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.renderer.print_error(context, error);
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.renderer.print_info(context, info);
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.renderer.start_tool_use(context, name, id);
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.renderer.print_tool_input(context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_use(context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.renderer
+            .start_tool_result(context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_tool_result_text(context, text);
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_result(context);
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_response(context);
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.renderer.print_interrupted(context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.renderer.should_interrupt()
+    }
+
+    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
+        print!("{prompt}");
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                println!();
+                Ok(Some(OperatorLine::Eof))
+            }
+            Ok(_) => Ok(Some(OperatorLine::Line(line))),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                println!();
+                Ok(Some(OperatorLine::Interrupted))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
 #[derive(arrrg_derive::CommandLine, Debug, Default, PartialEq, Eq)]
 struct SidArgs {
     #[arrrg(nested)]
@@ -167,6 +262,9 @@ struct SidArgs {
     #[arrrg(optional, "Resume an existing session by ID or directory", "SESSION")]
     resume: Option<String>,
 
+    #[arrrg(optional, "Run one prompt non-interactively and exit", "PROMPT")]
+    prompt: Option<String>,
+
     #[arrrg(flag, "Run a JSONL protocol server on stdin/stdout")]
     raw: bool,
 }
@@ -180,6 +278,7 @@ struct PreRuntimeSetup {
     workspace_display: String,
     session_display: String,
     bash_debug: Option<String>,
+    prompt: Option<String>,
     raw: bool,
     resumed: bool,
 }
@@ -633,8 +732,9 @@ impl SidRuntimeSession {
                 )
             })?;
 
-        let next_sid_session = Arc::new(SidSession::create_compacted(
+        let next_sid_session = Arc::new(SidSession::create_compacted_with_workspace(
             &self.config_root,
+            &self.workspace_root,
             session::CompactionProvenance {
                 session_id: parent_session_id.clone(),
                 session_dir: parent_session_dir,
@@ -689,6 +789,10 @@ impl SidRuntimeSession {
             .map_err(|err| transcript_error_path("transcript_save_failed", path, &err.to_string()))
     }
 
+    fn last_assistant_text(&self) -> Option<String> {
+        extract_last_assistant_text(&self.chat.clone_messages())
+    }
+
     #[cfg(test)]
     fn clone_messages(&self) -> Vec<claudius::MessageParam> {
         self.chat.clone_messages()
@@ -709,6 +813,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         param,
         bash_debug,
         resume,
+        prompt,
         raw,
     } = parse_sid_args()?;
     let mut config = ChatConfig::try_from(param).map_err(|err| {
@@ -735,11 +840,28 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
     })?
     .into_owned();
     let config_root = resolve_sid_home(&workspace_root)?;
-    let resumed = resume.is_some();
-    let sid_session = Arc::new(match resume {
-        Some(session) => SidSession::resume(&config_root, &session)?,
-        None => SidSession::create(&config_root)?,
-    });
+    let (sid_session, resumed) = match (resume.as_deref(), prompt.as_ref()) {
+        (Some(session), _) => (Arc::new(SidSession::resume(&config_root, session)?), true),
+        (None, Some(_)) => {
+            match SidSession::find_latest_for_workspace(&config_root, &workspace_root)? {
+                Some(session) => (Arc::new(session), true),
+                None => (
+                    Arc::new(SidSession::create_with_workspace(
+                        &config_root,
+                        &workspace_root,
+                    )?),
+                    false,
+                ),
+            }
+        }
+        (None, None) => (
+            Arc::new(SidSession::create_with_workspace(
+                &config_root,
+                &workspace_root,
+            )?),
+            false,
+        ),
+    };
     config.transcript_path = Some(sid_session.transcript_path());
     // Safe: no other threads are running yet.
     unsafe {
@@ -763,6 +885,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
             session_display
         },
         bash_debug,
+        prompt,
         raw,
         resumed,
     })
@@ -792,16 +915,12 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         workspace_display,
         session_display,
         bash_debug,
+        prompt,
         raw,
         resumed,
     } = setup;
 
-    if raw && bash_debug.is_some() {
-        return Err(cli_error(
-            "invalid_cli_args",
-            "--raw cannot be combined with --bash-debug",
-        ));
-    }
+    validate_runtime_mode(raw, bash_debug.as_deref(), prompt.as_deref())?;
 
     warn_if_sandbox_unavailable();
 
@@ -841,6 +960,39 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
             startup_confirmation_required,
         )
         .await;
+    }
+
+    if let Some(prompt) = prompt {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let mut renderer = PromptRenderer::new(use_color, interrupted.clone());
+        install_ctrlc_handler(interrupted)?;
+
+        if startup_confirmation_required && !confirm_manual_agent(&mut renderer, &agent_id)? {
+            println!("Aborted.");
+            return Ok(());
+        }
+
+        let client = Anthropic::new(None).map_err(|err| {
+            cli_error(
+                "client_init_failed",
+                "failed to initialize the Anthropic client",
+            )
+            .with_string_field("cause", &err.to_string())
+        })?;
+        let auto_compact_tokens = agent.auto_compact_tokens();
+        let chat = ChatSession::with_agent(client.clone(), agent);
+        let mut session = SidRuntimeSession::new(
+            client,
+            chat,
+            config,
+            workspace_root.clone(),
+            config_root.clone(),
+            sid_session.clone(),
+            agent_id.clone(),
+            auto_compact_tokens,
+        );
+        session.load_resumed_transcript(resumed)?;
+        return run_prompt_mode(session, prompt, &mut renderer).await;
     }
 
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -885,16 +1037,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
     session.load_resumed_transcript(resumed)?;
 
     let interrupted_clone = interrupted.clone();
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::Relaxed);
-    })
-    .map_err(|err| {
-        cli_error(
-            "signal_handler_failed",
-            "failed to install the Ctrl-C handler",
-        )
-        .with_string_field("cause", &err.to_string())
-    })?;
+    install_ctrlc_handler(interrupted_clone)?;
 
     println!(
         "sid (agent: {agent_id}, model: {})",
@@ -1184,6 +1327,33 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
     }
 
     Ok(())
+}
+
+async fn run_prompt_mode(
+    mut session: SidRuntimeSession,
+    prompt: String,
+    renderer: &mut dyn Renderer,
+) -> Result<(), SError> {
+    session
+        .send_message(claudius::MessageParam::user(prompt), renderer)
+        .await
+        .map_err(|err| cli_error("send_message_failed", &err.to_string()))?;
+    let response = session.last_assistant_text().ok_or_else(|| {
+        cli_error(
+            "empty_response",
+            "assistant produced no text response for --prompt",
+        )
+    })?;
+    maybe_auto_compact(&mut session, renderer, &()).await;
+
+    print!("{response}");
+    if !response.ends_with('\n') {
+        println!();
+    }
+    io::stdout().flush().map_err(|err| {
+        cli_error("io_error", "failed to flush prompt output")
+            .with_string_field("cause", &err.to_string())
+    })
 }
 
 fn parse_sid_command(input: &str) -> Option<SidCommand> {
@@ -1764,6 +1934,45 @@ fn cli_error(code: &str, message: &str) -> SError {
     SError::new("sid-cli").with_code(code).with_message(message)
 }
 
+fn validate_runtime_mode(
+    raw: bool,
+    bash_debug: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<(), SError> {
+    if raw && bash_debug.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--raw cannot be combined with --bash-debug",
+        ));
+    }
+    if raw && prompt.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--raw cannot be combined with --prompt",
+        ));
+    }
+    if bash_debug.is_some() && prompt.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--bash-debug cannot be combined with --prompt",
+        ));
+    }
+    Ok(())
+}
+
+fn install_ctrlc_handler(interrupted: Arc<AtomicBool>) -> Result<(), SError> {
+    ctrlc::set_handler(move || {
+        interrupted.store(true, Ordering::Relaxed);
+    })
+    .map_err(|err| {
+        cli_error(
+            "signal_handler_failed",
+            "failed to install the Ctrl-C handler",
+        )
+        .with_string_field("cause", &err.to_string())
+    })
+}
+
 fn warn_if_sandbox_unavailable() {
     if seatbelt::sandbox_available() {
         return;
@@ -1964,7 +2173,7 @@ mod tests {
     use super::{
         AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, SANDBOX_UNAVAILABLE_WARNING,
         SidArgs, SidCommand, SidRuntimeSession, SwitchPosition, parse_confirmation,
-        parse_sid_command, validate_no_free_args,
+        parse_sid_command, validate_no_free_args, validate_runtime_mode,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
@@ -2037,6 +2246,14 @@ mod tests {
         assert_eq!(status, 0, "unexpected parser status: {messages:?}");
         assert!(free.is_empty());
         assert!(args.raw);
+    }
+
+    #[test]
+    fn parse_args_accept_prompt_option() {
+        let (args, free, status, messages) = parse_args(&["--prompt", "review this"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert_eq!(args.prompt.as_deref(), Some("review this"));
     }
 
     #[test]
@@ -2326,6 +2543,21 @@ mod tests {
     }
 
     #[test]
+    fn sid_args_parse_prompt_and_resume() {
+        let (args, free, status, messages) =
+            parse_args(&["--resume", "sid-session", "--prompt", "continue"]);
+
+        assert_eq!(status, 0);
+        assert!(
+            messages.is_empty(),
+            "unexpected parser messages: {messages:?}"
+        );
+        assert!(free.is_empty(), "unexpected free args: {free:?}");
+        assert_eq!(args.resume.as_deref(), Some("sid-session"));
+        assert_eq!(args.prompt.as_deref(), Some("continue"));
+    }
+
+    #[test]
     fn sid_args_reject_unprefixed_chat_params() {
         let (_args, _free, status, messages) = parse_args(&["--temperature", "0.5"]);
 
@@ -2375,6 +2607,22 @@ mod tests {
                 .any(|message| message.contains("Argument to option 'bash-debug' missing")),
             "expected missing argument message, got {messages:?}"
         );
+    }
+
+    #[test]
+    fn validate_runtime_mode_rejects_prompt_with_raw() {
+        let err = validate_runtime_mode(true, None, Some("hello"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--raw cannot be combined with --prompt"));
+    }
+
+    #[test]
+    fn validate_runtime_mode_rejects_prompt_with_bash_debug() {
+        let err = validate_runtime_mode(false, Some("pwd"), Some("hello"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--bash-debug cannot be combined with --prompt"));
     }
 
     #[test]

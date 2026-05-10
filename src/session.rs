@@ -81,6 +81,7 @@ pub struct SidSession {
     id: String,
     sessions_root: PathBuf,
     root: PathBuf,
+    workspace_root: Option<String>,
     tmp_dir: PathBuf,
     bash_tmp_dir: PathBuf,
     events_path: PathBuf,
@@ -200,6 +201,10 @@ struct SessionTimestamp {
 struct SessionMetadata {
     id: String,
     #[serde(default)]
+    created_unix_micros: Option<i128>,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
     compacted_from: Option<CompactionProvenance>,
 }
 
@@ -223,7 +228,11 @@ impl SidSession {
     /// Returns an error when the sessions directory cannot be created or a
     /// unique session identifier cannot be allocated.
     pub fn create(config_root: &Path) -> Result<Self, SError> {
-        Self::create_in(resolve_sessions_root(config_root)?)
+        Self::create_in_with_provenance(
+            resolve_sessions_root(config_root)?,
+            Some(config_root.as_str().to_string()),
+            None,
+        )
     }
 
     /// Create a compacted continuation session linked to a parent via `provenance`.
@@ -236,7 +245,46 @@ impl SidSession {
         config_root: &Path,
         provenance: CompactionProvenance,
     ) -> Result<Self, SError> {
-        Self::create_compacted_in(resolve_sessions_root(config_root)?, provenance)
+        Self::create_in_with_provenance(
+            resolve_sessions_root(config_root)?,
+            Some(config_root.as_str().to_string()),
+            Some(provenance),
+        )
+    }
+
+    /// Create a fresh session and record the workspace it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions directory cannot be created or a
+    /// unique session identifier cannot be allocated.
+    pub fn create_with_workspace(
+        config_root: &Path,
+        workspace_root: &Path,
+    ) -> Result<Self, SError> {
+        Self::create_in_with_provenance(
+            resolve_sessions_root(config_root)?,
+            Some(workspace_root.as_str().to_string()),
+            None,
+        )
+    }
+
+    /// Create a compacted continuation session and record the workspace it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions directory cannot be created or a
+    /// unique session identifier cannot be allocated.
+    pub fn create_compacted_with_workspace(
+        config_root: &Path,
+        workspace_root: &Path,
+        provenance: CompactionProvenance,
+    ) -> Result<Self, SError> {
+        Self::create_in_with_provenance(
+            resolve_sessions_root(config_root)?,
+            Some(workspace_root.as_str().to_string()),
+            Some(provenance),
+        )
     }
 
     /// Resume an existing session identified by `spec`.
@@ -259,19 +307,44 @@ impl SidSession {
         Self::resume_from_root(sessions_root, root)
     }
 
+    /// Find the most recently started session for `workspace_root`.
+    ///
+    /// Sessions created after workspace metadata was added match by the
+    /// recorded `workspace_root`.  Older sessions are considered only when the
+    /// sessions root is the default workspace-local `sessions/` directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sessions root cannot be scanned or a session
+    /// metadata file cannot be read.
+    pub fn find_latest_for_workspace(
+        config_root: &Path,
+        workspace_root: &Path,
+    ) -> Result<Option<Self>, SError> {
+        let sessions_root = resolve_sessions_root(config_root)?;
+        let legacy_workspace_local = config_root.as_str() == workspace_root.as_str()
+            && sessions_root == PathBuf::from(workspace_root.as_str()).join(SESSIONS_DIR);
+        Self::find_latest_for_workspace_in(
+            sessions_root,
+            workspace_root.as_str(),
+            legacy_workspace_local,
+        )
+    }
+
     pub(crate) fn create_in(sessions_root: PathBuf) -> Result<Self, SError> {
-        Self::create_in_with_provenance(sessions_root, None)
+        Self::create_in_with_provenance(sessions_root, None, None)
     }
 
     pub(crate) fn create_compacted_in(
         sessions_root: PathBuf,
         provenance: CompactionProvenance,
     ) -> Result<Self, SError> {
-        Self::create_in_with_provenance(sessions_root, Some(provenance))
+        Self::create_in_with_provenance(sessions_root, None, Some(provenance))
     }
 
     fn create_in_with_provenance(
         sessions_root: PathBuf,
+        workspace_root: Option<String>,
         provenance: Option<CompactionProvenance>,
     ) -> Result<Self, SError> {
         fs::create_dir_all(&sessions_root).map_err(|err| {
@@ -289,6 +362,7 @@ impl SidSession {
                         timestamp,
                         sessions_root,
                         root,
+                        workspace_root.clone(),
                         provenance.clone(),
                     );
                 }
@@ -323,6 +397,7 @@ impl SidSession {
         timestamp: SessionTimestamp,
         sessions_root: PathBuf,
         root: PathBuf,
+        workspace_root: Option<String>,
         compaction_provenance: Option<CompactionProvenance>,
     ) -> Result<Self, SError> {
         let tmp_dir = root.join("tmp");
@@ -340,6 +415,7 @@ impl SidSession {
             id: timestamp.id,
             sessions_root,
             root: root.clone(),
+            workspace_root,
             tmp_dir,
             bash_tmp_dir,
             events_path: root.join(EVENTS_JOURNAL_FILE),
@@ -374,6 +450,7 @@ impl SidSession {
             id: metadata.id,
             sessions_root,
             root: root.clone(),
+            workspace_root: metadata.workspace_root,
             tmp_dir,
             bash_tmp_dir,
             events_path: root.join(EVENTS_JOURNAL_FILE),
@@ -387,6 +464,60 @@ impl SidSession {
         };
         session.log_session_resume()?;
         Ok(session)
+    }
+
+    fn find_latest_for_workspace_in(
+        sessions_root: PathBuf,
+        workspace_root: &str,
+        allow_legacy_workspace_local: bool,
+    ) -> Result<Option<Self>, SError> {
+        let entries = match fs::read_dir(&sessions_root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(
+                    session_error("io_error", "failed to scan sessions directory")
+                        .with_string_field("path", sessions_root.to_string_lossy().as_ref())
+                        .with_string_field("cause", &err.to_string()),
+                );
+            }
+        };
+
+        let mut latest: Option<(i128, String, PathBuf)> = None;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                session_error("io_error", "failed to scan sessions directory")
+                    .with_string_field("path", sessions_root.to_string_lossy().as_ref())
+                    .with_string_field("cause", &err.to_string())
+            })?;
+            let root = entry.path();
+            if !root.is_dir() || !root.join(SESSION_METADATA_FILE).is_file() {
+                continue;
+            }
+
+            let metadata = read_session_metadata(&root)?;
+            if !session_matches_workspace(&metadata, workspace_root, allow_legacy_workspace_local) {
+                continue;
+            }
+
+            let created_unix_micros = metadata.created_unix_micros.unwrap_or(i128::MIN);
+            let session_id = metadata.id.clone();
+            let replace = latest
+                .as_ref()
+                .map(|(best_created, best_id, _)| {
+                    created_unix_micros > *best_created
+                        || (created_unix_micros == *best_created && session_id > *best_id)
+                })
+                .unwrap_or(true);
+            if replace {
+                latest = Some((created_unix_micros, session_id, root));
+            }
+        }
+
+        let Some((_, _, root)) = latest else {
+            return Ok(None);
+        };
+        Self::resume_from_root(sessions_root, root).map(Some)
     }
 
     /// Return the session's unique identifier (a timestamp-based string).
@@ -657,6 +788,8 @@ impl SidSession {
             sessions_root: String,
             session_dir: String,
             #[serde(skip_serializing_if = "Option::is_none")]
+            workspace_root: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             compacted_from: Option<&'a CompactionProvenance>,
         }
 
@@ -668,6 +801,7 @@ impl SidSession {
             pid: std::process::id(),
             sessions_root: self.sessions_root.to_string_lossy().into_owned(),
             session_dir: self.root.to_string_lossy().into_owned(),
+            workspace_root: self.workspace_root.as_deref(),
             compacted_from: self.compaction_provenance.as_ref(),
         };
         self.write_json(self.root.join(SESSION_METADATA_FILE), &metadata)
@@ -780,6 +914,17 @@ pub fn read_compaction_provenance_from_dir(
     root: &StdPath,
 ) -> Result<Option<CompactionProvenance>, SError> {
     Ok(read_session_metadata(root)?.compacted_from)
+}
+
+fn session_matches_workspace(
+    metadata: &SessionMetadata,
+    workspace_root: &str,
+    allow_legacy_workspace_local: bool,
+) -> bool {
+    match metadata.workspace_root.as_deref() {
+        Some(recorded) => recorded == workspace_root,
+        None => allow_legacy_workspace_local,
+    }
 }
 
 fn resolve_sessions_root(config_root: &Path) -> Result<PathBuf, SError> {
@@ -1099,6 +1244,23 @@ mod tests {
     }
 
     #[test]
+    fn session_create_with_workspace_persists_workspace_root() {
+        let config_root = unique_temp_dir("config-root");
+        let workspace_root = unique_temp_dir("workspace-root");
+        fs::create_dir_all(workspace_root.as_str()).unwrap();
+        let session = SidSession::create_with_workspace(&config_root, &workspace_root).unwrap();
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(session.root().join(SESSION_METADATA_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["workspace_root"], json!(workspace_root.as_str()));
+
+        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    #[test]
     fn compacted_session_persists_provenance_and_reload() {
         let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
         let parent = SidSession::create_in(sessions_root.clone()).unwrap();
@@ -1316,6 +1478,58 @@ mod tests {
     }
 
     #[test]
+    fn find_latest_for_workspace_prefers_newest_matching_workspace() {
+        let config_root = unique_temp_dir("config-root");
+        let workspace_a = unique_temp_dir("workspace-a");
+        let workspace_b = unique_temp_dir("workspace-b");
+        fs::create_dir_all(workspace_a.as_str()).unwrap();
+        fs::create_dir_all(workspace_b.as_str()).unwrap();
+        let older = SidSession::create_with_workspace(&config_root, &workspace_a).unwrap();
+        let _other = SidSession::create_with_workspace(&config_root, &workspace_b).unwrap();
+        let newer = SidSession::create_with_workspace(&config_root, &workspace_a).unwrap();
+
+        let found = SidSession::find_latest_for_workspace(&config_root, &workspace_a)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.root(), newer.root());
+        assert_ne!(found.root(), older.root());
+
+        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(PathBuf::from(workspace_a.as_str())).unwrap();
+        fs::remove_dir_all(PathBuf::from(workspace_b.as_str())).unwrap();
+    }
+
+    #[test]
+    fn find_latest_for_workspace_ignores_legacy_sessions_in_shared_sid_home() {
+        let config_root = unique_temp_dir("config-root");
+        let workspace_root = unique_temp_dir("workspace-root");
+        fs::create_dir_all(workspace_root.as_str()).unwrap();
+        let session = SidSession::create_with_workspace(&config_root, &workspace_root).unwrap();
+        remove_workspace_root_metadata(session.root());
+
+        let found = SidSession::find_latest_for_workspace(&config_root, &workspace_root).unwrap();
+        assert!(found.is_none());
+
+        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn find_latest_for_workspace_allows_legacy_sessions_in_workspace_local_root() {
+        let workspace_root = unique_temp_dir("workspace-root");
+        fs::create_dir_all(workspace_root.as_str()).unwrap();
+        let session = SidSession::create_with_workspace(&workspace_root, &workspace_root).unwrap();
+        remove_workspace_root_metadata(session.root());
+
+        let found = SidSession::find_latest_for_workspace(&workspace_root, &workspace_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.root(), session.root());
+
+        fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    #[test]
     fn clear_bash_state_removes_snapshot_file() {
         let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
         let session = SidSession::create_in(sessions_root.clone()).unwrap();
@@ -1330,6 +1544,14 @@ mod tests {
         assert_eq!(session.read_bash_state().unwrap(), None);
 
         fs::remove_dir_all(sessions_root).unwrap();
+    }
+
+    fn remove_workspace_root_metadata(root: &StdPath) {
+        let path = root.join(SESSION_METADATA_FILE);
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        metadata.as_object_mut().unwrap().remove("workspace_root");
+        fs::write(path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
     }
 
     fn assert_timestamp_session_id(id: &str) {

@@ -8,6 +8,7 @@ sid - run a small, rc-configured coding agent in the current workspace
 
 ```text
 sid [OPTIONS]
+sid --prompt PROMPT [OPTIONS]
 sid --resume SESSION [OPTIONS]
 sid --raw [--resume SESSION] [OPTIONS]
 SID_HOME=DIR sid [OPTIONS]
@@ -39,6 +40,11 @@ or loading transcripts, clearing context, and printing session stats.  Use
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
 
+Use `--prompt <text>` to run one non-interactive user turn, print the assistant
+response, and exit.  In prompt mode `sid` resumes the most recently started
+session for the current working directory by default; use `--resume` to target
+a specific session instead.
+
 Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
 mode the process owns session state and emits typed events, prompts, and
 terminal results instead of the human-oriented terminal UI.  Requests are
@@ -63,6 +69,12 @@ Start a session:
 ```sh
 export CLAUDIUS_API_KEY="..."
 SID_HOME=~/.sid sid
+```
+
+Run one prompt and continue the latest session for the current directory:
+
+```sh
+SID_HOME=~/.sid sid --prompt "Summarize the pending changes"
 ```
 
 Run one bash command through the configured bash tool and exit:
@@ -132,6 +144,12 @@ warning.
 `--bash-debug COMMAND`
 : Run `COMMAND` through the configured built-in bash tool and exit.  This is
   useful for checking tool configuration without starting an interactive chat.
+
+`--prompt PROMPT`
+: Run one non-interactive user turn, print the assistant response, and exit.
+  Unless `--resume` is supplied, prompt mode resumes the most recently started
+  session recorded for the current working directory.  If no matching session
+  exists, `sid` creates a new one.
 
 `--raw`
 : Run a JSONL protocol server on stdin/stdout instead of the interactive
@@ -600,6 +618,11 @@ new one.  `sid` reloads `transcript.json`, appends a `session_resume` record to
 `events.jsonl`, continues `api.jsonl` and ordered tool sequences, and restores
 `bash-state.sh` into the next fresh PTY-backed bash session.
 
+Starting `sid --prompt <text>` without `--resume` scans the sessions root for
+the most recently started session whose recorded `workspace_root` matches the
+current directory, resumes that transcript, appends the new turn, and exits
+after printing the response.
+
 Running `/compact` creates a fresh session directory instead of mutating the
 current one.  The new `session.json` records which prior session it came from
 plus the prompt/model snapshot for the summary writer so future
@@ -822,7 +845,7 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/session.json`
 : Session metadata with the timestamp id, ISO-like creation time,
-  microsecond Unix timestamp, and process id.
+  microsecond Unix timestamp, process id, and recorded `workspace_root`.
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/transcript.json`
 : Auto-saved chat transcript.
