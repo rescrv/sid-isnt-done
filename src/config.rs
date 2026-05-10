@@ -178,6 +178,8 @@ pub struct AgentConfig {
     /// Short prose description of the agent's purpose.
     pub description: Option<String>,
     /// Tool identifiers this agent is allowed to invoke.
+    pub ps1: Option<String>,
+    /// Tool identifiers this agent is allowed to invoke.
     pub tools: Vec<String>,
     /// Skill identifiers this agent has access to.
     pub skills: Vec<String>,
@@ -221,6 +223,7 @@ impl AgentConfig {
         let enabled = rc_conf.service_switch(agent);
         let display_name = lookup_expanded(&provider, agent, "NAME")?;
         let description = lookup_expanded(&provider, agent, "DESC")?;
+        let ps1 = lookup_ps1_field(&provider, agent)?;
         let tools = lookup_split_field(&provider, agent, "TOOLS")?;
         let skills = lookup_split_field(&provider, agent, "SKILLS")?;
         let user_instructions_enabled =
@@ -272,6 +275,7 @@ impl AgentConfig {
             enabled,
             display_name,
             description,
+            ps1,
             tools,
             skills,
             prompt_path,
@@ -989,6 +993,16 @@ fn lookup_nonempty_field(
     }))
 }
 
+fn lookup_ps1_field(
+    provider: &impl VariableProvider,
+    scope: &str,
+) -> Result<Option<String>, SError> {
+    let Some(value) = provider.lookup("PS1") else {
+        return Ok(None);
+    };
+    expand_preserving_whitespace(provider, scope, "PS1", &value).map(Some)
+}
+
 fn lookup_bool_field(
     provider: &impl VariableProvider,
     scope: &str,
@@ -1091,6 +1105,41 @@ fn invalid_config_field(
         .with_string_field("field", field)
         .with_string_field("value", value)
         .with_string_field("reason", &reason)
+}
+
+fn expand_preserving_whitespace(
+    provider: &impl VariableProvider,
+    scope: &str,
+    field: &str,
+    value: &str,
+) -> Result<String, SError> {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' | '`' => {
+                quoted.push('\\');
+                quoted.push(ch);
+            }
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+
+    let expanded = shvar::expand_recursive(provider, &quoted)
+        .map_err(|err| invalid_config_field(scope, field, value, format!("{err:?}")))?;
+    let split = shvar::split(&expanded)
+        .map_err(|err| invalid_config_field(scope, field, value, format!("{err:?}")))?;
+    if split.len() == 1 {
+        Ok(split.into_iter().next().unwrap_or_default())
+    } else {
+        Err(invalid_config_field(
+            scope,
+            field,
+            value,
+            format!("expected one shell word after expansion, got {}", split.len()),
+        ))
+    }
 }
 
 fn expand_config_value(
@@ -1298,6 +1347,7 @@ format_ALIASES="fmt"
             Some("Let's go principal engineer")
         );
         assert_eq!(build.description.as_deref(), Some("buildit"));
+        assert_eq!(build.ps1, None);
         assert_eq!(build.tools, vec!["format".to_string(), "bash".to_string()]);
         assert_eq!(build.skills, vec!["*".to_string(), "rust docs".to_string()]);
         assert_eq!(
@@ -1584,6 +1634,28 @@ fmt_PROMPT_REVIEW='tool-prompts/missing.md'
         assert!(err.contains("invalid_config_field"));
         assert!(err.contains("TOP_P"));
         assert!(err.contains("wat"));
+    }
+
+    #[test]
+    fn ps1_expands_with_shell_semantics_and_preserves_trailing_space() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+ROLE='principal engineer'
+build_ENABLED=YES
+build_PS1='${NAME:-${ROLE}}> '
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let build = config.agents.get("build").unwrap();
+        assert_eq!(build.ps1.as_deref(), Some("principal engineer> "));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]

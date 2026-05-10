@@ -128,6 +128,7 @@ impl SidToolScope {
 pub struct SidAgent {
     id: String,
     enabled: SwitchPosition,
+    ps1: Option<String>,
     config: ChatConfig,
     named_prompts: BTreeMap<String, String>,
     tools: Vec<Arc<dyn Tool<Self>>>,
@@ -184,6 +185,7 @@ impl SidAgent {
         Self::with_parts(
             id,
             SwitchPosition::Yes,
+            None,
             config,
             BTreeMap::new(),
             vec![],
@@ -358,6 +360,10 @@ impl SidAgent {
     }
 
     /// Return `true` when the agent's enablement switch is [`SwitchPosition::Manual`].
+    pub fn ps1(&self) -> Option<&str> {
+        self.ps1.as_deref()
+    }
+
     pub fn requires_confirmation(&self) -> bool {
         self.enabled == SwitchPosition::Manual
     }
@@ -419,6 +425,7 @@ impl SidAgent {
         Ok(Self::with_parts(
             agent.to_string(),
             agent_config.enabled,
+            agent_config.ps1.clone(),
             chat_config,
             named_prompts,
             built_tools.tools,
@@ -441,6 +448,7 @@ impl SidAgent {
     fn with_parts(
         id: String,
         enabled: SwitchPosition,
+        ps1: Option<String>,
         config: ChatConfig,
         named_prompts: BTreeMap<String, String>,
         tools: Vec<Arc<dyn Tool<Self>>>,
@@ -460,6 +468,7 @@ impl SidAgent {
         Self {
             id,
             enabled,
+            ps1,
             config,
             named_prompts,
             tools,
@@ -3362,6 +3371,7 @@ mod tests {
         let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
 
         assert_eq!(agent.id(), "build");
+        assert_eq!(agent.ps1(), Some("Let's go principal engineer> "));
         assert_eq!(agent.stream_label(), "build".to_string());
         assert_eq!(
             agent.config.system_prompt_text(),
@@ -5598,6 +5608,7 @@ evil_ENABLED="NO"
 
 build_NAME="Let's go ${ROLE}"
 build_DESC="buildit"
+build_PS1='${NAME}> '
 build_TOOLS='format shell'
 
 plan_MODEL=claude-sonnet-4-5
