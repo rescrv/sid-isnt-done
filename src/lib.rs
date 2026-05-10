@@ -78,14 +78,8 @@ const DEFAULT_COMPACTOR_AGENT_ID: &str = "compact";
 const USER_CANCELLED_ACTION: &str = "user cancelled action";
 const ASK_AN_EXPERT_TOOL_NAME: &str = "ask_an_expert";
 const MAX_ASK_AN_EXPERT_DEPTH: usize = 8;
-const BASH_STATE_CAPTURE_COMMAND: &str = concat!(
-    "builtin printf 'builtin cd -- %q\\n' \"$PWD\"\n",
-    "builtin set +o\n",
-    "builtin shopt -p\n",
-    "builtin export -p\n",
-    "builtin alias -p\n",
-    "builtin declare -pf\n",
-);
+const BASH_CONSOLE_RESET_MESSAGE: &str = "bash console has reset";
+const SYNTHETIC_BASH_RESUME_TOOL_USE_ID_PREFIX: &str = "toolu_resume_bash_restart_";
 const DEFAULT_COMPACTOR_SYSTEM_PROMPT: &str = concat!(
     "You are the sid compaction agent.\n",
     "Turn the conversation history into a compact, high-signal handoff summary for a future session.\n",
@@ -540,7 +534,7 @@ impl SidAgent {
         command: &str,
         restart: bool,
     ) -> Result<String, std::io::Error> {
-        self.run_bash_command_with_renderer(command, restart, None)
+        self.run_bash_command_with_renderer(Some(command), restart, None)
             .await
     }
 
@@ -559,13 +553,13 @@ impl SidAgent {
         restart: bool,
         renderer: &mut dyn Renderer,
     ) -> Result<String, std::io::Error> {
-        self.run_bash_command_with_renderer(command, restart, Some(renderer))
+        self.run_bash_command_with_renderer(Some(command), restart, Some(renderer))
             .await
     }
 
     async fn run_bash_command_with_renderer(
         &self,
-        command: &str,
+        command: Option<&str>,
         restart: bool,
         renderer: Option<&mut dyn Renderer>,
     ) -> Result<String, std::io::Error> {
@@ -585,13 +579,26 @@ impl SidAgent {
                 ));
             }
             SwitchPosition::Manual => {
-                let input_value = serde_json::json!({
-                    "command": command,
-                    "restart": restart,
-                    "cwd": self.workspace_root.as_str(),
-                    "writable_roots": self.writable_roots.as_slice(),
-                });
-                match confirm_manual_tool_call("bash", &input_value, None, renderer) {
+                let mut input_value = serde_json::Map::from_iter([
+                    ("restart".to_string(), serde_json::json!(restart)),
+                    (
+                        "cwd".to_string(),
+                        serde_json::json!(self.workspace_root.as_str()),
+                    ),
+                    (
+                        "writable_roots".to_string(),
+                        serde_json::json!(self.writable_roots.as_slice()),
+                    ),
+                ]);
+                if let Some(command) = command {
+                    input_value.insert("command".to_string(), serde_json::json!(command));
+                }
+                match confirm_manual_tool_call(
+                    "bash",
+                    &serde_json::Value::Object(input_value),
+                    None,
+                    renderer,
+                ) {
                     Ok(ManualToolConfirmation::Allow) => {}
                     Ok(ManualToolConfirmation::Deny) => {
                         return Err(std::io::Error::new(
@@ -612,46 +619,40 @@ impl SidAgent {
             }
         }
 
-        if restart {
-            self.clear_persisted_bash_state()?;
-        }
-
         let mut session = self.bash_session.lock().await;
+        if restart {
+            *session = None;
+        }
+        let Some(command) = command else {
+            if restart {
+                return Ok(BASH_CONSOLE_RESET_MESSAGE.to_string());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bash requires a command unless restart is true",
+            ));
+        };
         if session.is_none() {
-            *session = Some(self.spawn_bash_session(!restart).await?);
+            *session = Some(self.spawn_bash_session().await?);
         }
 
         let result = {
             let session = session
                 .as_mut()
                 .expect("bash PTY session should be initialized");
-            session.run(command, restart).await
+            session.run(command, false).await
         };
         match result {
-            Ok(result) => {
-                let bash_session = session
-                    .as_mut()
-                    .expect("bash PTY session should still be initialized");
-                self.persist_bash_state(bash_session).await?;
-                render_bash_pty_result(result)
-            }
+            Ok(result) => render_bash_pty_result(result),
             Err(err) => {
-                let _ = self.clear_persisted_bash_state();
                 *session = None;
                 Err(err)
             }
         }
     }
 
-    async fn spawn_bash_session(
-        &self,
-        restore_state: bool,
-    ) -> Result<BashPtySession, std::io::Error> {
-        let mut session = BashPtySession::new(self.bash_pty_config()).await?;
-        if restore_state {
-            self.restore_bash_state(&mut session).await?;
-        }
-        Ok(session)
+    async fn spawn_bash_session(&self) -> Result<BashPtySession, std::io::Error> {
+        BashPtySession::new(self.bash_pty_config()).await
     }
 
     fn bash_pty_config(&self) -> BashPtyConfig {
@@ -687,67 +688,6 @@ impl SidAgent {
             shell_wrapper: seatbelt::shell_wrapper(&self.writable_roots),
             ..BashPtyConfig::default()
         }
-    }
-
-    fn clear_persisted_bash_state(&self) -> Result<(), std::io::Error> {
-        if let Some(session) = self.session.as_ref() {
-            session
-                .clear_bash_state()
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-        }
-        Ok(())
-    }
-
-    async fn restore_bash_state(
-        &self,
-        bash_session: &mut BashPtySession,
-    ) -> Result<(), std::io::Error> {
-        let Some(sid_session) = self.session.as_ref() else {
-            return Ok(());
-        };
-        let Some(_) = sid_session
-            .read_bash_state()
-            .map_err(|err| std::io::Error::other(err.to_string()))?
-        else {
-            return Ok(());
-        };
-
-        let restore_command = format!(
-            "builtin source {}",
-            shvar::quote_string(sid_session.bash_state_path().to_string_lossy().as_ref())
-        );
-        let result = bash_session.run(&restore_command, false).await?;
-        if result.status.success() {
-            Ok(())
-        } else {
-            Err(bash_state_io_error("failed to restore bash state", &result))
-        }
-    }
-
-    async fn persist_bash_state(
-        &self,
-        bash_session: &mut BashPtySession,
-    ) -> Result<(), std::io::Error> {
-        let Some(sid_session) = self.session.as_ref() else {
-            return Ok(());
-        };
-        if !bash_session.is_alive()? {
-            sid_session
-                .clear_bash_state()
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-            return Ok(());
-        }
-
-        let snapshot = bash_session.run(BASH_STATE_CAPTURE_COMMAND, false).await?;
-        if !snapshot.status.success() {
-            return Err(bash_state_io_error(
-                "failed to capture bash state",
-                &snapshot,
-            ));
-        }
-        sid_session
-            .write_bash_state(&snapshot.output)
-            .map_err(|err| std::io::Error::other(err.to_string()))
     }
 
     fn memory_source(&self) -> Option<&CompactionProvenance> {
@@ -1929,7 +1869,8 @@ impl SidBashCallback {
     ) -> ToolResult {
         #[derive(serde::Deserialize)]
         struct BashInput {
-            command: String,
+            #[serde(default)]
+            command: Option<String>,
             #[serde(default)]
             restart: bool,
         }
@@ -1940,7 +1881,7 @@ impl SidBashCallback {
         };
 
         match agent
-            .run_bash_command_with_renderer(&bash.command, bash.restart, renderer)
+            .run_bash_command_with_renderer(bash.command.as_deref(), bash.restart, renderer)
             .await
         {
             Ok(output) => tool_success_result(&tool_use.id, output),
@@ -2695,15 +2636,6 @@ fn render_bash_pty_result(result: BashPtyResult) -> Result<String, std::io::Erro
     }
 }
 
-fn bash_state_io_error(context: &str, result: &BashPtyResult) -> std::io::Error {
-    let mut rendered = strip_ansi_escapes(&result.output);
-    if !rendered.is_empty() && !rendered.ends_with('\n') {
-        rendered.push('\n');
-    }
-    rendered.push_str(&format!("{}", result.status));
-    std::io::Error::other(format!("{context}: {rendered}"))
-}
-
 /// Strip ANSI escape sequences from terminal output.
 ///
 /// Removes CSI sequences (`ESC[…X`), OSC sequences (`ESC]…ST`), and simple
@@ -2834,6 +2766,54 @@ pub fn compacted_transcript(parent_session_id: &str, summary: &str) -> Vec<Messa
         ),
         MessageParam::assistant(summary),
     ]
+}
+
+/// Append a synthetic bash reset tool exchange to a resumed transcript.
+pub fn append_resumed_bash_reset_marker(messages: &mut Vec<MessageParam>) {
+    let tool_use_id = next_synthetic_bash_resume_tool_use_id(messages);
+    messages.push(MessageParam::new(
+        MessageParamContent::Array(vec![
+            ToolUseBlock::new(
+                &tool_use_id,
+                "bash",
+                serde_json::json!({
+                    "restart": true
+                }),
+            )
+            .into(),
+        ]),
+        MessageRole::Assistant,
+    ));
+    messages.push(MessageParam::new(
+        MessageParamContent::Array(vec![
+            ToolResultBlock::new(tool_use_id)
+                .with_string_content(BASH_CONSOLE_RESET_MESSAGE.to_string())
+                .into(),
+        ]),
+        MessageRole::User,
+    ));
+}
+
+fn next_synthetic_bash_resume_tool_use_id(messages: &[MessageParam]) -> String {
+    let mut next = 1usize;
+    for message in messages {
+        let MessageParamContent::Array(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            let Some(tool_use) = block.as_tool_use() else {
+                continue;
+            };
+            if let Some(suffix) = tool_use
+                .id
+                .strip_prefix(SYNTHETIC_BASH_RESUME_TOOL_USE_ID_PREFIX)
+                && let Ok(index) = suffix.parse::<usize>()
+            {
+                next = next.max(index + 1);
+            }
+        }
+    }
+    format!("{SYNTHETIC_BASH_RESUME_TOOL_USE_ID_PREFIX}{next}")
 }
 
 fn tool_success_result(tool_use_id: &str, message: String) -> ToolResult {
@@ -3068,9 +3048,10 @@ You are operating in the sid-isn't-done environment.  Tools:
 - bash: A genuine bash shell:
     - Connected via PTY.
     - Without support for cursor positioning.
-    - With state persistence between invocations.
+    - With state persistence between invocations within this sid process.
     - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
     - `restart: true` throws the session away and starts fresh.
+    - After `sid --resume`, transcript history records a synthetic `restart: true` reset and the next real bash command starts from a fresh shell.
     - Initial CWD is {workspace_root}.
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.
@@ -4943,14 +4924,69 @@ esac
     }
 
     #[test]
-    fn resumed_session_restores_bash_state_snapshot() {
+    fn builtin_bash_tool_restart_without_command_resets_console() {
         let root = temp_config_root("agent");
         write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
-        let canonical_agents = Path::try_from(
-            fs::canonicalize(root.join("agents").as_str())
-                .expect("canonicalize agents directory should succeed"),
+        let canonical_root = Path::try_from(
+            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
         )
-        .expect("canonical agents path should be valid UTF-8")
+        .expect("canonical root path should be valid UTF-8")
+        .into_owned();
+
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let _ = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_1",
+            json!({
+                "command": "export FOO=bar\ncd agents",
+                "restart": true
+            }),
+        );
+        let reset = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_2",
+            json!({
+                "restart": true
+            }),
+        );
+        assert_eq!(
+            unwrap_success_block(reset),
+            ToolResultBlock {
+                tool_use_id: "toolu_bash_2".to_string(),
+                cache_control: None,
+                content: Some(ToolResultBlockContent::String(
+                    BASH_CONSOLE_RESET_MESSAGE.to_string()
+                )),
+                is_error: None,
+            }
+        );
+        let fresh = runtime
+            .block_on(agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", false))
+            .unwrap();
+        assert_eq!(
+            fresh.trim_end(),
+            format!("unset:{}", canonical_root.as_str())
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn resumed_session_starts_with_fresh_bash_state() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let canonical_root = Path::try_from(
+            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
+        )
+        .expect("canonical root path should be valid UTF-8")
         .into_owned();
         let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
 
@@ -4973,16 +5009,13 @@ esac
         let resumed_agent = SidAgent::from_config(&config, "build", root.clone())
             .unwrap()
             .with_session(resumed);
-        let restored = runtime
-            .block_on(resumed_agent.bash(
-                "if shopt -qo nounset; then nounset=on; else nounset=off; fi\nprintf '%s:%s:%s:%s:%s' \"$FOO\" \"$(f)\" \"$(ll)\" \"$PWD\" \"$nounset\"",
-                false,
-            ))
+        let fresh = runtime
+            .block_on(resumed_agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", false))
             .unwrap();
 
         assert_eq!(
-            restored.trim_end(),
-            format!("bar:hi:alias:{}:on", canonical_agents.as_str()),
+            fresh.trim_end(),
+            format!("unset:{}", canonical_root.as_str()),
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();
@@ -4990,55 +5023,60 @@ esac
     }
 
     #[test]
-    fn resumed_session_restart_discards_saved_bash_state() {
-        let root = temp_config_root("agent");
-        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
-        let canonical_root = Path::try_from(
-            fs::canonicalize(root.as_str()).expect("canonicalize root directory should succeed"),
-        )
-        .expect("canonical root path should be valid UTF-8")
-        .into_owned();
-        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
+    fn append_resumed_bash_reset_marker_uses_restart_only_tool_call() {
+        let mut messages = vec![MessageParam::user("resume me")];
 
-        let config = Config::load(&root).unwrap();
-        let sid_session = Arc::new(SidSession::create_in(sessions_root.clone()).unwrap());
-        let agent = SidAgent::from_config(&config, "build", root.clone())
-            .unwrap()
-            .with_session(sid_session.clone());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        append_resumed_bash_reset_marker(&mut messages);
+        append_resumed_bash_reset_marker(&mut messages);
 
-        runtime
-            .block_on(agent.bash("export FOO=bar\ncd agents", true))
-            .unwrap();
+        assert_eq!(messages.len(), 5);
+        let MessageParamContent::Array(first_blocks) = &messages[1].content else {
+            panic!("expected assistant tool use block");
+        };
+        let first_tool_use = first_blocks[0].as_tool_use().unwrap();
+        assert_eq!(first_tool_use.name, "bash");
+        assert_eq!(first_tool_use.input, json!({ "restart": true }));
+        assert_eq!(first_tool_use.id, "toolu_resume_bash_restart_1");
 
-        let resumed =
-            Arc::new(SidSession::resume_in(sessions_root.clone(), sid_session.id()).unwrap());
-        let resumed_agent = SidAgent::from_config(&config, "build", root.clone())
-            .unwrap()
-            .with_session(resumed.clone());
-        let restarted = runtime
-            .block_on(resumed_agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", true))
-            .unwrap();
+        let MessageParamContent::Array(first_result_blocks) = &messages[2].content else {
+            panic!("expected user tool result block");
+        };
+        let first_result = first_result_blocks[0].as_tool_result().unwrap();
+        assert_eq!(first_result.tool_use_id, "toolu_resume_bash_restart_1");
         assert_eq!(
-            restarted.trim_end(),
-            format!("unset:{}", canonical_root.as_str())
+            tool_block_text(first_result.clone()),
+            BASH_CONSOLE_RESET_MESSAGE
         );
 
-        let resumed_again =
-            Arc::new(SidSession::resume_in(sessions_root.clone(), sid_session.id()).unwrap());
-        let resumed_again_agent = SidAgent::from_config(&config, "build", root.clone())
-            .unwrap()
-            .with_session(resumed_again);
-        let restored = runtime
-            .block_on(resumed_again_agent.bash("printf '%s:%s' \"${FOO-unset}\" \"$PWD\"", false))
-            .unwrap();
+        let MessageParamContent::Array(second_blocks) = &messages[3].content else {
+            panic!("expected second assistant tool use block");
+        };
+        let second_tool_use = second_blocks[0].as_tool_use().unwrap();
+        assert_eq!(second_tool_use.id, "toolu_resume_bash_restart_2");
+    }
+
+    #[test]
+    fn restart_only_bash_tool_call_requires_restart() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = invoke_bash_tool(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_invalid",
+            json!({}),
+        );
         assert_eq!(
-            restored.trim_end(),
-            format!("unset:{}", canonical_root.as_str())
+            unwrap_error_text(result),
+            "bash requires a command unless restart is true"
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();
-        fs::remove_dir_all(sessions_root).unwrap();
     }
 
     #[test]
@@ -5517,9 +5555,10 @@ You are operating in the sid-isn't-done environment.  Tools:
 - bash: A genuine bash shell:
     - Connected via PTY.
     - Without support for cursor positioning.
-    - With state persistence between invocations.
+    - With state persistence between invocations within this sid process.
     - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
     - `restart: true` throws the session away and starts fresh.
+    - After `sid --resume`, transcript history records a synthetic `restart: true` reset and the next real bash command starts from a fresh shell.
     - Initial CWD is {workspace_root}.
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.

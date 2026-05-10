@@ -159,8 +159,9 @@ warning.
 : Resume an existing session by timestamp id or by session directory path.
   Session ids are resolved under `${SID_SESSIONS:-${SID_HOME}/sessions}`.
   Resuming reloads the saved transcript, continues the existing event and API
-  journals, preserves ordered tool numbering, and restores the persisted bash
-  shell snapshot.
+  journals, preserves ordered tool numbering, appends a synthetic bash
+  `{"restart": true}` tool/result pair to the transcript, and leaves the next
+  real bash command to start a fresh shell.
 
 `--help`
 : Print the command-line help.
@@ -602,7 +603,7 @@ esac
 Each `sid` process creates a timestamp-named session directory under
 `${SID_SESSIONS:-${SID_HOME}/sessions}`, for example
 `2026-04-20T18-42-13.123456-0700`.  Durable session state is written to a small
-set of append-only journals plus a bash snapshot file:
+set of append-only journals:
 
 ```text
 session.json
@@ -610,13 +611,13 @@ transcript.json
 events.jsonl
 api.jsonl
 tool-streams.jsonl
-bash-state.sh
 ```
 
 Starting `sid --resume <session>` reuses that directory instead of creating a
 new one.  `sid` reloads `transcript.json`, appends a `session_resume` record to
-`events.jsonl`, continues `api.jsonl` and ordered tool sequences, and restores
-`bash-state.sh` into the next fresh PTY-backed bash session.
+`events.jsonl`, continues `api.jsonl` and ordered tool sequences, appends a
+synthetic bash `{"restart": true}` tool/result pair to `transcript.json`, and
+starts the next real PTY-backed bash command from a fresh shell.
 
 Starting `sid --prompt <text>` without `--resume` scans the sessions root for
 the most recently started session whose recorded `workspace_root` matches the
@@ -858,9 +859,6 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tool-streams.jsonl`
 : Tool confirmation, stdout, and stderr stream journal.
-
-`${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/bash-state.sh`
-: Restorable bash shell snapshot used when a session is resumed.
 
 `${SID_SESSIONS:-${SID_HOME}/sessions}/${SID_SESSION_ID}/tmp/`
 : Runtime scratch.  Tool directories and bash temporary files live here while

@@ -28,8 +28,8 @@ use sid_isnt_done::raw_protocol::{
     install_tool_output_observer,
 };
 use sid_isnt_done::{
-    COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
-    seatbelt, session, session::SidSession,
+    COMPACTION_REQUEST_PROMPT, SidAgent, append_resumed_bash_reset_marker, compacted_transcript,
+    extract_last_assistant_text, seatbelt, session, session::SidSession,
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
@@ -546,20 +546,22 @@ impl SidRuntimeSession {
         }
 
         let transcript_path = self.sid_session.transcript_path();
-        if !transcript_path.is_file() {
-            return Ok(());
+        if transcript_path.is_file() {
+            self.chat
+                .load_transcript_from(&transcript_path)
+                .map_err(|err| {
+                    cli_error(
+                        "resume_transcript_failed",
+                        "failed to load resumed transcript",
+                    )
+                    .with_string_field("path", transcript_path.to_string_lossy().as_ref())
+                    .with_string_field("cause", &err.to_string())
+                })?;
         }
-
-        self.chat
-            .load_transcript_from(&transcript_path)
-            .map_err(|err| {
-                cli_error(
-                    "resume_transcript_failed",
-                    "failed to load resumed transcript",
-                )
-                .with_string_field("path", transcript_path.to_string_lossy().as_ref())
-                .with_string_field("cause", &err.to_string())
-            })
+        let mut messages = self.chat.clone_messages();
+        append_resumed_bash_reset_marker(&mut messages);
+        self.chat.replace_messages(messages);
+        self.persist_transcript()
     }
 
     fn set_model(&mut self, model_name: &str) {
@@ -741,10 +743,6 @@ impl SidRuntimeSession {
                 expert,
             },
         )?);
-
-        if let Some(state) = self.sid_session.read_bash_state()? {
-            next_sid_session.write_bash_state(&state)?;
-        }
 
         let transcript_path = next_sid_session.transcript_path();
         self.fallback_config.transcript_path = Some(transcript_path.clone());
@@ -2180,7 +2178,7 @@ mod tests {
     use claudius::MessageParam;
     use claudius::chat::{ChatConfig, ChatSession};
     use serde::Deserialize;
-    use sid_isnt_done::{SidAgent, session::SidSession};
+    use sid_isnt_done::{SidAgent, append_resumed_bash_reset_marker, session::SidSession};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2257,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn load_resumed_transcript_restores_saved_history() {
+    fn load_resumed_transcript_restores_saved_history_and_appends_bash_reset_marker() {
         let workspace_root = unique_workspace_root("resume-transcript");
         let sid_session = Arc::new(SidSession::create(&workspace_root).unwrap());
 
@@ -2275,10 +2273,9 @@ mod tests {
             new_runtime_session(&workspace_root, &workspace_root, sid_session.clone(), None);
 
         session.load_resumed_transcript(true).unwrap();
-        assert_eq!(
-            session.clone_messages(),
-            vec![MessageParam::user("resume me")]
-        );
+        let mut expected = vec![MessageParam::user("resume me")];
+        append_resumed_bash_reset_marker(&mut expected);
+        assert_eq!(session.clone_messages(), expected);
 
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
     }

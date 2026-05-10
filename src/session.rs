@@ -40,7 +40,6 @@ const TRANSCRIPT_FILE: &str = "transcript.json";
 const EVENTS_JOURNAL_FILE: &str = "events.jsonl";
 const API_JOURNAL_FILE: &str = "api.jsonl";
 const TOOL_STREAMS_JOURNAL_FILE: &str = "tool-streams.jsonl";
-const BASH_STATE_FILE: &str = "bash-state.sh";
 
 /// Identity snapshot of the agent that produced a compacted session summary.
 ///
@@ -87,7 +86,6 @@ pub struct SidSession {
     events_path: PathBuf,
     api_path: PathBuf,
     tool_streams_path: PathBuf,
-    bash_state_path: PathBuf,
     compaction_provenance: Option<CompactionProvenance>,
     counters: SessionCounters,
     journal_lock: StdMutex<()>,
@@ -331,10 +329,12 @@ impl SidSession {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn create_in(sessions_root: PathBuf) -> Result<Self, SError> {
         Self::create_in_with_provenance(sessions_root, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_compacted_in(
         sessions_root: PathBuf,
         provenance: CompactionProvenance,
@@ -421,7 +421,6 @@ impl SidSession {
             events_path: root.join(EVENTS_JOURNAL_FILE),
             api_path: root.join(API_JOURNAL_FILE),
             tool_streams_path: root.join(TOOL_STREAMS_JOURNAL_FILE),
-            bash_state_path: root.join(BASH_STATE_FILE),
             compaction_provenance,
             counters: SessionCounters::default(),
             journal_lock: StdMutex::new(()),
@@ -456,7 +455,6 @@ impl SidSession {
             events_path: root.join(EVENTS_JOURNAL_FILE),
             api_path: root.join(API_JOURNAL_FILE),
             tool_streams_path: root.join(TOOL_STREAMS_JOURNAL_FILE),
-            bash_state_path: root.join(BASH_STATE_FILE),
             compaction_provenance: metadata.compacted_from,
             counters: SessionCounters::from_state(counters),
             journal_lock: StdMutex::new(()),
@@ -547,51 +545,6 @@ impl SidSession {
 
     pub(crate) fn bash_tmp_dir(&self) -> &PathBuf {
         &self.bash_tmp_dir
-    }
-
-    pub(crate) fn bash_state_path(&self) -> &PathBuf {
-        &self.bash_state_path
-    }
-
-    /// Read the saved bash session state, if any.
-    ///
-    /// Returns `Ok(None)` when no state file exists or the file is empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on I/O failure.
-    pub fn read_bash_state(&self) -> Result<Option<String>, SError> {
-        match fs::read_to_string(&self.bash_state_path) {
-            Ok(state) if state.trim().is_empty() => Ok(None),
-            Ok(state) => Ok(Some(state)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(session_error("io_error", "failed to read bash state")
-                .with_string_field("path", self.bash_state_path.to_string_lossy().as_ref())
-                .with_string_field("cause", &err.to_string())),
-        }
-    }
-
-    /// Persist bash session state to disk for later resumption.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on I/O failure.
-    pub fn write_bash_state(&self, state: &str) -> Result<(), SError> {
-        fs::write(&self.bash_state_path, state).map_err(|err| {
-            session_error("io_error", "failed to write bash state")
-                .with_string_field("path", self.bash_state_path.to_string_lossy().as_ref())
-                .with_string_field("cause", &err.to_string())
-        })
-    }
-
-    pub(crate) fn clear_bash_state(&self) -> Result<(), SError> {
-        match fs::remove_file(&self.bash_state_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(session_error("io_error", "failed to clear bash state")
-                .with_string_field("path", self.bash_state_path.to_string_lossy().as_ref())
-                .with_string_field("cause", &err.to_string())),
-        }
     }
 
     pub(crate) fn tool_stream_journal(&self) -> ToolStreamJournal {
@@ -1404,14 +1357,9 @@ mod tests {
             .unwrap();
         session.log_api_response(&json!({ "id": "msg_1" })).unwrap();
         session.create_tool_invocation_dirs("sidreq_first").unwrap();
-        session.write_bash_state("export FOO=bar\n").unwrap();
 
         let resumed = SidSession::resume_in(sessions_root.clone(), session.id()).unwrap();
         assert_eq!(resumed.root(), session.root());
-        assert_eq!(
-            resumed.read_bash_state().unwrap(),
-            Some("export FOO=bar\n".to_string())
-        );
 
         resumed
             .log_api_request(&json!({ "messages": ["again"] }))
@@ -1528,24 +1476,6 @@ mod tests {
 
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
     }
-
-    #[test]
-    fn clear_bash_state_removes_snapshot_file() {
-        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
-        let session = SidSession::create_in(sessions_root.clone()).unwrap();
-
-        session.write_bash_state("export FOO=bar\n").unwrap();
-        assert_eq!(
-            session.read_bash_state().unwrap(),
-            Some("export FOO=bar\n".to_string())
-        );
-
-        session.clear_bash_state().unwrap();
-        assert_eq!(session.read_bash_state().unwrap(), None);
-
-        fs::remove_dir_all(sessions_root).unwrap();
-    }
-
     fn remove_workspace_root_metadata(root: &StdPath) {
         let path = root.join(SESSION_METADATA_FILE);
         let mut metadata: serde_json::Value =
