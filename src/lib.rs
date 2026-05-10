@@ -364,6 +364,7 @@ impl SidAgent {
         self.ps1.as_deref()
     }
 
+    /// Return `true` when the agent's enablement switch is [`SwitchPosition::Manual`].
     pub fn requires_confirmation(&self) -> bool {
         self.enabled == SwitchPosition::Manual
     }
@@ -1831,7 +1832,7 @@ fn format_cost(micro_cents: u64) -> String {
     // Convert remainder to fractional dollars with 4 decimal places.
     // remainder / 10_000 gives ten-thousandths of a dollar.
     let frac = remainder / 10_000;
-    format!("${}.{:04}", dollars, frac)
+    format!("${dollars}.{frac:04}")
 }
 
 fn tokens_to_u64(tokens: i32) -> u64 {
@@ -5512,37 +5513,30 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Uses sid's virtual filesystem.
     - The virtual filesystem maps / to the workspace root.
     - It is not an operating-system chroot.
-    - Absolute editor paths are workspace-rooted; /foo means {}/foo.
+    - Absolute editor paths are workspace-rooted; /foo means {workspace_root}/foo.
 - bash: A genuine bash shell:
     - Connected via PTY.
     - Without support for cursor positioning.
     - With state persistence between invocations.
     - With PS0, PS1, PS2 and PROMPT_COMMAND set to readonly.
     - `restart: true` throws the session away and starts fresh.
-    - Initial CWD is {}.
+    - Initial CWD is {workspace_root}.
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
     - Use the index to browse skills if you need specialized knowledge.
 
 CRITICAL — the edit tool and bash tool use different path namespaces:
-- The edit tool's / is the workspace root ({}).
+- The edit tool's / is the workspace root ({workspace_root}).
   To edit a file at the workspace root, use /filename (e.g., /src/lib.rs).
   NEVER pass a full host path to the edit tool.
-- Bash sees the real host filesystem.  `pwd` prints {}, not /.
-  To convert a bash path to an edit path, strip the {} prefix.
-  To convert an edit path to a bash path, prepend {}.
+- Bash sees the real host filesystem.  `pwd` prints {workspace_root}, not /.
+  To convert a bash path to an edit path, strip the {workspace_root} prefix.
+  To convert an edit path to a bash path, prepend {workspace_root}.
   If bash `pwd` is a subdirectory, a relative path like ./foo.rs in bash
   corresponds to stripping the workspace prefix from the absolute bash path.
-- Example: the bash path {}/src/lib.rs is the edit path /src/lib.rs.
+- Example: the bash path {workspace_root}/src/lib.rs is the edit path /src/lib.rs.
 "#,
-            workspace_root,
-            workspace_root,
-            workspace_root,
-            workspace_root,
-            workspace_root,
-            workspace_root,
-            workspace_root
         )
     }
 

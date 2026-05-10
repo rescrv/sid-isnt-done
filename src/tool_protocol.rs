@@ -123,34 +123,32 @@ pub fn extract_tool_output(
 ) -> Result<String, String> {
     if result.protocol_version != TOOL_PROTOCOL_VERSION {
         return Err(format!(
-            "tool '{}' protocol error: unsupported result protocol version {}",
-            display_name, result.protocol_version
+            "tool '{display_name}' protocol error: unsupported result protocol version {0}",
+            result.protocol_version
         ));
     }
     if result.request_id != request_id {
         return Err(format!(
-            "tool '{}' protocol error: request_id mismatch (expected {}, got {})",
-            display_name, request_id, result.request_id
+            "tool '{display_name}' protocol error: request_id mismatch (expected {request_id}, got {result_request_id})",
+            result_request_id = result.request_id
         ));
     }
 
     if result.ok {
         let Some(output) = result.output else {
             return Err(format!(
-                "tool '{}' protocol error: missing success output",
-                display_name
+                "tool '{display_name}' protocol error: missing success output"
             ));
         };
         if output.kind != "text" {
             return Err(format!(
-                "tool '{}' protocol error: unsupported output kind '{}'",
-                display_name, output.kind
+                "tool '{display_name}' protocol error: unsupported output kind '{0}'",
+                output.kind
             ));
         }
         let Some(text) = output.text else {
             return Err(format!(
-                "tool '{}' protocol error: missing output.text",
-                display_name
+                "tool '{display_name}' protocol error: missing output.text"
             ));
         };
         return Ok(text);
@@ -158,14 +156,12 @@ pub fn extract_tool_output(
 
     let Some(error) = result.error else {
         return Err(format!(
-            "tool '{}' protocol error: missing error object",
-            display_name
+            "tool '{display_name}' protocol error: missing error object"
         ));
     };
     let Some(message) = error.message else {
         return Err(format!(
-            "tool '{}' protocol error: missing error.message",
-            display_name
+            "tool '{display_name}' protocol error: missing error.message"
         ));
     };
     let _ = error.code;

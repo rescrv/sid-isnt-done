@@ -129,10 +129,7 @@ pub(crate) fn prepare_rc_tool_invocation(
 ) -> Result<PreparedRcToolInvocation, String> {
     let request_id = next_request_id();
     let invocation_dirs = create_tool_invocation_dirs(context, &request_id).map_err(|err| {
-        format!(
-            "tool '{}' failed to create invocation directories: {}",
-            display_name, err
-        )
+        format!("tool '{display_name}' failed to create invocation directories: {err}")
     })?;
     let scratch_dir = invocation_dirs.scratch_dir;
     let temp_dir = invocation_dirs.temp_dir;
@@ -163,12 +160,8 @@ pub(crate) fn prepare_rc_tool_invocation(
         },
     };
 
-    write_json_file(&request_file, &request).map_err(|err| {
-        format!(
-            "tool '{}' failed to write request.json: {}",
-            display_name, err
-        )
-    })?;
+    write_json_file(&request_file, &request)
+        .map_err(|err| format!("tool '{display_name}' failed to write request.json: {err}"))?;
 
     let runtime = prepare_tool_rc_runtime(
         display_name,
@@ -180,12 +173,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         &scratch_dir,
         &temp_dir,
     )
-    .map_err(|err| {
-        format!(
-            "tool '{}' failed to prepare rc invocation: {}",
-            display_name, err
-        )
-    })?;
+    .map_err(|err| format!("tool '{display_name}' failed to prepare rc invocation: {err}"))?;
 
     Ok(PreparedRcToolInvocation {
         display_name: display_name.to_string(),
@@ -570,6 +558,7 @@ struct ToolRunReport {
     output_len: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tee_child_output<R, W>(
     mut reader: R,
     mut terminal: W,

@@ -1137,7 +1137,10 @@ fn expand_preserving_whitespace(
             scope,
             field,
             value,
-            format!("expected one shell word after expansion, got {}", split.len()),
+            format!(
+                "expected one shell word after expansion, got {}",
+                split.len()
+            ),
         ))
     }
 }

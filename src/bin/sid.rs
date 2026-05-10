@@ -1075,8 +1075,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
                                 Some(tokens) => terminal.print_info(
                                     &context,
                                     &format!(
-                                        "Extended thinking enabled with {} token budget.",
-                                        tokens
+                                        "Extended thinking enabled with {tokens} token budget."
                                     ),
                                 ),
                                 None => {
@@ -1237,7 +1236,7 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
 
 fn print_help() {
     for line in help_text().lines() {
-        println!("    {}", line);
+        println!("    {line}");
     }
     println!(
         "      /compact              Summarize the session and continue in a new child session"
@@ -1844,7 +1843,7 @@ fn print_stats(stats: &SessionStats) {
     println!("      Top-p: {}", describe_float(stats.top_p));
     println!("      Top-k: {}", describe_top_k(stats.top_k));
     if let Some(prompt) = stats.system_prompt.as_deref() {
-        println!("      System prompt: {}", prompt);
+        println!("      System prompt: {prompt}");
     } else {
         println!("      System prompt: (none)");
     }
@@ -1891,7 +1890,7 @@ fn print_config(stats: &SessionStats) {
         }
     );
     if let Some(prompt) = stats.system_prompt.as_deref() {
-        println!("      System prompt: {}", prompt);
+        println!("      System prompt: {prompt}");
     } else {
         println!("      System prompt: (none)");
     }
@@ -1904,7 +1903,7 @@ fn print_stop_sequences(stop_sequences: &[String]) {
     } else {
         println!("      Stop sequences:");
         for stop_sequence in stop_sequences {
-            println!("        - {}", stop_sequence);
+            println!("        - {stop_sequence}");
         }
     }
 }
