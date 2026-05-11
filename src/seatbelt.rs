@@ -436,10 +436,13 @@ const POLICY_AFTER_WRITE_RULES: &str = r#"
 (allow file-read-data (subpath "/usr/libexec"))
 (allow file-read-metadata (subpath "/usr/libexec"))
 
-; Library paths (Homebrew, system, Applications).
+; Library and executable paths (Homebrew, system, Applications).
 (allow file-read* (subpath "/Library/Preferences"))
+(allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/opt/homebrew/lib"))
 (allow file-read* (subpath "/usr/local/lib"))
+(allow file-read* (subpath "/usr/local/bin"))
+(allow file-read* (subpath "/usr/local/sbin"))
 (allow file-read* (subpath "/Applications"))
 
 ; Terminal device handles.
@@ -857,6 +860,14 @@ mod tests {
         let policy =
             build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
         assert!(policy.contains("(subpath \"/Library/Developer/CommandLineTools\")"));
+    }
+
+    #[test]
+    fn build_policy_contains_homebrew_read_roots() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(policy.contains("(subpath \"/opt/homebrew\")"));
+        assert!(policy.contains("(subpath \"/usr/local/bin\")"));
     }
 
     #[test]
