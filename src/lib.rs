@@ -5412,6 +5412,46 @@ esac
     }
 
     #[test]
+    fn tool_invocation_timeout_covers_background_children_holding_pipes() {
+        if sandbox_exec_refuses_children() {
+            return;
+        }
+
+        let root = temp_config_root("agent");
+        write_sample_config_with_fmt_script_and_timeout(
+            &root,
+            &background_pipe_holder_tool_script(),
+            Some(1),
+        );
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone().into_owned()).unwrap();
+        let tool_config = config.tools.get("format").unwrap();
+        let exposed_name = exposed_tool_name("build", "format").unwrap();
+        let canonical_id = resolve_canonical_tool_id(&config.tools_rc_conf, "format").unwrap();
+        let tool = ExternalTool::from_config(exposed_name.clone(), canonical_id, tool_config);
+        let tool_use = ToolUseBlock::new(
+            "toolu_123",
+            exposed_name,
+            json!({ "paths": ["src/lib.rs"] }),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(4),
+                    invoke_external_tool(&tool, &agent, &tool_use, None),
+                )
+                .await
+            })
+            .expect("tool invocation should return at the configured timeout");
+        let error = unwrap_error_text(result);
+        assert!(error.contains("timed out after 1s"), "{error}");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn tool_invocation_returns_protocol_error_when_result_protocol_version_is_unsupported() {
         let root = temp_config_root("agent");
         write_sample_config_with_fmt_script(&root, &unsupported_protocol_version_tool_script());
@@ -5630,6 +5670,14 @@ edit_ENABLED="YES"
     }
 
     fn write_sample_config_with_fmt_script(root: &Path, fmt_script: &str) {
+        write_sample_config_with_fmt_script_and_timeout(root, fmt_script, None);
+    }
+
+    fn write_sample_config_with_fmt_script_and_timeout(
+        root: &Path,
+        fmt_script: &str,
+        timeout: Option<u64>,
+    ) {
         fs::create_dir_all(root.join("agents").as_str()).unwrap();
         fs::write(
             root.join("agents.conf").as_str(),
@@ -5650,15 +5698,20 @@ plan_MAX_TOKENS=8192
 "#,
         )
         .unwrap();
+        let fmt_timeout = timeout
+            .map(|seconds| format!("fmt_TIMEOUT=\"{seconds}\"\n"))
+            .unwrap_or_default();
         fs::write(
             root.join("tools.conf").as_str(),
-            r#"
+            format!(
+                r#"
 fmt_ENABLED="YES"
-shell_ENABLED="YES"
+{fmt_timeout}shell_ENABLED="YES"
 
 format_INHERIT="YES"
 format_ALIASES="fmt"
-"#,
+"#
+            ),
         )
         .unwrap();
         fs::write(
@@ -5777,6 +5830,10 @@ format_ALIASES="fmt"
 
     fn confirmation_preview_tool_script() -> String {
         "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\nif [ \"$TOOL_MODE\" = confirm ]; then\n    printf 'mode=%s tool=%s id=%s request=%s\\n' \"$TOOL_MODE\" \"$TOOL_NAME\" \"$TOOL_ID\" \"$(basename \"$REQUEST_FILE\")\"\n    exit 0\nfi\ncat >\"$RESULT_FILE\" <<EOF\n{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{\"kind\":\"text\",\"text\":\"format ran\"}}\nEOF\n".to_string()
+    }
+
+    fn background_pipe_holder_tool_script() -> String {
+        "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\n(sleep 3) &\ncat >\"$RESULT_FILE\" <<EOF\n{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{\"kind\":\"text\",\"text\":\"format ran\"}}\nEOF\n".to_string()
     }
 
     fn sandbox_exec_refuses_children() -> bool {

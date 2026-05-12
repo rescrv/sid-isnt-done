@@ -32,6 +32,9 @@ use crate::tool_protocol::{
     write_json_file,
 };
 
+const TOOL_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const TOOL_OUTPUT_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
 /// Minimal context needed by the tool invocation runtime.
 ///
 /// Decouples the tool runtime from the full agent type so the invocation
@@ -297,25 +300,102 @@ pub(crate) async fn run_prepared_rc_tool_text(
 /// falls back to SIGKILL.  This gives tools a chance to clean up temporary
 /// files, release locks, or flush partial output before being forcefully
 /// terminated.
-async fn kill_gracefully(child: &mut tokio::process::Child) {
-    const GRACE_PERIOD: Duration = Duration::from_secs(5);
-
-    if let Some(pid) = child.id() {
-        #[cfg(unix)]
-        {
-            // SAFETY: sending a signal to a known-live process id is safe.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
-        match tokio::time::timeout(GRACE_PERIOD, child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                child.kill().await.ok();
-            }
-        }
-    } else {
+async fn terminate_timed_out_tool<T, U>(
+    child: &mut tokio::process::Child,
+    process_group_id: Option<u32>,
+    stdout_task: tokio::task::JoinHandle<T>,
+    stderr_task: tokio::task::JoinHandle<U>,
+    force_kill: bool,
+) {
+    signal_tool_process(child, process_group_id, libc::SIGTERM);
+    let child_exited = tokio::time::timeout(TOOL_TERMINATION_GRACE_PERIOD, child.wait())
+        .await
+        .is_ok();
+    let (stdout_drained, stderr_drained) = tokio::join!(
+        drain_or_abort_task(stdout_task),
+        drain_or_abort_task(stderr_task)
+    );
+    if force_kill || !child_exited || !stdout_drained || !stderr_drained {
+        signal_tool_process(child, process_group_id, libc::SIGKILL);
         child.kill().await.ok();
+    }
+}
+
+async fn drain_or_abort_task<T>(mut task: tokio::task::JoinHandle<T>) -> bool {
+    tokio::select! {
+        result = &mut task => {
+            let _ = result;
+            true
+        }
+        _ = tokio::time::sleep(TOOL_OUTPUT_DRAIN_GRACE_PERIOD) => {
+            task.abort();
+            let _ = task.await;
+            false
+        }
+    }
+}
+
+async fn with_tool_deadline<T>(
+    future: impl std::future::Future<Output = T>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<T, ()> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| ()),
+        None => Ok(future.await),
+    }
+}
+
+enum OutputLogWaitError {
+    Failed(String),
+    TimedOut,
+}
+
+fn tool_timeout_message(prepared: &PreparedRcToolInvocation) -> String {
+    let seconds = prepared.timeout.map(|limit| limit.as_secs()).unwrap_or(0);
+    format!(
+        "tool '{}' timed out after {}s",
+        prepared.display_name, seconds
+    )
+}
+
+fn isolate_tool_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+fn signal_tool_process(
+    child: &tokio::process::Child,
+    process_group_id: Option<u32>,
+    signal: libc::c_int,
+) {
+    #[cfg(unix)]
+    {
+        if let Some(pgid) = process_group_id.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            // SAFETY: kill(2) is called with a negative process-group id that
+            // came from a child process we spawned into its own group.
+            unsafe {
+                libc::kill(-pgid, signal);
+            }
+        }
+        if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            // SAFETY: sending a signal to a known child process id is safe.
+            unsafe {
+                libc::kill(pid, signal);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process_group_id;
+        let _ = signal;
     }
 }
 
@@ -330,6 +410,7 @@ async fn run_prepared_rc_tool_text_inner(
         return (Err(err), report);
     }
     let mut cmd = prepared_rc_tool_command(prepared, "run", writable_roots);
+    isolate_tool_process_group(&mut cmd);
     cmd.kill_on_drop(true);
     let mut child = match cmd
         .stdin(Stdio::inherit())
@@ -348,6 +429,7 @@ async fn run_prepared_rc_tool_text_inner(
             );
         }
     };
+    let process_group_id = child.id();
     let stdout = child
         .stdout
         .take()
@@ -389,18 +471,13 @@ async fn run_prepared_rc_tool_text_inner(
         prepared.tool_use_id.clone(),
     ));
 
-    let wait_result = match prepared.timeout {
-        Some(limit) => tokio::time::timeout(limit, child.wait())
-            .await
-            .map_err(|_| {
-                format!(
-                    "tool '{}' timed out after {}s",
-                    prepared.display_name,
-                    limit.as_secs(),
-                )
-            }),
-        None => Ok(child.wait().await),
-    };
+    let deadline = prepared
+        .timeout
+        .map(|limit| tokio::time::Instant::now() + limit);
+    let timeout_msg = tool_timeout_message(prepared);
+    let wait_result = with_tool_deadline(child.wait(), deadline)
+        .await
+        .map_err(|_| timeout_msg.clone());
 
     let status = match wait_result {
         Ok(Ok(status)) => status,
@@ -414,21 +491,51 @@ async fn run_prepared_rc_tool_text_inner(
             );
         }
         Err(timeout_msg) => {
-            kill_gracefully(&mut child).await;
-            // Pipes close when child is killed; let tee tasks finish.
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            terminate_timed_out_tool(
+                &mut child,
+                process_group_id,
+                stdout_task,
+                stderr_task,
+                false,
+            )
+            .await;
             report.status = Some("timeout".to_string());
             return (Err(timeout_msg), report);
         }
     };
     report.status = Some(status.to_string());
     report.exit_code = status.code();
-    if let Err(err) = await_output_log(prepared, "stdout", stdout_task).await {
-        return (Err(err), report);
+    match await_output_log_until(prepared, "stdout", stdout_task, deadline).await {
+        Ok(()) => {}
+        Err(OutputLogWaitError::Failed(err)) => return (Err(err), report),
+        Err(OutputLogWaitError::TimedOut) => {
+            terminate_timed_out_tool(
+                &mut child,
+                process_group_id,
+                stderr_task,
+                completed_output_log_task(),
+                true,
+            )
+            .await;
+            report.status = Some("timeout".to_string());
+            return (Err(timeout_msg), report);
+        }
     }
-    if let Err(err) = await_output_log(prepared, "stderr", stderr_task).await {
-        return (Err(err), report);
+    match await_output_log_until(prepared, "stderr", stderr_task, deadline).await {
+        Ok(()) => {}
+        Err(OutputLogWaitError::Failed(err)) => return (Err(err), report),
+        Err(OutputLogWaitError::TimedOut) => {
+            terminate_timed_out_tool(
+                &mut child,
+                process_group_id,
+                completed_output_log_task(),
+                completed_output_log_task(),
+                true,
+            )
+            .await;
+            report.status = Some("timeout".to_string());
+            return (Err(timeout_msg), report);
+        }
     }
     if !status.success() {
         return (
@@ -470,28 +577,7 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
 
     let readonly_roots = WritableRoots::default();
     let mut cmd = prepared_rc_tool_command(prepared, "confirm", &readonly_roots);
-    cmd.kill_on_drop(true);
-    let output = tokio::time::timeout(
-        CONFIRM_TIMEOUT,
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "tool '{}' confirm timed out after {}s",
-            prepared.display_name,
-            CONFIRM_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|err| {
-        format!(
-            "tool '{}' failed to launch confirm: {}",
-            prepared.display_name, err
-        )
-    })?;
+    let output = run_confirmation_preview_command(prepared, &mut cmd, CONFIRM_TIMEOUT).await?;
 
     if let Some(session) = session {
         let journal = session.tool_stream_journal();
@@ -529,6 +615,111 @@ pub(crate) async fn render_rc_tool_confirmation_preview(
         ));
     }
     Ok(preview)
+}
+
+struct ToolChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_confirmation_preview_command(
+    prepared: &PreparedRcToolInvocation,
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+) -> Result<ToolChildOutput, String> {
+    isolate_tool_process_group(cmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "tool '{}' failed to launch confirm: {}",
+                prepared.display_name, err
+            )
+        })?;
+    let process_group_id = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout should be piped before spawn");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr should be piped before spawn");
+    let stdout_task = tokio::spawn(read_child_output(stdout));
+    let stderr_task = tokio::spawn(read_child_output(stderr));
+    let deadline = Some(tokio::time::Instant::now() + timeout);
+    let timeout_msg = format!(
+        "tool '{}' confirm timed out after {}s",
+        prepared.display_name,
+        timeout.as_secs()
+    );
+
+    let status = match with_tool_deadline(child.wait(), deadline).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            return Err(format!(
+                "tool '{}' failed to wait for confirm: {}",
+                prepared.display_name, err
+            ));
+        }
+        Err(()) => {
+            terminate_timed_out_tool(
+                &mut child,
+                process_group_id,
+                stdout_task,
+                stderr_task,
+                false,
+            )
+            .await;
+            return Err(timeout_msg);
+        }
+    };
+
+    let stdout =
+        match await_collected_output_until(prepared, "confirm stdout", stdout_task, deadline).await
+        {
+            Ok(stdout) => stdout,
+            Err(OutputLogWaitError::Failed(err)) => return Err(err),
+            Err(OutputLogWaitError::TimedOut) => {
+                terminate_timed_out_tool(
+                    &mut child,
+                    process_group_id,
+                    stderr_task,
+                    completed_collected_output_task(),
+                    true,
+                )
+                .await;
+                return Err(timeout_msg);
+            }
+        };
+    let stderr =
+        match await_collected_output_until(prepared, "confirm stderr", stderr_task, deadline).await
+        {
+            Ok(stderr) => stderr,
+            Err(OutputLogWaitError::Failed(err)) => return Err(err),
+            Err(OutputLogWaitError::TimedOut) => {
+                terminate_timed_out_tool(
+                    &mut child,
+                    process_group_id,
+                    completed_collected_output_task(),
+                    completed_collected_output_task(),
+                    true,
+                )
+                .await;
+                return Err(timeout_msg);
+            }
+        };
+
+    Ok(ToolChildOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub(crate) fn cleanup_prepared_rc_tool(
@@ -602,12 +793,66 @@ where
     Ok(())
 }
 
-async fn await_output_log(
+async fn read_child_output<R>(mut reader: R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output).await?;
+    Ok(output)
+}
+
+async fn await_output_log_until(
     prepared: &PreparedRcToolInvocation,
     stream: &str,
-    task: tokio::task::JoinHandle<io::Result<()>>,
+    mut task: tokio::task::JoinHandle<io::Result<()>>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), OutputLogWaitError> {
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                result = &mut task => output_log_result(prepared, stream, result)
+                    .map_err(OutputLogWaitError::Failed),
+                _ = tokio::time::sleep_until(deadline) => {
+                    task.abort();
+                    let _ = task.await;
+                    Err(OutputLogWaitError::TimedOut)
+                }
+            }
+        }
+        None => output_log_result(prepared, stream, task.await).map_err(OutputLogWaitError::Failed),
+    }
+}
+
+async fn await_collected_output_until(
+    prepared: &PreparedRcToolInvocation,
+    stream: &str,
+    mut task: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Vec<u8>, OutputLogWaitError> {
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                result = &mut task => collected_output_result(prepared, stream, result)
+                    .map_err(OutputLogWaitError::Failed),
+                _ = tokio::time::sleep_until(deadline) => {
+                    task.abort();
+                    let _ = task.await;
+                    Err(OutputLogWaitError::TimedOut)
+                }
+            }
+        }
+        None => collected_output_result(prepared, stream, task.await)
+            .map_err(OutputLogWaitError::Failed),
+    }
+}
+
+fn output_log_result(
+    prepared: &PreparedRcToolInvocation,
+    stream: &str,
+    result: Result<io::Result<()>, tokio::task::JoinError>,
 ) -> Result<(), String> {
-    match task.await {
+    match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(format!(
             "tool '{}' failed to log {}: {}",
@@ -618,6 +863,32 @@ async fn await_output_log(
             prepared.display_name, stream, err
         )),
     }
+}
+
+fn collected_output_result(
+    prepared: &PreparedRcToolInvocation,
+    stream: &str,
+    result: Result<io::Result<Vec<u8>>, tokio::task::JoinError>,
+) -> Result<Vec<u8>, String> {
+    match result {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(format!(
+            "tool '{}' failed to read {}: {}",
+            prepared.display_name, stream, err
+        )),
+        Err(err) => Err(format!(
+            "tool '{}' failed to join {} reader: {}",
+            prepared.display_name, stream, err
+        )),
+    }
+}
+
+fn completed_output_log_task() -> tokio::task::JoinHandle<io::Result<()>> {
+    tokio::spawn(async { Ok(()) })
+}
+
+fn completed_collected_output_task() -> tokio::task::JoinHandle<io::Result<Vec<u8>>> {
+    tokio::spawn(async { Ok(Vec::new()) })
 }
 
 fn prepared_rc_tool_command(

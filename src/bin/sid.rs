@@ -1609,13 +1609,14 @@ where
         })))),
         RawRequest::SwitchAgent { agent } => {
             match session.agent_summary(&agent)? {
-                Some(summary) if summary.enabled == SwitchPosition::Manual => {
-                    if !confirm_manual_agent(server, &summary.id)? {
-                        return Err(cli_error(
-                            "manual_agent_denied",
-                            "manual agent switch denied",
-                        ));
-                    }
+                Some(summary)
+                    if summary.enabled == SwitchPosition::Manual
+                        && !confirm_manual_agent(server, &summary.id)? =>
+                {
+                    return Err(cli_error(
+                        "manual_agent_denied",
+                        "manual agent switch denied",
+                    ));
                 }
                 _ => {}
             }
