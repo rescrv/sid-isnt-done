@@ -10,8 +10,9 @@ use std::sync::Mutex as StdMutex;
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use crate::raw_protocol::{
-    RAW_PROTOCOL_VERSION, RawEvent, RawEventEnvelope, RawPrompt, RawRequest, RawRequestEnvelope,
-    RawResultEnvelope, RawServerError, RawServerMessage, ToolOutputEvent, ToolOutputObserver,
+    RAW_PROTOCOL_VERSION, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck, RawRequest,
+    RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage, ToolOutputEvent,
+    ToolOutputObserver,
 };
 
 /// Raw-protocol decode error that preserves any discovered request id.
@@ -355,6 +356,14 @@ where
                     prompt_id: response_prompt_id,
                     response,
                 } if response_prompt_id == prompt_id => {
+                    self.write_message(&RawServerMessage::PromptAck(RawPromptAck {
+                        protocol_version: RAW_PROTOCOL_VERSION,
+                        sequence: 0,
+                        request_id: request_id.clone(),
+                        response_request_id: request.request_id,
+                        prompt_id,
+                        response: response.clone(),
+                    }))?;
                     return Ok(Some(OperatorLine::Line(response)));
                 }
                 RawRequest::PromptResponse { .. } => {
@@ -487,6 +496,9 @@ mod tests {
             .output
             .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
         assert!(text.contains("\"type\":\"prompt\""));
+        assert!(text.contains("\"type\":\"prompt_ack\""));
+        assert!(text.contains("\"response_request_id\":\"good\""));
+        assert!(text.contains("\"response\":\"yes\""));
         assert!(text.contains("\"request_id\":\"bad\""));
         assert!(text.contains("\"code\":\"busy\""));
     }

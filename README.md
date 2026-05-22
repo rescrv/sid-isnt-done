@@ -55,6 +55,8 @@ Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
 of stdin/stdout.  `SPEC` is `vsock://CID:PORT` on Linux or
 `unix:///path/to/socket` on Unix platforms.  New connections replace older
 connections and receive the server message history before live messages.
+Answered prompts are replayed as `prompt_ack` messages instead of fresh
+prompts, while unanswered prompts are replayed as prompts.
 
 ## QUICKSTART
 
@@ -168,6 +170,9 @@ warning.
   `VMADDR_CID_ANY`, or `unix:///path/to/socket` on Unix platforms.  When a new
   client connects, sid disconnects the previous socket, replays all prior
   server messages to the new socket, and then continues streaming live output.
+  Prompts that were already answered are replayed as `prompt_ack` messages with
+  the accepted response; unanswered prompts are replayed as normal `prompt`
+  messages.
 
 `--resume SESSION`
 : Resume an existing session by timestamp id or by session directory path.

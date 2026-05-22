@@ -145,6 +145,8 @@ pub enum RawServerMessage {
     Event(RawEventEnvelope),
     /// Interactive prompt that requires a `prompt_response`.
     Prompt(RawPrompt),
+    /// A previously emitted prompt was answered.
+    PromptAck(RawPromptAck),
     /// Terminal request result.
     Result(RawResultEnvelope),
 }
@@ -156,6 +158,7 @@ impl RawServerMessage {
             RawServerMessage::Hello(message) => message.sequence = sequence,
             RawServerMessage::Event(message) => message.sequence = sequence,
             RawServerMessage::Prompt(message) => message.sequence = sequence,
+            RawServerMessage::PromptAck(message) => message.sequence = sequence,
             RawServerMessage::Result(message) => message.sequence = sequence,
         }
         self
@@ -371,6 +374,27 @@ pub struct RawPrompt {
     pub message: String,
     /// Allowed textual choices.
     pub choices: Vec<String>,
+}
+
+/// Prompt acknowledgement emitted when a `prompt_response` is accepted.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RawPromptAck {
+    /// Protocol version emitted by the server.
+    pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Request identifier associated with the original prompt.
+    pub request_id: String,
+    /// Request identifier of the accepted `prompt_response`.
+    pub response_request_id: String,
+    /// Prompt identifier that was acknowledged.
+    pub prompt_id: String,
+    /// Accepted response text.
+    pub response: String,
 }
 
 /// Terminal response for a client request.

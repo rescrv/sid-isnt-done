@@ -1,9 +1,12 @@
 //! Socket listener transport for `sid --listen`.
 //!
 //! The listener keeps the raw JSONL stream process-local and lets frontends
-//! reconnect without restarting the agent session.  Every complete server
-//! message is retained in memory and replayed to the newest connection.
+//! reconnect without restarting the agent session.  Complete server messages
+//! are retained in memory and replayed to the newest connection.  Prompts are
+//! replayed semantically: unanswered prompts stay as prompts, while answered
+//! prompts are represented by their later `prompt_ack` messages.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::raw_mode::RawServer;
+use crate::raw_protocol::RawServerMessage;
 
 const VMADDR_CID_ANY_VALUE: u32 = u32::MAX;
 
@@ -331,11 +335,48 @@ struct InputLine {
     line: String,
 }
 
+struct HistoryLine {
+    line: Vec<u8>,
+    kind: HistoryKind,
+}
+
+impl HistoryLine {
+    fn parse(line: &[u8]) -> Self {
+        let kind = match serde_json::from_slice::<RawServerMessage>(line) {
+            Ok(RawServerMessage::Prompt(prompt)) => HistoryKind::Prompt {
+                prompt_id: prompt.prompt_id,
+            },
+            Ok(RawServerMessage::PromptAck(prompt_ack)) => HistoryKind::PromptAck {
+                prompt_id: prompt_ack.prompt_id,
+            },
+            _ => HistoryKind::Other,
+        };
+        Self {
+            line: line.to_vec(),
+            kind,
+        }
+    }
+
+    fn should_replay(&self, acknowledged_prompts: &HashSet<String>) -> bool {
+        match &self.kind {
+            HistoryKind::Prompt { prompt_id } => !acknowledged_prompts.contains(prompt_id),
+            HistoryKind::PromptAck { .. } | HistoryKind::Other => true,
+        }
+    }
+}
+
+enum HistoryKind {
+    Prompt { prompt_id: String },
+    PromptAck { prompt_id: String },
+    Other,
+}
+
 #[derive(Default)]
 struct ListenState {
     current: Option<Box<dyn ConnectedSocket>>,
     generation: u64,
-    history: Vec<u8>,
+    history: Vec<HistoryLine>,
+    acknowledged_prompts: HashSet<String>,
     pending: Vec<u8>,
 }
 
@@ -345,7 +386,11 @@ impl ListenState {
         if let Some(current) = self.current.take() {
             current.shutdown_socket();
         }
-        stream.write_all(&self.history)?;
+        for line in &self.history {
+            if line.should_replay(&self.acknowledged_prompts) {
+                stream.write_all(&line.line)?;
+            }
+        }
         stream.flush()?;
         self.current = Some(stream);
         Ok(self.generation)
@@ -366,7 +411,11 @@ impl ListenState {
     }
 
     fn write_line(&mut self, line: &[u8]) {
-        self.history.extend_from_slice(line);
+        let history_line = HistoryLine::parse(line);
+        if let HistoryKind::PromptAck { prompt_id } = &history_line.kind {
+            self.acknowledged_prompts.insert(prompt_id.clone());
+        }
+        self.history.push(history_line);
         let mut disconnect = false;
         if let Some(current) = self.current.as_mut() {
             disconnect = current
@@ -756,6 +805,47 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replay_output_replays_only_unacknowledged_prompts_as_prompts() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let state = Arc::new(Mutex::new(ListenState::default()));
+        let mut output = ReplayOutput::new(state.clone());
+        output
+            .write_all(prompt_line("prompt-1").as_bytes())
+            .unwrap();
+
+        let (first_server, first_client) = UnixStream::pair().unwrap();
+        first_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .connect(Box::new(first_server))
+            .unwrap();
+        let mut first_reader = BufReader::new(first_client);
+        assert_eq!(read_type(&mut first_reader), "prompt");
+
+        output
+            .write_all(prompt_ack_line("prompt-1", "yes").as_bytes())
+            .unwrap();
+
+        let (second_server, second_client) = UnixStream::pair().unwrap();
+        second_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .connect(Box::new(second_server))
+            .unwrap();
+        let mut second_reader = BufReader::new(second_client);
+        assert_eq!(read_type(&mut second_reader), "prompt_ack");
+    }
+
     fn read_request_id(reader: &mut impl BufRead) -> String {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -763,5 +853,45 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    fn read_type(reader: &mut impl BufRead) -> String {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn prompt_line(prompt_id: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "prompt",
+                "protocol_version": 2,
+                "sequence": 1,
+                "request_id": "request",
+                "prompt_id": prompt_id,
+                "kind": "confirmation",
+                "message": "Continue?",
+                "choices": ["yes", "no"],
+            })
+        )
+    }
+
+    fn prompt_ack_line(prompt_id: &str, response: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "prompt_ack",
+                "protocol_version": 2,
+                "sequence": 2,
+                "request_id": "request",
+                "response_request_id": "response-request",
+                "prompt_id": prompt_id,
+                "response": response,
+            })
+        )
     }
 }
