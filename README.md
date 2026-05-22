@@ -11,6 +11,7 @@ sid [OPTIONS]
 sid --prompt PROMPT [OPTIONS]
 sid --resume SESSION [OPTIONS]
 sid --raw [--resume SESSION] [OPTIONS]
+sid --listen SPEC [--resume SESSION] [OPTIONS]
 SID_HOME=DIR sid [OPTIONS]
 sid --bash-debug COMMAND
 sid-seatbelt [--writable-roots DIR[:DIR...]] -- COMMAND [ARG...]
@@ -50,6 +51,10 @@ mode the process owns session state and emits typed events, prompts, and
 terminal results instead of the human-oriented terminal UI.  Requests are
 semantic operations such as user turns, agent switches, compaction, and config
 updates.  Raw mode is intended for alternative frontends and local automation.
+Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
+of stdin/stdout.  `SPEC` is `vsock://CID:PORT` on Linux or
+`unix:///path/to/socket` on Unix platforms.  New connections replace older
+connections and receive the server message history before live messages.
 
 ## QUICKSTART
 
@@ -153,7 +158,16 @@ warning.
 
 `--raw`
 : Run a JSONL protocol server on stdin/stdout instead of the interactive
-  readline UI.  Stdout is reserved for protocol messages in this mode.
+  readline UI.  Stdout is reserved for protocol messages in this mode.  Raw
+  server messages include a monotonic `sequence` field so clients can
+  de-duplicate replayed messages.
+
+`--listen SPEC`
+: Run a reconnectable JSONL protocol server and imply `--raw`.  `SPEC` is
+  `vsock://CID:PORT` on Linux, with `CID` optional or `any` for
+  `VMADDR_CID_ANY`, or `unix:///path/to/socket` on Unix platforms.  When a new
+  client connects, sid disconnects the previous socket, replays all prior
+  server messages to the new socket, and then continues streaming live output.
 
 `--resume SESSION`
 : Resume an existing session by timestamp id or by session directory path.

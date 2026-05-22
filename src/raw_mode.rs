@@ -30,7 +30,15 @@ pub struct SharedOutput<W>
 where
     W: Write + Send + 'static,
 {
-    writer: Arc<StdMutex<W>>,
+    state: Arc<StdMutex<SharedOutputState<W>>>,
+}
+
+struct SharedOutputState<W>
+where
+    W: Write + Send + 'static,
+{
+    writer: W,
+    next_sequence: u64,
 }
 
 impl<W> Clone for SharedOutput<W>
@@ -39,7 +47,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            writer: self.writer.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -51,28 +59,33 @@ where
     /// Create a new shared output sink.
     pub fn new(writer: W) -> Self {
         Self {
-            writer: Arc::new(StdMutex::new(writer)),
+            state: Arc::new(StdMutex::new(SharedOutputState {
+                writer,
+                next_sequence: 1,
+            })),
         }
     }
 
     /// Write one JSONL server message.
     pub fn write_message(&self, message: &RawServerMessage) -> io::Result<()> {
-        let payload = serde_json::to_vec(message)
-            .map_err(|err| io::Error::other(format!("failed to serialize raw message: {err}")))?;
-        let mut writer = self
-            .writer
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| io::Error::other("raw output lock poisoned"))?;
-        writer.write_all(&payload)?;
-        writer.write_all(b"\n")?;
-        writer.flush()
+        let message = message.clone().with_sequence(state.next_sequence);
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let payload = serde_json::to_vec(&message)
+            .map_err(|err| io::Error::other(format!("failed to serialize raw message: {err}")))?;
+        state.writer.write_all(&payload)?;
+        state.writer.write_all(b"\n")?;
+        state.writer.flush()
     }
 
     /// Execute `f` with a mutable borrow of the underlying writer.
     #[cfg(test)]
     pub(crate) fn with_writer<T>(&self, f: impl FnOnce(&W) -> T) -> T {
-        let writer = self.writer.lock().expect("raw output lock poisoned");
-        f(&writer)
+        let state = self.state.lock().expect("raw output lock poisoned");
+        f(&state.writer)
     }
 }
 
@@ -138,6 +151,7 @@ where
     ) -> io::Result<()> {
         self.write_message(&RawServerMessage::Result(RawResultEnvelope {
             protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
             request_id: request_id.to_string(),
             ok: true,
             data,
@@ -154,6 +168,7 @@ where
     ) -> io::Result<()> {
         self.write_message(&RawServerMessage::Result(RawResultEnvelope {
             protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
             request_id: request_id.to_string(),
             ok: false,
             data: None,
@@ -188,6 +203,7 @@ where
         let request_id = self.active_request_id.as_ref().cloned().unwrap_or_default();
         self.write_message(&RawServerMessage::Event(RawEventEnvelope {
             protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
             request_id,
             event,
         }))
@@ -323,6 +339,7 @@ where
         self.next_prompt_id = self.next_prompt_id.saturating_add(1);
         self.write_message(&RawServerMessage::Prompt(RawPrompt {
             protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
             request_id: request_id.clone(),
             prompt_id: prompt_id.clone(),
             kind: "confirmation".to_string(),
@@ -386,6 +403,7 @@ where
             .output
             .write_message(&RawServerMessage::Event(RawEventEnvelope {
                 protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
                 request_id: event.request_id.clone(),
                 event: RawEvent::ToolOutput {
                     tool_name: event.tool_name.clone(),
@@ -430,10 +448,32 @@ mod tests {
     }
 
     #[test]
+    fn write_message_assigns_monotonic_sequences() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server.write_ok_result("one", None).unwrap();
+        server.write_ok_result("two", None).unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let sequences = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["sequence"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[test]
     fn prompt_wait_rejects_non_prompt_requests() {
         let input = BufReader::new(
-            br#"{"protocol_version":1,"request_id":"bad","op":"stats"}
-{"protocol_version":1,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+            br#"{"protocol_version":2,"request_id":"bad","op":"stats"}
+{"protocol_version":2,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
 "#
             .as_slice(),
         );

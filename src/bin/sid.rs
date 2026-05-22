@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,6 +267,13 @@ struct SidArgs {
 
     #[arrrg(flag, "Run a JSONL protocol server on stdin/stdout")]
     raw: bool,
+
+    #[arrrg(
+        optional,
+        "Run a reconnectable JSONL protocol server on SPEC; implies --raw",
+        "SPEC"
+    )]
+    listen: Option<String>,
 }
 
 /// Data computed synchronously before the tokio runtime starts.
@@ -280,6 +287,7 @@ struct PreRuntimeSetup {
     bash_debug: Option<String>,
     prompt: Option<String>,
     raw: bool,
+    listen: Option<String>,
     resumed: bool,
 }
 
@@ -813,7 +821,9 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         resume,
         prompt,
         raw,
+        listen,
     } = parse_sid_args()?;
+    let raw = raw || listen.is_some();
     let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
             .with_string_field("cause", &err.to_string())
@@ -885,6 +895,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         bash_debug,
         prompt,
         raw,
+        listen,
         resumed,
     })
 }
@@ -915,6 +926,7 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
         bash_debug,
         prompt,
         raw,
+        listen,
         resumed,
     } = setup;
 
@@ -950,8 +962,21 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
             auto_compact_tokens,
         );
         session.load_resumed_transcript(resumed)?;
+        if let Some(listen) = listen {
+            return run_raw_session(
+                session,
+                sid_isnt_done::raw_listen::listen(&listen)
+                    .map_err(|err| raw_io_error("failed to start raw listener", &err))?,
+                workspace_display,
+                session_display,
+                resumed,
+                startup_confirmation_required,
+            )
+            .await;
+        }
         return run_raw_session(
             session,
+            RawServer::stdio(),
             workspace_display,
             session_display,
             resumed,
@@ -1480,15 +1505,16 @@ async fn maybe_auto_compact(
 
 async fn run_raw_session(
     mut session: SidRuntimeSession,
+    mut server: RawServer<impl BufRead + Send, impl Write + Send + 'static>,
     workspace_display: String,
     session_display: String,
     resumed: bool,
     startup_confirmation_required: bool,
 ) -> Result<(), SError> {
-    let mut server = RawServer::stdio();
     server
         .write_message(&RawServerMessage::Hello(RawHello {
             protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
             session_id: session.sid_session.id().to_string(),
             session_dir: session_display,
             workspace_root: workspace_display,
@@ -2245,6 +2271,14 @@ mod tests {
         assert_eq!(status, 0, "unexpected parser status: {messages:?}");
         assert!(free.is_empty());
         assert!(args.raw);
+    }
+
+    #[test]
+    fn parse_args_accept_listen_option() {
+        let (args, free, status, messages) = parse_args(&["--listen", "unix:///tmp/sid.sock"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert_eq!(args.listen.as_deref(), Some("unix:///tmp/sid.sock"));
     }
 
     #[test]

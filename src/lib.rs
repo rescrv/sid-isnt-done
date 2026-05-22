@@ -17,6 +17,8 @@ pub mod builtin_tools;
 /// Workspace configuration loading and types.
 pub mod config;
 mod filesystem;
+/// Socket listener transport for `sid --listen`.
+pub mod raw_listen;
 /// JSONL transport utilities for `sid --raw`.
 pub mod raw_mode;
 /// JSONL protocol types and raw-mode support hooks.

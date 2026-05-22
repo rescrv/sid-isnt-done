@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current `sid --raw` protocol version.
-pub const RAW_PROTOCOL_VERSION: u32 = 1;
+pub const RAW_PROTOCOL_VERSION: u32 = 2;
 
 /// A client request envelope sent to `sid --raw`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -149,11 +149,30 @@ pub enum RawServerMessage {
     Result(RawResultEnvelope),
 }
 
+impl RawServerMessage {
+    /// Return a copy of this message stamped with `sequence`.
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        match &mut self {
+            RawServerMessage::Hello(message) => message.sequence = sequence,
+            RawServerMessage::Event(message) => message.sequence = sequence,
+            RawServerMessage::Prompt(message) => message.sequence = sequence,
+            RawServerMessage::Result(message) => message.sequence = sequence,
+        }
+        self
+    }
+}
+
 /// Initial session announcement for a raw server instance.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RawHello {
     /// Protocol version emitted by the server.
     pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
     /// Active session identifier.
     pub session_id: String,
     /// Active session directory path.
@@ -177,6 +196,12 @@ pub struct RawHello {
 pub struct RawEventEnvelope {
     /// Protocol version emitted by the server.
     pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
     /// Request identifier chosen by the client.
     pub request_id: String,
     /// Event payload.
@@ -330,6 +355,12 @@ pub enum RawEvent {
 pub struct RawPrompt {
     /// Protocol version emitted by the server.
     pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
     /// Request identifier associated with the prompt.
     pub request_id: String,
     /// Stable prompt identifier used by the matching response.
@@ -347,6 +378,12 @@ pub struct RawPrompt {
 pub struct RawResultEnvelope {
     /// Protocol version emitted by the server.
     pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
     /// Request identifier chosen by the client.
     pub request_id: String,
     /// `true` for success, `false` for error.
