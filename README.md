@@ -12,6 +12,7 @@ sid --prompt PROMPT [OPTIONS]
 sid --resume SESSION [OPTIONS]
 sid --raw [--resume SESSION] [OPTIONS]
 sid --listen SPEC [--resume SESSION] [OPTIONS]
+sid --connect SPEC [OPTIONS]
 SID_HOME=DIR sid [OPTIONS]
 sid --bash-debug COMMAND
 sid-seatbelt [--writable-roots DIR[:DIR...]] -- COMMAND [ARG...]
@@ -57,6 +58,10 @@ of stdin/stdout.  `SPEC` is `vsock://CID:PORT` on Linux or
 connections and receive the server message history before live messages.
 Answered prompts are replayed as `prompt_ack` messages instead of fresh
 prompts, while unanswered prompts are replayed as prompts.
+Use `--connect SPEC` to attach the normal terminal UI to a listening raw
+server.  The client speaks JSONL over the socket internally, but renders
+assistant output, tool output, prompts, results, and slash commands like an
+ordinary interactive `sid` session.
 
 ## QUICKSTART
 
@@ -172,7 +177,14 @@ warning.
   server messages to the new socket, and then continues streaming live output.
   Prompts that were already answered are replayed as `prompt_ack` messages with
   the accepted response; unanswered prompts are replayed as normal `prompt`
-  messages.
+  messages.  A `replay_complete` message marks the end of the replayed history.
+
+`--connect SPEC`
+: Connect the normal terminal UI to a reconnectable JSONL protocol server.
+  `SPEC` accepts the same URL forms as `--listen`; for `vsock://PORT`,
+  `vsock://any:PORT`, and `vsock://-1:PORT`, connect mode targets the host CID.
+  `--connect` is mutually exclusive with `--raw`, `--listen`, `--prompt`,
+  `--resume`, and `--bash-debug`.
 
 `--resume SESSION`
 : Resume an existing session by timestamp id or by session directory path.

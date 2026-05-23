@@ -3,7 +3,7 @@
 //! This module owns the JSONL stdin/stdout transport, prompt handling, and
 //! external-tool output forwarding used by raw-mode frontends.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -12,8 +12,31 @@ use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 use crate::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck, RawRequest,
     RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage, ToolOutputEvent,
-    ToolOutputObserver,
+    ToolOutputObserver, UsageReportEvent, UsageReportObserver,
 };
+
+/// Raw request input with optional nonblocking line polling.
+///
+/// Plain stdio raw mode cannot be polled portably, so the default
+/// implementation reports no available line.  Reconnectable transports
+/// override this to let streamed renderers observe client interrupts.
+pub trait RawInput: BufRead + Send {
+    /// Try to read one complete request line without blocking.
+    fn try_read_line(&mut self) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+impl<T> RawInput for BufReader<T> where T: Read + Send {}
+
+impl<T> RawInput for Box<T>
+where
+    T: RawInput + ?Sized,
+{
+    fn try_read_line(&mut self) -> io::Result<Option<String>> {
+        (**self).try_read_line()
+    }
+}
 
 /// Raw-protocol decode error that preserves any discovered request id.
 #[derive(Debug)]
@@ -93,10 +116,10 @@ where
 /// Line-oriented raw JSONL server that also implements `claudius::Renderer`.
 pub struct RawServer<R, W>
 where
-    R: BufRead + Send,
+    R: RawInput,
     W: Write + Send + 'static,
 {
-    input: R,
+    input: StdMutex<R>,
     output: SharedOutput<W>,
     active_request_id: Option<String>,
     next_prompt_id: u64,
@@ -111,13 +134,13 @@ impl RawServer<BufReader<io::Stdin>, io::Stdout> {
 
 impl<R, W> RawServer<R, W>
 where
-    R: BufRead + Send,
+    R: RawInput,
     W: Write + Send + 'static,
 {
     /// Create a raw server from arbitrary reader/writer handles.
     pub fn new(input: R, output: W) -> Self {
         Self {
-            input,
+            input: StdMutex::new(input),
             output: SharedOutput::new(output),
             active_request_id: None,
             next_prompt_id: 1,
@@ -184,7 +207,13 @@ where
     pub fn read_request(&mut self) -> io::Result<Option<RawRequestEnvelope>> {
         loop {
             let mut line = String::new();
-            let read = self.input.read_line(&mut line)?;
+            let read = {
+                let mut input = self
+                    .input
+                    .lock()
+                    .map_err(|_| io::Error::other("raw input lock poisoned"))?;
+                input.read_line(&mut line)?
+            };
             if read == 0 {
                 return Ok(None);
             }
@@ -209,11 +238,69 @@ where
             event,
         }))
     }
+
+    fn try_read_request(
+        &self,
+    ) -> io::Result<Option<Result<RawRequestEnvelope, ParsedRequestError>>> {
+        loop {
+            let line = {
+                let mut input = self
+                    .input
+                    .lock()
+                    .map_err(|_| io::Error::other("raw input lock poisoned"))?;
+                input.try_read_line()?
+            };
+            let Some(line) = line else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            return Ok(Some(parse_request_line(&line)));
+        }
+    }
+
+    fn poll_interrupt(&self) -> io::Result<bool> {
+        while let Some(request) = self.try_read_request()? {
+            let request = match request {
+                Ok(request) => request,
+                Err(err) => {
+                    self.write_error_result(&err.request_id, err.code.as_deref(), &err.message)?;
+                    continue;
+                }
+            };
+            if request.protocol_version != RAW_PROTOCOL_VERSION {
+                self.write_error_result(
+                    &request.request_id,
+                    Some("unsupported_protocol_version"),
+                    &format!(
+                        "unsupported raw protocol version {}",
+                        request.protocol_version
+                    ),
+                )?;
+                continue;
+            }
+            match request.request {
+                RawRequest::Interrupt => {
+                    self.write_ok_result(&request.request_id, None)?;
+                    return Ok(true);
+                }
+                _ => {
+                    self.write_error_result(
+                        &request.request_id,
+                        Some("busy"),
+                        "server is busy streaming another request",
+                    )?;
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl<R, W> Renderer for RawServer<R, W>
 where
-    R: BufRead + Send,
+    R: RawInput,
     W: Write + Send + 'static,
 {
     fn start_agent(&mut self, context: &dyn StreamContext) {
@@ -330,6 +417,10 @@ where
         });
     }
 
+    fn should_interrupt(&self) -> bool {
+        self.poll_interrupt().unwrap_or(false)
+    }
+
     fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
         let request_id = self
             .active_request_id
@@ -425,6 +516,50 @@ where
     }
 }
 
+/// Usage observer that forwards model usage reports onto the raw JSONL stream.
+pub struct RawUsageReportObserver<W>
+where
+    W: Write + Send + 'static,
+{
+    output: SharedOutput<W>,
+    request_id: String,
+}
+
+impl<W> RawUsageReportObserver<W>
+where
+    W: Write + Send + 'static,
+{
+    /// Create a new observer that writes usage reports as raw `info` events.
+    pub fn new(output: SharedOutput<W>, request_id: impl Into<String>) -> Self {
+        Self {
+            output,
+            request_id: request_id.into(),
+        }
+    }
+}
+
+impl<W> UsageReportObserver for RawUsageReportObserver<W>
+where
+    W: Write + Send + 'static,
+{
+    fn on_usage_report(&self, event: &UsageReportEvent) {
+        for message in [&event.token_line, &event.usage_line] {
+            let _ = self
+                .output
+                .write_message(&RawServerMessage::Event(RawEventEnvelope {
+                    protocol_version: RAW_PROTOCOL_VERSION,
+                    sequence: 0,
+                    request_id: self.request_id.clone(),
+                    event: RawEvent::Info {
+                        label: None,
+                        depth: 0,
+                        message: message.clone(),
+                    },
+                }));
+        }
+    }
+}
+
 /// Parse a raw request line while preserving any extracted request id.
 pub fn parse_request_line(line: &str) -> Result<RawRequestEnvelope, ParsedRequestError> {
     let value: serde_json::Value =
@@ -448,6 +583,41 @@ pub fn parse_request_line(line: &str) -> Result<RawRequestEnvelope, ParsedReques
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct PollInput {
+        lines: VecDeque<String>,
+    }
+
+    impl PollInput {
+        fn new(lines: &[&str]) -> Self {
+            Self {
+                lines: lines.iter().map(|line| line.to_string()).collect(),
+            }
+        }
+    }
+
+    impl Read for PollInput {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl BufRead for PollInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&[])
+        }
+
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    impl RawInput for PollInput {
+        fn try_read_line(&mut self) -> io::Result<Option<String>> {
+            Ok(self.lines.pop_front())
+        }
+    }
+
+    // ── parse_request_line ───────────────────────────────────────────────
 
     #[test]
     fn parse_request_line_extracts_request_id_on_decode_error() {
@@ -455,6 +625,50 @@ mod tests {
         assert_eq!(err.request_id, "abc");
         assert_eq!(err.code.as_deref(), Some("invalid_request"));
     }
+
+    #[test]
+    fn parse_request_line_rejects_invalid_json() {
+        let err = parse_request_line("not json at all").unwrap_err();
+        assert_eq!(err.request_id, "");
+        assert_eq!(err.code.as_deref(), Some("invalid_request_json"));
+    }
+
+    #[test]
+    fn parse_request_line_succeeds_for_valid_request() {
+        let line = r#"{"protocol_version":2,"request_id":"r-1","op":"stats"}"#;
+        let envelope = parse_request_line(line).unwrap();
+        assert_eq!(envelope.request_id, "r-1");
+        assert_eq!(envelope.request, RawRequest::Stats);
+    }
+
+    #[test]
+    fn parse_request_line_succeeds_for_user_turn() {
+        let line =
+            r#"{"protocol_version":2,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
+        let envelope = parse_request_line(line).unwrap();
+        assert_eq!(
+            envelope.request,
+            RawRequest::UserTurn {
+                text: "hello world".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_request_line_succeeds_for_interrupt() {
+        let line = r#"{"protocol_version":2,"request_id":"r-int","op":"interrupt"}"#;
+        let envelope = parse_request_line(line).unwrap();
+        assert_eq!(envelope.request_id, "r-int");
+        assert_eq!(envelope.request, RawRequest::Interrupt);
+    }
+
+    #[test]
+    fn parse_request_line_missing_request_id_gives_empty_string() {
+        let err = parse_request_line(r#"{"protocol_version":2}"#).unwrap_err();
+        assert_eq!(err.request_id, "");
+    }
+
+    // ── write_message / sequences ────────────────────────────────────────
 
     #[test]
     fn write_message_assigns_monotonic_sequences() {
@@ -477,6 +691,229 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![1, 2]);
     }
+
+    // ── write_ok_result / write_error_result ─────────────────────────────
+
+    #[test]
+    fn write_ok_result_emits_result_type_with_ok_true() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_ok_result("r-1", Some(serde_json::json!({"key": "value"})))
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["request_id"], "r-1");
+        assert_eq!(value["data"]["key"], "value");
+    }
+
+    #[test]
+    fn write_error_result_emits_result_type_with_ok_false() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_error_result("r-2", Some("test_code"), "something broke")
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["request_id"], "r-2");
+        assert_eq!(value["error"]["code"], "test_code");
+        assert_eq!(value["error"]["message"], "something broke");
+    }
+
+    #[test]
+    fn write_error_result_without_code() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_error_result("r-3", None, "generic error")
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["error"]["code"], serde_json::Value::Null);
+        assert_eq!(value["error"]["message"], "generic error");
+    }
+
+    // ── read_request ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_request_returns_none_on_eof() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        assert!(server.read_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_request_skips_blank_lines() {
+        let input = BufReader::new(
+            b"\n\n{\"protocol_version\":2,\"request_id\":\"r-1\",\"op\":\"stats\"}\n".as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        let req = server.read_request().unwrap().unwrap();
+        assert_eq!(req.request_id, "r-1");
+    }
+
+    #[test]
+    fn read_request_reports_malformed_json_and_continues() {
+        let input = BufReader::new(
+            b"not json\n{\"protocol_version\":2,\"request_id\":\"r-1\",\"op\":\"stats\"}\n"
+                .as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        let req = server.read_request().unwrap().unwrap();
+        assert_eq!(req.request_id, "r-1");
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        assert!(
+            text.contains("invalid_request_json"),
+            "expected error for malformed JSON, got: {text}"
+        );
+    }
+
+    #[test]
+    fn read_request_reports_valid_json_with_missing_op_and_continues() {
+        let input = BufReader::new(
+            b"{\"request_id\":\"bad\",\"protocol_version\":2}\n{\"protocol_version\":2,\"request_id\":\"good\",\"op\":\"shutdown\"}\n"
+                .as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        let req = server.read_request().unwrap().unwrap();
+        assert_eq!(req.request_id, "good");
+        assert_eq!(req.request, RawRequest::Shutdown);
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        assert!(text.contains("\"request_id\":\"bad\""));
+        assert!(text.contains("invalid_request"));
+    }
+
+    // ── emit_event ───────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_event_uses_active_request_id() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("req-42".to_string());
+        server
+            .emit_event(RawEvent::Info {
+                label: None,
+                depth: 0,
+                message: "test".to_string(),
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["request_id"], "req-42");
+        assert_eq!(value["type"], "event");
+        assert_eq!(value["event"], "info");
+    }
+
+    #[test]
+    fn emit_event_uses_empty_string_when_no_request_id() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .emit_event(RawEvent::Info {
+                label: None,
+                depth: 0,
+                message: "test".to_string(),
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["request_id"], "");
+    }
+
+    #[test]
+    fn clear_request_id_reverts_to_empty() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("req-1".to_string());
+        server.clear_request_id();
+        server
+            .emit_event(RawEvent::Info {
+                label: None,
+                depth: 0,
+                message: "test".to_string(),
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["request_id"], "");
+    }
+
+    #[test]
+    fn should_interrupt_polls_interrupt_request() {
+        let input = PollInput::new(&[
+            r#"{"protocol_version":2,"request_id":"interrupt-1","op":"interrupt"}"#,
+        ]);
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("turn-1".to_string());
+
+        assert!(server.should_interrupt());
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["request_id"], "interrupt-1");
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn should_interrupt_rejects_non_interrupt_request_as_busy() {
+        let input =
+            PollInput::new(&[r#"{"protocol_version":2,"request_id":"stats-1","op":"stats"}"#]);
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+
+        assert!(!server.should_interrupt());
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        assert!(text.contains("\"request_id\":\"stats-1\""));
+        assert!(text.contains("\"code\":\"busy\""));
+    }
+
+    // ── prompt handling ──────────────────────────────────────────────────
 
     #[test]
     fn prompt_wait_rejects_non_prompt_requests() {
@@ -501,5 +938,177 @@ mod tests {
         assert!(text.contains("\"response\":\"yes\""));
         assert!(text.contains("\"request_id\":\"bad\""));
         assert!(text.contains("\"code\":\"busy\""));
+    }
+
+    #[test]
+    fn prompt_wait_rejects_stale_prompt_id() {
+        let input = BufReader::new(
+            br#"{"protocol_version":2,"request_id":"stale","op":"prompt_response","prompt_id":"prompt-999","response":"yes"}
+{"protocol_version":2,"request_id":"correct","op":"prompt_response","prompt_id":"prompt-1","response":"no"}
+"#
+            .as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("req-1".to_string());
+        let line = server.read_operator_line("Allow?").unwrap();
+        assert_eq!(line, Some(OperatorLine::Line("no".to_string())));
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        assert!(
+            text.contains("stale_prompt"),
+            "expected stale_prompt error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn prompt_wait_returns_eof_on_input_close() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("req-1".to_string());
+        let line = server.read_operator_line("Continue?").unwrap();
+        assert_eq!(line, Some(OperatorLine::Eof));
+    }
+
+    #[test]
+    fn prompt_ids_increment_across_calls() {
+        // First prompt uses prompt-1, second uses prompt-2.
+        let input = BufReader::new(
+            br#"{"protocol_version":2,"request_id":"a","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+{"protocol_version":2,"request_id":"b","op":"prompt_response","prompt_id":"prompt-2","response":"no"}
+"#
+            .as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        server.set_request_id("req-1".to_string());
+
+        let first = server.read_operator_line("First?").unwrap();
+        assert_eq!(first, Some(OperatorLine::Line("yes".to_string())));
+
+        let second = server.read_operator_line("Second?").unwrap();
+        assert_eq!(second, Some(OperatorLine::Line("no".to_string())));
+    }
+
+    #[test]
+    fn prompt_uses_fallback_request_id_when_none_set() {
+        let input = BufReader::new(
+            br#"{"protocol_version":2,"request_id":"resp","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+"#
+            .as_slice(),
+        );
+        let output = Vec::new();
+        let mut server = RawServer::new(input, output);
+        // Deliberately do NOT set a request id.
+        let line = server.read_operator_line("Continue?").unwrap();
+        assert_eq!(line, Some(OperatorLine::Line("yes".to_string())));
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        // Prompt should use fallback request_id "prompt".
+        assert!(
+            text.contains("\"request_id\":\"prompt\""),
+            "expected fallback request_id, got: {text}"
+        );
+    }
+
+    // ── SharedOutput clone ───────────────────────────────────────────────
+
+    #[test]
+    fn shared_output_clones_share_sequence_counter() {
+        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
+        let clone = output.clone();
+
+        output
+            .write_message(&RawServerMessage::Result(RawResultEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
+                request_id: "a".to_string(),
+                ok: true,
+                data: None,
+                error: None,
+            }))
+            .unwrap();
+        clone
+            .write_message(&RawServerMessage::Result(RawResultEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
+                request_id: "b".to_string(),
+                ok: true,
+                data: None,
+                error: None,
+            }))
+            .unwrap();
+
+        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
+        let sequences: Vec<u64> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["sequence"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+    }
+
+    // ── RawToolOutputObserver ────────────────────────────────────────────
+
+    #[test]
+    fn tool_output_observer_emits_tool_output_event() {
+        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
+        let observer = RawToolOutputObserver::new(output.clone());
+
+        observer.on_tool_output(&ToolOutputEvent {
+            request_id: "r-1".to_string(),
+            tool_name: "bash".to_string(),
+            tool_use_id: "tu-1".to_string(),
+            stream: "stdout".to_string(),
+            text: Some("hello\n".to_string()),
+            data_b64: None,
+        });
+
+        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "event");
+        assert_eq!(value["event"], "tool_output");
+        assert_eq!(value["request_id"], "r-1");
+        assert_eq!(value["tool_name"], "bash");
+        assert_eq!(value["tool_use_id"], "tu-1");
+        assert_eq!(value["stream"], "stdout");
+        assert_eq!(value["text"], "hello\n");
+    }
+
+    #[test]
+    fn usage_report_observer_emits_info_events() {
+        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
+        let observer = RawUsageReportObserver::new(output.clone(), "r-usage");
+
+        observer.on_usage_report(&UsageReportEvent {
+            token_line: "[tokens: input=1 cached_input=2 output=3]".to_string(),
+            usage_line: "[usage: test]".to_string(),
+        });
+
+        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
+        let values = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["type"], "event");
+        assert_eq!(values[0]["event"], "info");
+        assert_eq!(values[0]["request_id"], "r-usage");
+        assert_eq!(
+            values[0]["message"],
+            "[tokens: input=1 cached_input=2 output=3]"
+        );
+        assert_eq!(values[1]["type"], "event");
+        assert_eq!(values[1]["event"], "info");
+        assert_eq!(values[1]["request_id"], "r-usage");
+        assert_eq!(values[1]["message"], "[usage: test]");
     }
 }

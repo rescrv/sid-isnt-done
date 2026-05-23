@@ -66,6 +66,7 @@ use crate::config::{
     TOOLS_CONF_FILE, ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
+use crate::raw_protocol::{UsageReportEvent, notify_usage_report_observer};
 use crate::seatbelt::WritableRoots;
 use crate::session::{CompactionExpertConfig, CompactionProvenance, SidSession};
 use crate::tool_runtime::ToolRuntimeContext;
@@ -1324,11 +1325,17 @@ impl Agent for SidAgent {
             }
             None => String::new(),
         };
-        println!(
-            "[tokens: input={} cached_input={} output={}{}]",
-            totals.input, totals.cached_input, totals.output, cost_suffix
-        );
-        println!("[usage: {:?}]", resp.usage);
+        let report = UsageReportEvent {
+            token_line: format!(
+                "[tokens: input={} cached_input={} output={}{}]",
+                totals.input, totals.cached_input, totals.output, cost_suffix
+            ),
+            usage_line: format!("[usage: {:?}]", resp.usage),
+        };
+        if !notify_usage_report_observer(&report) {
+            println!("{}", report.token_line);
+            println!("{}", report.usage_line);
+        }
         Ok(())
     }
 

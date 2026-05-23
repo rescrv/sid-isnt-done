@@ -1,4 +1,4 @@
-//! Socket listener transport for `sid --listen`.
+//! Socket listener and connector transport for `sid --listen` and `sid --connect`.
 //!
 //! The listener keeps the raw JSONL stream process-local and lets frontends
 //! reconnect without restarting the agent session.  Complete server messages
@@ -9,33 +9,125 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::raw_mode::RawServer;
-use crate::raw_protocol::RawServerMessage;
+use crate::raw_mode::{RawInput, RawServer};
+use crate::raw_protocol::{
+    RAW_PROTOCOL_VERSION, RawReplayComplete, RawRequestEnvelope, RawServerMessage,
+};
 
 const VMADDR_CID_ANY_VALUE: u32 = u32::MAX;
+const VMADDR_CID_HOST_VALUE: u32 = 2;
 
 /// Listen on `spec` and return a raw JSONL server backed by that socket.
 ///
 /// `unix:///absolute/path` binds a Unix-domain socket on Unix platforms.
 /// `vsock://CID:PORT` binds an AF_VSOCK stream listener on Linux.  `CID` may
 /// be omitted, `any`, or `-1` to bind `VMADDR_CID_ANY`.
-pub fn listen(spec: &str) -> io::Result<RawServer<Box<dyn BufRead + Send>, Box<dyn Write + Send>>> {
+pub fn listen(spec: &str) -> io::Result<RawServer<Box<dyn RawInput>, Box<dyn Write + Send>>> {
     let spec = ListenSpec::parse(spec)?;
     let (sender, receiver) = mpsc::channel();
     let state = Arc::new(Mutex::new(ListenState::default()));
     let guard = start_accept_loop(spec, sender, state.clone())?;
-    let input: Box<dyn BufRead + Send> =
-        Box::new(ListeningInput::new(receiver, state.clone(), guard));
+    let input: Box<dyn RawInput> = Box::new(ListeningInput::new(receiver, state.clone(), guard));
     let output: Box<dyn Write + Send> = Box::new(ReplayOutput::new(state));
     Ok(RawServer::new(input, output))
 }
 
+/// A client connection to a reconnectable raw JSONL server.
+///
+/// Use [`RawConnection::connect`] to connect to a listen-compatible spec and
+/// exchange typed raw protocol messages.
+pub struct RawConnection {
+    reader: BufReader<Box<dyn ConnectedSocket>>,
+    writer: RawConnectionWriter,
+}
+
+/// Shared writer half for a raw listener connection.
+#[derive(Clone)]
+pub struct RawConnectionWriter {
+    writer: Arc<Mutex<Box<dyn ConnectedSocket>>>,
+}
+
+impl RawConnectionWriter {
+    fn new(writer: Box<dyn ConnectedSocket>) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+
+    /// Write one client request to the connection.
+    pub fn write_request(&self, request: &RawRequestEnvelope) -> io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("raw connection writer lock poisoned"))?;
+        serde_json::to_writer(&mut *writer, request).map_err(|err| {
+            io::Error::other(format!("failed to encode raw client request: {err}"))
+        })?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+}
+
+impl RawConnection {
+    /// Connect to a raw JSONL listener.
+    ///
+    /// `unix:///absolute/path` connects to a Unix-domain socket on Unix
+    /// platforms.  `vsock://CID:PORT` connects to an AF_VSOCK stream peer on
+    /// Linux.  To stay compatible with listener specs, omitted, `any`, or `-1`
+    /// CIDs target the host CID by convention.
+    pub fn connect(spec: &str) -> io::Result<Self> {
+        let reader = connect_socket(spec)?;
+        let writer = RawConnectionWriter::new(reader.try_clone_socket()?);
+        Ok(Self {
+            reader: BufReader::new(reader),
+            writer,
+        })
+    }
+
+    /// Read one server message from the connection.
+    pub fn read_message(&mut self) -> io::Result<Option<RawServerMessage>> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self.reader.read_line(&mut line)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            return serde_json::from_str(&line).map(Some).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to decode raw server message: {err}"),
+                )
+            });
+        }
+    }
+
+    /// Write one client request to the connection.
+    pub fn write_request(&mut self, request: &RawRequestEnvelope) -> io::Result<()> {
+        self.writer.write_request(request)
+    }
+
+    /// Clone the connection writer for another thread.
+    pub fn writer_handle(&self) -> RawConnectionWriter {
+        self.writer.clone()
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum ListenSpec {
+    Unix(PathBuf),
+    Vsock { cid: u32, port: u32 },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ConnectSpec {
     Unix(PathBuf),
     Vsock { cid: u32, port: u32 },
 }
@@ -51,6 +143,21 @@ impl ListenSpec {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "listen spec must start with unix:// or vsock://",
+        ))
+    }
+}
+
+impl ConnectSpec {
+    fn parse(spec: &str) -> io::Result<Self> {
+        if let Some(path) = spec.strip_prefix("unix://") {
+            return parse_unix_spec(path).map(ConnectSpec::Unix);
+        }
+        if let Some(address) = spec.strip_prefix("vsock://") {
+            return parse_vsock_connect_spec(address);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "connect spec must start with unix:// or vsock://",
         ))
     }
 }
@@ -79,9 +186,35 @@ fn parse_vsock_spec(address: &str) -> io::Result<ListenSpec> {
     Ok(ListenSpec::Vsock { cid, port })
 }
 
+fn parse_vsock_connect_spec(address: &str) -> io::Result<ConnectSpec> {
+    if address.is_empty() || address.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vsock connect URL must be vsock://CID:PORT or vsock://PORT",
+        ));
+    }
+    let (cid, port) = match address.rsplit_once(':') {
+        Some((cid, port)) => (parse_vsock_connect_cid(cid)?, parse_vsock_port(port)?),
+        None => (VMADDR_CID_HOST_VALUE, parse_vsock_port(address)?),
+    };
+    Ok(ConnectSpec::Vsock { cid, port })
+}
+
 fn parse_vsock_cid(cid: &str) -> io::Result<u32> {
     match cid {
         "" | "any" | "-1" => Ok(VMADDR_CID_ANY_VALUE),
+        _ => cid.parse::<u32>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid vsock CID {cid:?}: {err}"),
+            )
+        }),
+    }
+}
+
+fn parse_vsock_connect_cid(cid: &str) -> io::Result<u32> {
+    match cid {
+        "" | "any" | "-1" => Ok(VMADDR_CID_HOST_VALUE),
         _ => cid.parse::<u32>().map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -163,6 +296,41 @@ fn start_accept_loop(
         ListenSpec::Unix(path) => start_unix_accept_loop(path, sender, state),
         ListenSpec::Vsock { cid, port } => start_vsock_accept_loop(cid, port, sender, state),
     }
+}
+
+fn connect_socket(spec: &str) -> io::Result<Box<dyn ConnectedSocket>> {
+    match ConnectSpec::parse(spec)? {
+        ConnectSpec::Unix(path) => connect_unix_socket(path),
+        ConnectSpec::Vsock { cid, port } => connect_vsock_socket(cid, port),
+    }
+}
+
+#[cfg(unix)]
+fn connect_unix_socket(path: PathBuf) -> io::Result<Box<dyn ConnectedSocket>> {
+    use std::os::unix::net::UnixStream;
+
+    Ok(Box::new(UnixStream::connect(path)?))
+}
+
+#[cfg(not(unix))]
+fn connect_unix_socket(_path: PathBuf) -> io::Result<Box<dyn ConnectedSocket>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unix:// connections are not supported on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn connect_vsock_socket(cid: u32, port: u32) -> io::Result<Box<dyn ConnectedSocket>> {
+    Ok(Box::new(vsock::VsockStream::connect(cid, port)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_vsock_socket(_cid: u32, _port: u32) -> io::Result<Box<dyn ConnectedSocket>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "vsock:// connections are only supported on Linux",
+    ))
 }
 
 #[cfg(unix)]
@@ -391,6 +559,7 @@ impl ListenState {
                 stream.write_all(&line.line)?;
             }
         }
+        write_replay_complete(&mut stream)?;
         stream.flush()?;
         self.current = Some(stream);
         Ok(self.generation)
@@ -423,10 +592,8 @@ impl ListenState {
                 .and_then(|_| current.flush())
                 .is_err();
         }
-        if disconnect {
-            if let Some(current) = self.current.take() {
-                current.shutdown_socket();
-            }
+        if disconnect && let Some(current) = self.current.take() {
+            current.shutdown_socket();
         }
     }
 
@@ -435,12 +602,20 @@ impl ListenState {
             .current
             .as_mut()
             .is_some_and(|current| current.flush().is_err());
-        if disconnect {
-            if let Some(current) = self.current.take() {
-                current.shutdown_socket();
-            }
+        if disconnect && let Some(current) = self.current.take() {
+            current.shutdown_socket();
         }
     }
+}
+
+fn write_replay_complete(stream: &mut Box<dyn ConnectedSocket>) -> io::Result<()> {
+    let payload = serde_json::to_vec(&RawServerMessage::ReplayComplete(RawReplayComplete {
+        protocol_version: RAW_PROTOCOL_VERSION,
+        sequence: 0,
+    }))
+    .map_err(|err| io::Error::other(format!("failed to encode replay marker: {err}")))?;
+    stream.write_all(&payload)?;
+    stream.write_all(b"\n")
 }
 
 struct ReplayOutput {
@@ -552,6 +727,36 @@ impl BufRead for ListeningInput {
     }
 }
 
+impl RawInput for ListeningInput {
+    fn try_read_line(&mut self) -> io::Result<Option<String>> {
+        loop {
+            if self.position < self.buffer.len() {
+                if self.generation == self.current_generation()? {
+                    let line = String::from_utf8(self.buffer[self.position..].to_vec()).map_err(
+                        |err| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("raw listener buffered input was not UTF-8: {err}"),
+                            )
+                        },
+                    )?;
+                    self.clear_buffer();
+                    return Ok(Some(line));
+                }
+                self.clear_buffer();
+            }
+
+            match self.receiver.try_recv() {
+                Ok(input) if input.generation == self.current_generation()? => {
+                    return Ok(Some(input.line));
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return Ok(None),
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod vsock {
     use std::io::{self, Read, Write};
@@ -601,6 +806,27 @@ mod vsock {
             Ok(VsockStream {
                 fd: unsafe { OwnedFd::from_raw_fd(fd) },
             })
+        }
+    }
+
+    impl VsockStream {
+        pub(super) fn connect(cid: u32, port: u32) -> io::Result<Self> {
+            let fd = syscall_fd(|| unsafe {
+                libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+            })?;
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let mut address = unsafe { mem::zeroed::<libc::sockaddr_vm>() };
+            address.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+            address.svm_cid = cid;
+            address.svm_port = port;
+            syscall_unit(|| unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&address as *const libc::sockaddr_vm).cast::<libc::sockaddr>(),
+                    mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+                )
+            })?;
+            Ok(Self { fd })
         }
     }
 
@@ -693,6 +919,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_vsock_connect_spec_defaults_to_host_cid() {
+        assert_eq!(
+            ConnectSpec::parse("vsock://1024").unwrap(),
+            ConnectSpec::Vsock {
+                cid: VMADDR_CID_HOST_VALUE,
+                port: 1024,
+            }
+        );
+        assert_eq!(
+            ConnectSpec::parse("vsock://any:2048").unwrap(),
+            ConnectSpec::Vsock {
+                cid: VMADDR_CID_HOST_VALUE,
+                port: 2048,
+            }
+        );
+        assert_eq!(
+            ConnectSpec::parse("vsock://3:2048").unwrap(),
+            ConnectSpec::Vsock { cid: 3, port: 2048 }
+        );
+    }
+
+    #[test]
     fn parse_unix_spec_requires_absolute_path() {
         let err = ListenSpec::parse("unix://relative.sock").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -704,11 +952,12 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+        let id = std::process::id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("sid-listen-test-{nanos}.sock"));
+            .subsec_nanos();
+        let path = PathBuf::from(format!("/tmp/sid-lt-{id}-{nanos}.sock"));
         let spec = format!("unix://{}", path.display());
         let server = match listen(&spec) {
             Ok(server) => server,
@@ -723,6 +972,7 @@ mod tests {
             .unwrap();
         let mut first_reader = BufReader::new(first.try_clone().unwrap());
         assert_eq!(read_request_id(&mut first_reader), "first");
+        assert_eq!(read_type(&mut first_reader), "replay_complete");
 
         server.write_ok_result("second", None).unwrap();
         assert_eq!(read_request_id(&mut first_reader), "second");
@@ -734,6 +984,7 @@ mod tests {
         let mut second_reader = BufReader::new(second);
         assert_eq!(read_request_id(&mut second_reader), "first");
         assert_eq!(read_request_id(&mut second_reader), "second");
+        assert_eq!(read_type(&mut second_reader), "replay_complete");
 
         server.write_ok_result("third", None).unwrap();
         assert_eq!(read_request_id(&mut second_reader), "third");
@@ -766,10 +1017,11 @@ mod tests {
                 .unwrap(),
             1
         );
+        let mut first_reader = BufReader::new(first_client.try_clone().unwrap());
+        assert_eq!(read_type(&mut first_reader), "replay_complete");
 
         output.write_all(br#"{"sequence":1}"#).unwrap();
         output.write_all(b"\n").unwrap();
-        let mut first_reader = BufReader::new(first_client.try_clone().unwrap());
         let mut first_line = String::new();
         first_reader.read_line(&mut first_line).unwrap();
         assert_eq!(first_line, "{\"sequence\":1}\n");
@@ -791,6 +1043,7 @@ mod tests {
         let mut replayed = String::new();
         second_reader.read_line(&mut replayed).unwrap();
         assert_eq!(replayed, "{\"sequence\":1}\n");
+        assert_eq!(read_type(&mut second_reader), "replay_complete");
 
         output.write_all(b"{\"sequence\":2}\n").unwrap();
         let mut live = String::new();
@@ -893,5 +1146,362 @@ mod tests {
                 "response": response,
             })
         )
+    }
+
+    // ── percent_decode ───────────────────────────────────────────────────
+
+    #[test]
+    fn percent_decode_passthrough() {
+        assert_eq!(percent_decode("/tmp/foo.sock").unwrap(), "/tmp/foo.sock");
+    }
+
+    #[test]
+    fn percent_decode_space() {
+        assert_eq!(percent_decode("/tmp/my%20sock").unwrap(), "/tmp/my sock");
+    }
+
+    #[test]
+    fn percent_decode_multiple() {
+        assert_eq!(percent_decode("%2F%2F").unwrap(), "//");
+    }
+
+    #[test]
+    fn percent_decode_mixed_case_hex() {
+        assert_eq!(percent_decode("%4a%4A").unwrap(), "JJ");
+    }
+
+    #[test]
+    fn percent_decode_incomplete_escape() {
+        assert!(percent_decode("%2").is_err());
+        assert!(percent_decode("abc%").is_err());
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex_digit() {
+        assert!(percent_decode("%GG").is_err());
+    }
+
+    // ── hex_value ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_value_digits() {
+        assert_eq!(hex_value(b'0'), Some(0));
+        assert_eq!(hex_value(b'9'), Some(9));
+    }
+
+    #[test]
+    fn hex_value_lowercase() {
+        assert_eq!(hex_value(b'a'), Some(10));
+        assert_eq!(hex_value(b'f'), Some(15));
+    }
+
+    #[test]
+    fn hex_value_uppercase() {
+        assert_eq!(hex_value(b'A'), Some(10));
+        assert_eq!(hex_value(b'F'), Some(15));
+    }
+
+    #[test]
+    fn hex_value_invalid() {
+        assert_eq!(hex_value(b'g'), None);
+        assert_eq!(hex_value(b'G'), None);
+        assert_eq!(hex_value(b' '), None);
+        assert_eq!(hex_value(b'z'), None);
+    }
+
+    // ── parse_vsock_port ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_vsock_port_valid() {
+        assert_eq!(parse_vsock_port("1024").unwrap(), 1024);
+        assert_eq!(parse_vsock_port("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_vsock_port_empty() {
+        assert!(parse_vsock_port("").is_err());
+    }
+
+    #[test]
+    fn parse_vsock_port_non_numeric() {
+        assert!(parse_vsock_port("abc").is_err());
+    }
+
+    // ── parse_vsock_cid ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_vsock_cid_any_variants() {
+        assert_eq!(parse_vsock_cid("").unwrap(), VMADDR_CID_ANY_VALUE);
+        assert_eq!(parse_vsock_cid("any").unwrap(), VMADDR_CID_ANY_VALUE);
+        assert_eq!(parse_vsock_cid("-1").unwrap(), VMADDR_CID_ANY_VALUE);
+    }
+
+    #[test]
+    fn parse_vsock_cid_numeric() {
+        assert_eq!(parse_vsock_cid("3").unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_vsock_cid_invalid() {
+        assert!(parse_vsock_cid("xyz").is_err());
+    }
+
+    // ── parse_vsock_connect_cid ──────────────────────────────────────────
+
+    #[test]
+    fn parse_vsock_connect_cid_any_maps_to_host() {
+        assert_eq!(parse_vsock_connect_cid("").unwrap(), VMADDR_CID_HOST_VALUE);
+        assert_eq!(
+            parse_vsock_connect_cid("any").unwrap(),
+            VMADDR_CID_HOST_VALUE
+        );
+        assert_eq!(
+            parse_vsock_connect_cid("-1").unwrap(),
+            VMADDR_CID_HOST_VALUE
+        );
+    }
+
+    #[test]
+    fn parse_vsock_connect_cid_numeric() {
+        assert_eq!(parse_vsock_connect_cid("5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_vsock_connect_cid_invalid() {
+        assert!(parse_vsock_connect_cid("xyz").is_err());
+    }
+
+    // ── ListenSpec / ConnectSpec parse edge cases ─────────────────────────
+
+    #[test]
+    fn listen_spec_rejects_unknown_scheme() {
+        assert!(ListenSpec::parse("tcp://localhost:1234").is_err());
+    }
+
+    #[test]
+    fn connect_spec_rejects_unknown_scheme() {
+        assert!(ConnectSpec::parse("tcp://localhost:1234").is_err());
+    }
+
+    #[test]
+    fn vsock_listen_spec_rejects_path_separator() {
+        assert!(ListenSpec::parse("vsock://1024/extra").is_err());
+    }
+
+    #[test]
+    fn vsock_connect_spec_rejects_path_separator() {
+        assert!(ConnectSpec::parse("vsock://1024/extra").is_err());
+    }
+
+    #[test]
+    fn vsock_listen_spec_rejects_empty_address() {
+        assert!(ListenSpec::parse("vsock://").is_err());
+    }
+
+    #[test]
+    fn vsock_connect_spec_rejects_empty_address() {
+        assert!(ConnectSpec::parse("vsock://").is_err());
+    }
+
+    #[test]
+    fn listen_spec_cid_with_port() {
+        assert_eq!(
+            ListenSpec::parse("vsock://3:5000").unwrap(),
+            ListenSpec::Vsock { cid: 3, port: 5000 }
+        );
+    }
+
+    #[test]
+    fn connect_spec_minus_one_cid() {
+        assert_eq!(
+            ConnectSpec::parse("vsock://-1:9000").unwrap(),
+            ConnectSpec::Vsock {
+                cid: VMADDR_CID_HOST_VALUE,
+                port: 9000,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listen_spec_unix_with_percent_encoded_space() {
+        assert_eq!(
+            ListenSpec::parse("unix:///tmp/my%20socket.sock").unwrap(),
+            ListenSpec::Unix(PathBuf::from("/tmp/my socket.sock")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_spec_unix_roundtrip() {
+        assert_eq!(
+            ConnectSpec::parse("unix:///tmp/test.sock").unwrap(),
+            ConnectSpec::Unix(PathBuf::from("/tmp/test.sock")),
+        );
+    }
+
+    // ── HistoryLine::should_replay ───────────────────────────────────────
+
+    #[test]
+    fn history_line_unanswered_prompt_should_replay() {
+        let line = prompt_line("p-1");
+        let history = HistoryLine::parse(line.as_bytes());
+        let acked = HashSet::new();
+        assert!(history.should_replay(&acked));
+    }
+
+    #[test]
+    fn history_line_answered_prompt_should_not_replay() {
+        let line = prompt_line("p-1");
+        let history = HistoryLine::parse(line.as_bytes());
+        let acked: HashSet<String> = ["p-1".to_string()].into_iter().collect();
+        assert!(!history.should_replay(&acked));
+    }
+
+    #[test]
+    fn history_line_prompt_ack_always_replays() {
+        let line = prompt_ack_line("p-1", "yes");
+        let history = HistoryLine::parse(line.as_bytes());
+        let acked = HashSet::new();
+        assert!(history.should_replay(&acked));
+    }
+
+    #[test]
+    fn history_line_other_always_replays() {
+        let line = b"{\"type\":\"result\",\"protocol_version\":2,\"sequence\":1,\"request_id\":\"r\",\"ok\":true}\n";
+        let history = HistoryLine::parse(line);
+        let acked = HashSet::new();
+        assert!(history.should_replay(&acked));
+    }
+
+    // ── ListenState::push_output ─────────────────────────────────────────
+
+    #[test]
+    fn push_output_buffers_partial_lines() {
+        let mut state = ListenState::default();
+        state.push_output(b"partial");
+        assert_eq!(state.history.len(), 0);
+        assert_eq!(state.pending, b"partial");
+
+        state.push_output(b" line\n");
+        assert_eq!(state.history.len(), 1);
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn push_output_handles_multiple_lines_in_one_call() {
+        let mut state = ListenState::default();
+        state.push_output(b"line1\nline2\n");
+        assert_eq!(state.history.len(), 2);
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn push_output_handles_trailing_partial() {
+        let mut state = ListenState::default();
+        state.push_output(b"line1\npartial");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.pending, b"partial");
+    }
+
+    #[test]
+    fn listening_input_try_read_line_is_nonblocking_and_filters_stale_generations() {
+        let (sender, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ListenState::default()));
+        state.lock().unwrap().generation = 2;
+        let mut input = ListeningInput::new(receiver, state, ListenGuard::default());
+
+        assert_eq!(RawInput::try_read_line(&mut input).unwrap(), None);
+
+        sender
+            .send(InputLine {
+                generation: 1,
+                line: "stale\n".to_string(),
+            })
+            .unwrap();
+        sender
+            .send(InputLine {
+                generation: 2,
+                line: "live\n".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            RawInput::try_read_line(&mut input).unwrap(),
+            Some("live\n".to_string())
+        );
+        assert_eq!(RawInput::try_read_line(&mut input).unwrap(), None);
+    }
+
+    // ── ListenState::connect (acknowledged prompt suppression) ───────────
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_replays_all_when_no_prompts_acknowledged() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let mut state = ListenState::default();
+        // Push a prompt and a result.
+        state.push_output(prompt_line("p-1").as_bytes());
+        state.push_output(
+            b"{\"type\":\"result\",\"protocol_version\":2,\"sequence\":1,\"request_id\":\"r\",\"ok\":true}\n",
+        );
+        assert_eq!(state.history.len(), 2);
+
+        let (server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        state.connect(Box::new(server)).unwrap();
+
+        let mut reader = BufReader::new(client);
+        assert_eq!(read_type(&mut reader), "prompt");
+        assert_eq!(read_type(&mut reader), "result");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_skips_acknowledged_prompts() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let mut state = ListenState::default();
+        state.push_output(prompt_line("p-1").as_bytes());
+        state.push_output(prompt_ack_line("p-1", "yes").as_bytes());
+        assert_eq!(state.history.len(), 2);
+        // p-1 should be in acknowledged_prompts now.
+        assert!(state.acknowledged_prompts.contains("p-1"));
+
+        let (server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        state.connect(Box::new(server)).unwrap();
+
+        // Only the prompt_ack should be replayed, not the prompt.
+        let mut reader = BufReader::new(client);
+        assert_eq!(read_type(&mut reader), "prompt_ack");
+    }
+
+    // ── ListenGuard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn listen_guard_default_does_not_unlink() {
+        let guard = ListenGuard::default();
+        assert!(guard.unlink_on_drop.is_none());
+        drop(guard); // should not panic
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listen_guard_unlinks_on_drop() {
+        let path = PathBuf::from(format!("/tmp/sid-guard-test-{}.sock", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        assert!(path.exists());
+
+        let guard = ListenGuard::unlink_on_drop(path.clone());
+        drop(guard);
+        assert!(!path.exists());
     }
 }

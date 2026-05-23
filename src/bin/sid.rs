@@ -1,9 +1,13 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use arrrg::CommandLine;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use handled::SError;
 use rc_conf::SwitchPosition;
 use rustyline::DefaultEditor;
@@ -16,16 +20,17 @@ use claudius::chat::{
     ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, SessionStats,
     help_text, parse_command,
 };
-use claudius::{Anthropic, Effort, Model};
+use claudius::{Anthropic, Effort, KnownModel, Model, TokenRates};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{
     AGENTS_CONF_FILE, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
 };
-use sid_isnt_done::raw_mode::{RawServer, RawToolOutputObserver};
+use sid_isnt_done::raw_mode::{RawInput, RawServer, RawToolOutputObserver, RawUsageReportObserver};
 use sid_isnt_done::raw_protocol::{
-    RAW_PROTOCOL_VERSION, RawHello, RawRequest, RawRequestEnvelope, RawServerMessage,
-    install_tool_output_observer,
+    RAW_PROTOCOL_VERSION, RawEvent, RawHello, RawPrompt, RawRequest, RawRequestEnvelope,
+    RawResultEnvelope, RawServerMessage, install_tool_output_observer,
+    install_usage_report_observer,
 };
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, append_resumed_bash_reset_marker, compacted_transcript,
@@ -44,6 +49,115 @@ const SANDBOX_UNAVAILABLE_WARNING: &str = concat!(
     "!! WARNING: sid will run bash and external tools UNSANDBOXED.\n",
     "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
 );
+const MICRO_CENTS_PER_DOLLAR: f64 = 100_000_000.0;
+const SESSION_SPEND_EXHAUSTED: &str = concat!(
+    "Session spend limit exhausted. ",
+    "Use /spend to increase or /spend clear to remove the limit."
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SidSpendState {
+    limit_micro_cents: u64,
+    used_micro_cents: u64,
+}
+
+impl SidSpendState {
+    fn new(limit_micro_cents: u64) -> Self {
+        Self {
+            limit_micro_cents,
+            used_micro_cents: 0,
+        }
+    }
+
+    fn from_dollars(dollars: f64) -> Self {
+        Self::new(dollars_to_micro_cents(dollars))
+    }
+
+    fn remaining_micro_cents(&self) -> u64 {
+        self.limit_micro_cents.saturating_sub(self.used_micro_cents)
+    }
+
+    fn record_cost(&mut self, cost_micro_cents: u64) {
+        self.used_micro_cents = self.used_micro_cents.saturating_add(cost_micro_cents);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SpendUsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+}
+
+impl SpendUsageTotals {
+    fn from_stats_delta(before: &SessionStats, after: &SessionStats) -> Self {
+        Self {
+            input_tokens: after
+                .total_input_tokens
+                .saturating_sub(before.total_input_tokens),
+            output_tokens: after
+                .total_output_tokens
+                .saturating_sub(before.total_output_tokens),
+            cache_creation_tokens: after
+                .total_cache_creation_tokens
+                .saturating_sub(before.total_cache_creation_tokens),
+            cache_read_tokens: after
+                .total_cache_read_tokens
+                .saturating_sub(before.total_cache_read_tokens),
+        }
+    }
+
+    fn cost_micro_cents(&self, rates: TokenRates) -> u64 {
+        self.input_tokens
+            .saturating_mul(rates.input)
+            .saturating_add(self.output_tokens.saturating_mul(rates.output))
+            .saturating_add(
+                self.cache_creation_tokens
+                    .saturating_mul(rates.cache_creation),
+            )
+            .saturating_add(self.cache_read_tokens.saturating_mul(rates.cache_read))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpendTurnClamp {
+    original_max_tokens: Option<u32>,
+    clamped_max_tokens: u32,
+}
+
+fn dollars_to_micro_cents(dollars: f64) -> u64 {
+    let result = dollars * MICRO_CENTS_PER_DOLLAR;
+    if result.is_finite() && result >= 0.0 {
+        result as u64
+    } else {
+        u64::MAX
+    }
+}
+
+fn model_token_rates(model: &Model) -> TokenRates {
+    match model {
+        Model::Known(KnownModel::ClaudeHaiku45 | KnownModel::ClaudeHaiku4520251001) => {
+            KnownModel::ClaudeHaiku45.token_rates()
+        }
+        Model::Known(
+            KnownModel::Claude37SonnetLatest
+            | KnownModel::Claude37Sonnet20250219
+            | KnownModel::ClaudeSonnet40
+            | KnownModel::ClaudeSonnet420250514
+            | KnownModel::Claude4Sonnet20250514
+            | KnownModel::ClaudeSonnet45
+            | KnownModel::ClaudeSonnet4520250929,
+        ) => KnownModel::ClaudeSonnet45.token_rates(),
+        Model::Known(
+            KnownModel::ClaudeOpus4520251101
+            | KnownModel::ClaudeOpus45
+            | KnownModel::ClaudeOpus46
+            | KnownModel::ClaudeOpus47,
+        ) => KnownModel::ClaudeOpus45.token_rates(),
+        Model::Known(_) | Model::Custom(_) => KnownModel::ClaudeSonnet45.token_rates(),
+    }
+}
 
 struct SidTerminal {
     editor: DefaultEditor,
@@ -274,6 +388,18 @@ struct SidArgs {
         "SPEC"
     )]
     listen: Option<String>,
+
+    #[arrrg(
+        optional,
+        "Connect to a reconnectable JSONL protocol server on SPEC",
+        "SPEC"
+    )]
+    connect: Option<String>,
+}
+
+enum StartupSetup {
+    Local(Box<PreRuntimeSetup>),
+    Connect(ConnectSetup),
 }
 
 /// Data computed synchronously before the tokio runtime starts.
@@ -289,6 +415,12 @@ struct PreRuntimeSetup {
     raw: bool,
     listen: Option<String>,
     resumed: bool,
+}
+
+/// Data needed to run `sid --connect` as a terminal frontend.
+struct ConnectSetup {
+    spec: String,
+    use_color: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +602,7 @@ struct SidRuntimeSession {
     current_agent_id: String,
     overrides: SessionOverrides,
     rolled_up_stats: SessionStatsRollup,
+    sid_spend: Option<SidSpendState>,
     auto_compact_tokens: Option<u64>,
 }
 
@@ -485,6 +618,11 @@ impl SidRuntimeSession {
         current_agent_id: String,
         auto_compact_tokens: Option<u64>,
     ) -> Self {
+        let sid_spend = chat
+            .config()
+            .session_spend
+            .as_ref()
+            .map(|spend| SidSpendState::new(spend.total_micro_cents()));
         Self {
             client,
             chat,
@@ -495,6 +633,7 @@ impl SidRuntimeSession {
             current_agent_id,
             overrides: SessionOverrides::default(),
             rolled_up_stats: SessionStatsRollup::default(),
+            sid_spend,
             auto_compact_tokens,
         }
     }
@@ -510,6 +649,16 @@ impl SidRuntimeSession {
     fn stats(&self) -> SessionStats {
         let mut stats = self.chat.stats();
         self.rolled_up_stats.apply(&mut stats);
+        match self.sid_spend {
+            Some(spend) => {
+                stats.session_spend_micro_cents = Some(spend.limit_micro_cents);
+                stats.spend_used_micro_cents = spend.used_micro_cents;
+            }
+            None => {
+                stats.session_spend_micro_cents = None;
+                stats.spend_used_micro_cents = 0;
+            }
+        }
         stats
     }
 
@@ -527,7 +676,69 @@ impl SidRuntimeSession {
         message: claudius::MessageParam,
         renderer: &mut dyn Renderer,
     ) -> Result<(), claudius::Error> {
-        self.chat.send_message(message, renderer).await
+        let model = self.chat.config().model();
+        let before = self.chat.stats();
+        let clamp = match self.spend_turn_clamp() {
+            Ok(clamp) => clamp,
+            Err(err) => {
+                renderer.print_error(&(), SESSION_SPEND_EXHAUSTED);
+                return Err(err);
+            }
+        };
+        if let Some(clamp) = clamp {
+            self.chat
+                .config_mut()
+                .set_max_tokens(clamp.clamped_max_tokens);
+        }
+
+        let result = self.chat.send_message(message, renderer).await;
+        let after = self.chat.stats();
+        if let Some(clamp) = clamp {
+            self.chat.config_mut().template.max_tokens = clamp.original_max_tokens;
+        }
+        if result.is_ok() {
+            self.record_sid_spend_delta(&before, &after, &model);
+        }
+        result
+    }
+
+    fn spend_turn_clamp(&self) -> Result<Option<SpendTurnClamp>, claudius::Error> {
+        let Some(spend) = self.sid_spend else {
+            return Ok(None);
+        };
+        let remaining = spend.remaining_micro_cents();
+        let rates = model_token_rates(&self.chat.config().model());
+        let affordable_tokens = remaining / rates.output.max(1);
+        if affordable_tokens == 0 {
+            return Err(claudius::Error::bad_request(
+                "session spend exhausted",
+                Some("spend".to_string()),
+            ));
+        }
+
+        let max_tokens = self.chat.config().max_tokens();
+        let affordable_tokens = u32::try_from(affordable_tokens).unwrap_or(u32::MAX);
+        if affordable_tokens < max_tokens {
+            Ok(Some(SpendTurnClamp {
+                original_max_tokens: self.chat.config().template.max_tokens,
+                clamped_max_tokens: affordable_tokens,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn record_sid_spend_delta(
+        &mut self,
+        before: &SessionStats,
+        after: &SessionStats,
+        model: &Model,
+    ) {
+        let Some(spend) = self.sid_spend.as_mut() else {
+            return;
+        };
+        let usage = SpendUsageTotals::from_stats_delta(before, after);
+        spend.record_cost(usage.cost_micro_cents(model_token_rates(model)));
     }
 
     fn clear(&mut self) -> Result<(), SError> {
@@ -640,6 +851,7 @@ impl SidRuntimeSession {
     fn set_session_spend(&mut self, dollars: Option<f64>) {
         self.chat.config_mut().set_session_spend(dollars);
         self.overrides.session_spend = Some(dollars);
+        self.sid_spend = dollars.map(SidSpendState::from_dollars);
     }
 
     fn set_caching_enabled(&mut self, enabled: bool) {
@@ -688,10 +900,23 @@ impl SidRuntimeSession {
 
         self.chat = next_chat;
         self.current_agent_id = agent_id.to_string();
+        self.sync_configured_sid_spend();
         self.persist_transcript()?;
 
         let summary = self.current_agent_summary()?;
         Ok(AgentSwitchResult::Switched(summary))
+    }
+
+    fn sync_configured_sid_spend(&mut self) {
+        if self.sid_spend.is_some() || self.overrides.session_spend.is_some() {
+            return;
+        }
+        self.sid_spend = self
+            .chat
+            .config()
+            .session_spend
+            .as_ref()
+            .map(|spend| SidSpendState::new(spend.total_micro_cents()));
     }
 
     async fn compact(&mut self) -> Result<CompactResult, SError> {
@@ -772,6 +997,7 @@ impl SidRuntimeSession {
         self.chat = next_chat;
         self.sid_session = next_sid_session.clone();
         self.rolled_up_stats = SessionStatsRollup::default();
+        self.sync_configured_sid_spend();
         self.persist_transcript()?;
 
         Ok(CompactResult {
@@ -814,7 +1040,7 @@ impl SidRuntimeSession {
 /// Parse arguments, resolve paths, create the session directory, and set
 /// environment variables for child processes.  Runs before the tokio runtime
 /// so that process-global `set_var` calls are single-threaded and safe.
-fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
+fn pre_runtime_setup() -> Result<StartupSetup, SError> {
     let SidArgs {
         param,
         bash_debug,
@@ -822,7 +1048,26 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         prompt,
         raw,
         listen,
+        connect,
     } = parse_sid_args()?;
+    if let Some(connect) = connect {
+        validate_connect_mode(
+            raw,
+            listen.as_deref(),
+            resume.as_deref(),
+            bash_debug.as_deref(),
+            prompt.as_deref(),
+        )?;
+        let config = ChatConfig::try_from(param).map_err(|err| {
+            cli_error("invalid_cli_args", "failed to parse command line arguments")
+                .with_string_field("cause", &err.to_string())
+        })?;
+        return Ok(StartupSetup::Connect(ConnectSetup {
+            spec: connect,
+            use_color: config.use_color,
+        }));
+    }
+
     let raw = raw || listen.is_some();
     let mut config = ChatConfig::try_from(param).map_err(|err| {
         cli_error("invalid_cli_args", "failed to parse command line arguments")
@@ -881,7 +1126,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
     let workspace_display = workspace_root.as_str().to_string();
     let session_display = sid_session.root().display().to_string();
 
-    Ok(PreRuntimeSetup {
+    Ok(StartupSetup::Local(Box::new(PreRuntimeSetup {
         config,
         workspace_root,
         config_root,
@@ -897,7 +1142,7 @@ fn pre_runtime_setup() -> Result<PreRuntimeSetup, SError> {
         raw,
         listen,
         resumed,
-    })
+    })))
 }
 
 fn main() {
@@ -915,7 +1160,12 @@ fn main() {
     }
 }
 
-async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
+async fn try_main(setup: StartupSetup) -> Result<(), SError> {
+    let setup = match setup {
+        StartupSetup::Local(setup) => *setup,
+        StartupSetup::Connect(setup) => return run_connect_mode(setup),
+    };
+
     let PreRuntimeSetup {
         config,
         workspace_root,
@@ -1352,6 +1602,97 @@ async fn try_main(setup: PreRuntimeSetup) -> Result<(), SError> {
     Ok(())
 }
 
+fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut terminal = SidTerminal::new(setup.use_color, interrupted.clone())?;
+    install_ctrlc_handler(interrupted.clone())?;
+
+    let mut client = RawTerminalClient::connect(&setup.spec, interrupted.clone())?;
+    let hello = client.read_hello(&mut terminal)?;
+    if !hello.sandbox_available {
+        eprint!("{SANDBOX_UNAVAILABLE_WARNING}");
+    }
+
+    println!(
+        "sid (agent: {}, model: {})",
+        hello.current_agent, hello.model
+    );
+    println!("workspace: {}", hello.workspace_root);
+    println!("session: {}", hello.session_dir);
+    println!("connected: {}", setup.spec);
+    println!("Type /help for commands, /quit to exit\n");
+
+    if hello.startup_confirmation_required {
+        let result = client.read_until_result("startup", &mut terminal)?;
+        if !result.ok {
+            terminal.print_error(&(), &raw_result_message(&result));
+            return Ok(());
+        }
+    }
+    client.drain_replay(&mut terminal)?;
+
+    loop {
+        interrupted.store(false, Ordering::Relaxed);
+
+        match terminal.read_line("You: ") {
+            Ok(OperatorLine::Line(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                terminal.add_history_entry(line);
+
+                if line == "/edit" {
+                    match invoke_external_editor() {
+                        Ok(Some(content)) => {
+                            let content = content.trim();
+                            terminal.add_history_entry(content);
+                            client.send_user_turn(content, &mut terminal)?;
+                        }
+                        Ok(None) => {
+                            terminal.print_info(&(), "Editor returned empty; nothing sent.");
+                        }
+                        Err(err) => {
+                            terminal.print_error(&(), &format!("Failed to invoke editor: {err}"));
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(cmd) = parse_sid_command(line) {
+                    client.handle_sid_command(cmd, &mut terminal)?;
+                    continue;
+                }
+
+                if let Some(cmd) = parse_command(line) {
+                    if client.handle_chat_command(cmd, &mut terminal)? {
+                        break;
+                    }
+                    continue;
+                }
+
+                client.send_user_turn(line, &mut terminal)?;
+            }
+            Ok(OperatorLine::Interrupted) => {
+                println!();
+                client.shutdown_server(&mut terminal)?;
+                break;
+            }
+            Ok(OperatorLine::Eof) => {
+                println!("\nGoodbye!");
+                break;
+            }
+            Err(err) => {
+                terminal.print_error(&(), &format!("Input error: {err}"));
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_prompt_mode(
     mut session: SidRuntimeSession,
     prompt: String,
@@ -1377,6 +1718,819 @@ async fn run_prompt_mode(
         cli_error("io_error", "failed to flush prompt output")
             .with_string_field("cause", &err.to_string())
     })
+}
+
+struct RawTerminalClient {
+    connection: sid_isnt_done::raw_listen::RawConnection,
+    interrupted: Arc<AtomicBool>,
+    next_request_id: u64,
+    current_agent: Option<String>,
+    replay_complete: bool,
+}
+
+impl RawTerminalClient {
+    fn connect(spec: &str, interrupted: Arc<AtomicBool>) -> Result<Self, SError> {
+        let connection = sid_isnt_done::raw_listen::RawConnection::connect(spec)
+            .map_err(|err| raw_io_error("failed to connect raw listener", &err))?;
+        Ok(Self {
+            connection,
+            interrupted,
+            next_request_id: 1,
+            current_agent: None,
+            replay_complete: false,
+        })
+    }
+
+    fn read_hello(&mut self, terminal: &mut SidTerminal) -> Result<RawHello, SError> {
+        loop {
+            match self.read_message()? {
+                RawServerMessage::Hello(hello) => {
+                    self.current_agent = Some(hello.current_agent.clone());
+                    return Ok(hello);
+                }
+                message => {
+                    self.handle_server_message(message, terminal, None)?;
+                }
+            }
+        }
+    }
+
+    fn drain_replay(&mut self, terminal: &mut SidTerminal) -> Result<(), SError> {
+        let mut resumed_request_id = None;
+        while !self.replay_complete {
+            match self.read_message()? {
+                RawServerMessage::ReplayComplete(_) => {
+                    self.replay_complete = true;
+                }
+                RawServerMessage::Hello(hello) => {
+                    self.current_agent = Some(hello.current_agent);
+                }
+                RawServerMessage::Prompt(prompt) => {
+                    resumed_request_id.get_or_insert_with(|| prompt.request_id.clone());
+                    self.answer_prompt(prompt, terminal)?;
+                }
+                RawServerMessage::Event(event) => {
+                    render_raw_event(event.event, terminal)?;
+                }
+                RawServerMessage::PromptAck(_) | RawServerMessage::Result(_) => {}
+            }
+        }
+        if let Some(request_id) = resumed_request_id {
+            let result = self.read_until_result(&request_id, terminal)?;
+            if !result.ok {
+                terminal.print_error(&(), &raw_result_message(&result));
+            }
+        }
+        Ok(())
+    }
+
+    fn send_user_turn(&mut self, text: &str, terminal: &mut SidTerminal) -> Result<(), SError> {
+        let result = self.send_request(
+            "turn",
+            RawRequest::UserTurn {
+                text: text.to_string(),
+            },
+            terminal,
+        )?;
+        if !result.ok {
+            terminal.print_error(&(), &raw_result_message(&result));
+        } else if let Some(data) = result.data.as_ref() {
+            self.update_identity(data);
+        }
+        Ok(())
+    }
+
+    fn shutdown_server(&mut self, terminal: &mut SidTerminal) -> Result<(), SError> {
+        let result = self.send_request("shutdown", RawRequest::Shutdown, terminal)?;
+        if !result.ok {
+            terminal.print_error(&(), &raw_result_message(&result));
+        }
+        Ok(())
+    }
+
+    fn handle_sid_command(
+        &mut self,
+        cmd: SidCommand,
+        terminal: &mut SidTerminal,
+    ) -> Result<(), SError> {
+        match cmd {
+            SidCommand::ShowAgent => {
+                if let Some(data) =
+                    self.send_request_data("agent", RawRequest::ShowAgent, terminal)?
+                {
+                    print_remote_agent_summary(&data);
+                }
+            }
+            SidCommand::AgentList => {
+                if let Some(data) =
+                    self.send_request_data("agents", RawRequest::ListAgents, terminal)?
+                {
+                    print_remote_agent_list(&data);
+                }
+            }
+            SidCommand::SwitchAgent(agent) => {
+                let already_current = self.current_agent.as_deref() == Some(agent.as_str());
+                if let Some(data) = self.send_request_data(
+                    "switch-agent",
+                    RawRequest::SwitchAgent {
+                        agent: agent.clone(),
+                    },
+                    terminal,
+                )? {
+                    if already_current {
+                        terminal.print_info(&(), &format!("Already using agent: {agent}"));
+                    } else {
+                        terminal.print_info(
+                            &(),
+                            &format!("Switched to agent: {}", format_remote_agent_label(&data)),
+                        );
+                    }
+                }
+            }
+            SidCommand::Compact => {
+                if let Some(data) =
+                    self.send_request_data("compact", RawRequest::Compact, terminal)?
+                {
+                    terminal.print_info(
+                        &(),
+                        &format!(
+                            "Compacted session {} into {} ({})",
+                            json_str(&data, "parent_session_id").unwrap_or("?"),
+                            json_str(&data, "new_session_id").unwrap_or("?"),
+                            json_str(&data, "new_session_root").unwrap_or("?")
+                        ),
+                    );
+                }
+            }
+            SidCommand::Invalid(message) => {
+                terminal.print_error(&(), &message);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_chat_command(
+        &mut self,
+        cmd: ChatCommand,
+        terminal: &mut SidTerminal,
+    ) -> Result<bool, SError> {
+        match cmd {
+            ChatCommand::Quit => {
+                println!("Goodbye!");
+                return Ok(true);
+            }
+            ChatCommand::Clear => {
+                if self
+                    .send_request_data("clear", RawRequest::Clear, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "Conversation cleared.");
+                }
+            }
+            ChatCommand::Help => {
+                print_help();
+            }
+            ChatCommand::Model(model_name) => {
+                if self
+                    .send_request_data(
+                        "model",
+                        RawRequest::SetModel {
+                            model: model_name.clone(),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("Model changed to: {model_name}"));
+                }
+            }
+            ChatCommand::System(prompt) => {
+                if self
+                    .send_request_data(
+                        "system",
+                        RawRequest::SetSystemPrompt {
+                            prompt: prompt.clone(),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    match prompt {
+                        Some(prompt) => {
+                            terminal.print_info(&(), &format!("System prompt set to: {prompt}"))
+                        }
+                        None => terminal.print_info(&(), "System prompt cleared."),
+                    }
+                }
+            }
+            ChatCommand::MaxTokens(value) => {
+                if self
+                    .send_request_data(
+                        "max-tokens",
+                        RawRequest::SetMaxTokens { max_tokens: value },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("max_tokens set to {value}"));
+                }
+            }
+            ChatCommand::Temperature(value) => {
+                if self
+                    .send_request_data(
+                        "temperature",
+                        RawRequest::SetTemperature {
+                            temperature: Some(value),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("temperature set to {value:.2}"));
+                }
+            }
+            ChatCommand::ClearTemperature => {
+                if self
+                    .send_request_data(
+                        "temperature",
+                        RawRequest::SetTemperature { temperature: None },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "temperature reset to model default");
+                }
+            }
+            ChatCommand::TopP(value) => {
+                if self
+                    .send_request_data(
+                        "top-p",
+                        RawRequest::SetTopP { top_p: Some(value) },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("top_p set to {value:.2}"));
+                }
+            }
+            ChatCommand::ClearTopP => {
+                if self
+                    .send_request_data("top-p", RawRequest::SetTopP { top_p: None }, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "top_p reset to model default");
+                }
+            }
+            ChatCommand::TopK(value) => {
+                if self
+                    .send_request_data(
+                        "top-k",
+                        RawRequest::SetTopK { top_k: Some(value) },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("top_k set to {value}"));
+                }
+            }
+            ChatCommand::ClearTopK => {
+                if self
+                    .send_request_data("top-k", RawRequest::SetTopK { top_k: None }, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "top_k reset to model default");
+                }
+            }
+            ChatCommand::AddStopSequence(sequence) => {
+                if self
+                    .send_request_data(
+                        "stop-sequence",
+                        RawRequest::AddStopSequence {
+                            sequence: sequence.clone(),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("Added stop sequence: {sequence}"));
+                }
+            }
+            ChatCommand::ClearStopSequences => {
+                if self
+                    .send_request_data("stop-sequences", RawRequest::ClearStopSequences, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "Stop sequences cleared.");
+                }
+            }
+            ChatCommand::ListStopSequences => {
+                if let Some(data) = self.send_request_data(
+                    "stop-sequences",
+                    RawRequest::ListStopSequences,
+                    terminal,
+                )? {
+                    print_stop_sequences(&json_string_array(&data, "stop_sequences"));
+                }
+            }
+            ChatCommand::Thinking(budget) => {
+                if self
+                    .send_request_data(
+                        "thinking",
+                        RawRequest::SetThinkingBudget { tokens: budget },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    match budget {
+                        Some(tokens) => terminal.print_info(
+                            &(),
+                            &format!("Extended thinking enabled with {tokens} token budget."),
+                        ),
+                        None => terminal.print_info(&(), "Extended thinking disabled."),
+                    }
+                }
+            }
+            ChatCommand::ThinkingAdaptive => {
+                if self
+                    .send_request_data("thinking", RawRequest::SetThinkingAdaptive, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "Adaptive thinking enabled.");
+                }
+            }
+            ChatCommand::Effort(effort) => {
+                if self
+                    .send_request_data(
+                        "effort",
+                        RawRequest::SetEffort {
+                            effort: Some(effort),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(
+                        &(),
+                        &format!("Effort level set to {}.", effort_name(effort)),
+                    );
+                }
+            }
+            ChatCommand::ClearEffort => {
+                if self
+                    .send_request_data("effort", RawRequest::SetEffort { effort: None }, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "Effort level cleared.");
+                }
+            }
+            ChatCommand::Spend(dollars) => {
+                if self
+                    .send_request_data(
+                        "spend",
+                        RawRequest::SetSpend {
+                            dollars: Some(dollars),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("Session spend limit set to ${dollars:.2}."));
+                }
+            }
+            ChatCommand::ClearSpend => {
+                if self
+                    .send_request_data("spend", RawRequest::SetSpend { dollars: None }, terminal)?
+                    .is_some()
+                {
+                    terminal.print_info(&(), "Session spend limit cleared.");
+                }
+            }
+            ChatCommand::Caching(enabled) => {
+                if self
+                    .send_request_data("caching", RawRequest::SetCaching { enabled }, terminal)?
+                    .is_some()
+                {
+                    if enabled {
+                        terminal.print_info(&(), "Prompt caching enabled.");
+                    } else {
+                        terminal.print_info(&(), "Prompt caching disabled.");
+                    }
+                }
+            }
+            ChatCommand::TranscriptPath(_) | ChatCommand::ClearTranscriptPath => {
+                terminal.print_info(
+                    &(),
+                    "Transcript auto-save is managed by the session system.",
+                );
+            }
+            ChatCommand::SaveTranscript(path) => {
+                if self
+                    .send_request_data(
+                        "save-transcript",
+                        RawRequest::SaveTranscript { path: path.clone() },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("Transcript saved to {path}"));
+                }
+            }
+            ChatCommand::LoadTranscript(path) => {
+                if self
+                    .send_request_data(
+                        "load-transcript",
+                        RawRequest::LoadTranscript { path: path.clone() },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("Transcript loaded from {path}"));
+                }
+            }
+            ChatCommand::Stats => {
+                if let Some(data) = self.send_request_data("stats", RawRequest::Stats, terminal)? {
+                    print_remote_stats(&data);
+                }
+            }
+            ChatCommand::ShowConfig => {
+                if let Some(data) =
+                    self.send_request_data("config", RawRequest::ShowConfig, terminal)?
+                {
+                    print_remote_config(&data);
+                }
+            }
+            ChatCommand::Invalid(message) => {
+                terminal.print_error(&(), &message);
+            }
+        }
+        Ok(false)
+    }
+
+    fn send_request_data(
+        &mut self,
+        prefix: &str,
+        request: RawRequest,
+        terminal: &mut SidTerminal,
+    ) -> Result<Option<Value>, SError> {
+        let result = self.send_request(prefix, request, terminal)?;
+        if result.ok {
+            if let Some(data) = result.data.as_ref() {
+                self.update_identity(data);
+            }
+            Ok(result.data)
+        } else {
+            terminal.print_error(&(), &raw_result_message(&result));
+            Ok(None)
+        }
+    }
+
+    fn send_request(
+        &mut self,
+        prefix: &str,
+        request: RawRequest,
+        terminal: &mut SidTerminal,
+    ) -> Result<RawResultEnvelope, SError> {
+        let request_id = self.next_request_id(prefix);
+        self.interrupted.store(false, Ordering::Relaxed);
+        self.write_request(&request_id, request)?;
+        let _interrupt_watcher = self.start_interrupt_watcher(&request_id);
+        self.read_until_result(&request_id, terminal)
+    }
+
+    fn start_interrupt_watcher(&self, request_id: &str) -> RawInterruptWatcher {
+        let writer = self.connection.writer_handle();
+        let interrupted = self.interrupted.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let request_id = format!("{request_id}:interrupt");
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                if interrupted.swap(false, Ordering::Relaxed) {
+                    let _ = writer.write_request(&RawRequestEnvelope {
+                        protocol_version: RAW_PROTOCOL_VERSION,
+                        request_id,
+                        request: RawRequest::Interrupt,
+                    });
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        RawInterruptWatcher {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn read_until_result(
+        &mut self,
+        request_id: &str,
+        terminal: &mut SidTerminal,
+    ) -> Result<RawResultEnvelope, SError> {
+        loop {
+            let message = self.read_message()?;
+            if let Some(result) = self.handle_server_message(message, terminal, Some(request_id))? {
+                return Ok(result);
+            }
+        }
+    }
+
+    fn handle_server_message(
+        &mut self,
+        message: RawServerMessage,
+        terminal: &mut SidTerminal,
+        awaited_request_id: Option<&str>,
+    ) -> Result<Option<RawResultEnvelope>, SError> {
+        match message {
+            RawServerMessage::Hello(hello) => {
+                self.current_agent = Some(hello.current_agent);
+                Ok(None)
+            }
+            RawServerMessage::ReplayComplete(_) => {
+                self.replay_complete = true;
+                Ok(None)
+            }
+            RawServerMessage::Event(event) => {
+                render_raw_event(event.event, terminal)?;
+                Ok(None)
+            }
+            RawServerMessage::Prompt(prompt) => {
+                self.answer_prompt(prompt, terminal)?;
+                Ok(None)
+            }
+            RawServerMessage::PromptAck(_) => Ok(None),
+            RawServerMessage::Result(result) => {
+                if awaited_request_id == Some(result.request_id.as_str()) {
+                    return Ok(Some(result));
+                }
+                if !result.ok {
+                    terminal.print_error(&(), &raw_result_message(&result));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn answer_prompt(
+        &mut self,
+        prompt: RawPrompt,
+        terminal: &mut SidTerminal,
+    ) -> Result<(), SError> {
+        loop {
+            let input = terminal
+                .read_operator_line(&prompt.message)
+                .map_err(|err| {
+                    cli_error("io_error", "failed to read raw prompt response")
+                        .with_string_field("prompt_id", &prompt.prompt_id)
+                        .with_string_field("cause", &err.to_string())
+                })?;
+            let response = match input {
+                Some(OperatorLine::Line(input)) if prompt.kind == "confirmation" => {
+                    match parse_confirmation(&input) {
+                        Some(true) => "yes".to_string(),
+                        Some(false) => "no".to_string(),
+                        None => {
+                            println!("Please answer yes or no.");
+                            continue;
+                        }
+                    }
+                }
+                Some(OperatorLine::Line(input)) => input,
+                Some(OperatorLine::Interrupted) | Some(OperatorLine::Eof) | None => prompt
+                    .choices
+                    .iter()
+                    .find(|choice| choice.eq_ignore_ascii_case("no"))
+                    .cloned()
+                    .or_else(|| prompt.choices.last().cloned())
+                    .unwrap_or_default(),
+            };
+            let request_id = self.next_request_id("prompt");
+            self.write_request(
+                &request_id,
+                RawRequest::PromptResponse {
+                    prompt_id: prompt.prompt_id,
+                    response,
+                },
+            )?;
+            return Ok(());
+        }
+    }
+
+    fn next_request_id(&mut self, prefix: &str) -> String {
+        let request_id = format!("sid-connect-{prefix}-{}", self.next_request_id);
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        request_id
+    }
+
+    fn read_message(&mut self) -> Result<RawServerMessage, SError> {
+        self.connection
+            .read_message()
+            .map_err(|err| raw_io_error("failed to read raw server message", &err))?
+            .ok_or_else(|| cli_error("io_error", "raw connection closed"))
+    }
+
+    fn write_request(&mut self, request_id: &str, request: RawRequest) -> Result<(), SError> {
+        self.connection
+            .write_request(&RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: request_id.to_string(),
+                request,
+            })
+            .map_err(|err| raw_io_error("failed to write raw request", &err))
+    }
+
+    fn update_identity(&mut self, data: &Value) {
+        if let Some(agent) = json_str(data, "current_agent").or_else(|| json_str(data, "id")) {
+            self.current_agent = Some(agent.to_string());
+        }
+    }
+}
+
+struct RawInterruptWatcher {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RawInterruptWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct RemoteStreamContext {
+    label: Option<String>,
+    depth: usize,
+}
+
+impl StreamContext for RemoteStreamContext {
+    fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
+fn render_raw_event(event: RawEvent, terminal: &mut SidTerminal) -> Result<(), SError> {
+    match event {
+        RawEvent::AgentStart { label, depth } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.start_agent(&context);
+        }
+        RawEvent::AgentFinish {
+            label,
+            depth,
+            stop_reason,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            let stop_reason = stop_reason.as_deref().and_then(parse_raw_stop_reason);
+            terminal.finish_agent(&context, stop_reason.as_ref());
+        }
+        RawEvent::AssistantTextDelta { label, depth, text } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_text(&context, &text);
+        }
+        RawEvent::ThinkingDelta { label, depth, text } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_thinking(&context, &text);
+        }
+        RawEvent::Info {
+            label,
+            depth,
+            message,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_info(&context, &message);
+        }
+        RawEvent::Error {
+            label,
+            depth,
+            message,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_error(&context, &message);
+        }
+        RawEvent::ToolUseStart {
+            label,
+            depth,
+            name,
+            tool_use_id,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.start_tool_use(&context, &name, &tool_use_id);
+        }
+        RawEvent::ToolInputDelta {
+            label,
+            depth,
+            partial_json,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_tool_input(&context, &partial_json);
+        }
+        RawEvent::ToolUseEnd { label, depth } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.finish_tool_use(&context);
+        }
+        RawEvent::ToolResultStart {
+            label,
+            depth,
+            tool_use_id,
+            is_error,
+        } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.start_tool_result(&context, &tool_use_id, is_error);
+        }
+        RawEvent::ToolResultTextDelta { label, depth, text } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_tool_result_text(&context, &text);
+        }
+        RawEvent::ToolResultEnd { label, depth } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.finish_tool_result(&context);
+        }
+        RawEvent::ResponseFinish { label, depth } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.finish_response(&context);
+        }
+        RawEvent::Interrupted { label, depth } => {
+            let context = RemoteStreamContext { label, depth };
+            terminal.print_interrupted(&context);
+        }
+        RawEvent::ToolOutput {
+            stream,
+            text,
+            data_b64,
+            ..
+        } => {
+            write_raw_tool_output(&stream, text.as_deref(), data_b64.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_raw_stop_reason(value: &str) -> Option<StopReason> {
+    value.parse::<StopReason>().ok().or(match value {
+        "EndTurn" => Some(StopReason::EndTurn),
+        "MaxTokens" => Some(StopReason::MaxTokens),
+        "StopSequence" => Some(StopReason::StopSequence),
+        "ToolUse" => Some(StopReason::ToolUse),
+        "PauseTurn" => Some(StopReason::PauseTurn),
+        "Refusal" => Some(StopReason::Refusal),
+        "ModelContextWindowExceeded" => Some(StopReason::ModelContextWindowExceeded),
+        _ => None,
+    })
+}
+
+fn write_raw_tool_output(
+    stream: &str,
+    text: Option<&str>,
+    data_b64: Option<&str>,
+) -> Result<(), SError> {
+    let bytes = match (text, data_b64) {
+        (Some(text), _) => text.as_bytes().to_vec(),
+        (None, Some(data_b64)) => BASE64_STANDARD.decode(data_b64).map_err(|err| {
+            cli_error(
+                "invalid_raw_tool_output",
+                "failed to decode raw tool output",
+            )
+            .with_string_field("cause", &err.to_string())
+        })?,
+        (None, None) => Vec::new(),
+    };
+    if stream == "stderr" {
+        let mut stderr = io::stderr();
+        stderr.write_all(&bytes).map_err(|err| {
+            cli_error("io_error", "failed to write raw tool stderr")
+                .with_string_field("cause", &err.to_string())
+        })?;
+        stderr.flush().map_err(|err| {
+            cli_error("io_error", "failed to flush raw tool stderr")
+                .with_string_field("cause", &err.to_string())
+        })?;
+    } else {
+        let mut stdout = io::stdout();
+        stdout.write_all(&bytes).map_err(|err| {
+            cli_error("io_error", "failed to write raw tool stdout")
+                .with_string_field("cause", &err.to_string())
+        })?;
+        stdout.flush().map_err(|err| {
+            cli_error("io_error", "failed to flush raw tool stdout")
+                .with_string_field("cause", &err.to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn raw_result_message(result: &RawResultEnvelope) -> String {
+    result
+        .error
+        .as_ref()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "raw request failed".to_string())
 }
 
 fn parse_sid_command(input: &str) -> Option<SidCommand> {
@@ -1505,7 +2659,7 @@ async fn maybe_auto_compact(
 
 async fn run_raw_session(
     mut session: SidRuntimeSession,
-    mut server: RawServer<impl BufRead + Send, impl Write + Send + 'static>,
+    mut server: RawServer<impl RawInput, impl Write + Send + 'static>,
     workspace_display: String,
     session_display: String,
     resumed: bool,
@@ -1566,6 +2720,8 @@ async fn run_raw_session(
             continue;
         }
         server.set_request_id(request_id.clone());
+        let usage_observer = Arc::new(RawUsageReportObserver::new(server.output(), &request_id));
+        let _usage_observer = install_usage_report_observer(Some(usage_observer));
         let result = handle_raw_request(&mut session, &mut server, request).await;
         server.clear_request_id();
         match result {
@@ -1602,7 +2758,7 @@ async fn handle_raw_request<R, W>(
     request: RawRequestEnvelope,
 ) -> Result<RequestDisposition, SError>
 where
-    R: std::io::BufRead + Send,
+    R: RawInput,
     W: std::io::Write + Send + 'static,
 {
     match request.request {
@@ -1622,6 +2778,7 @@ where
             "unexpected_prompt_response",
             "prompt_response is only valid while the server is waiting on a prompt",
         )),
+        RawRequest::Interrupt => Ok(RequestDisposition::Continue(None)),
         RawRequest::ShowAgent => Ok(RequestDisposition::Continue(Some(agent_summary_json(
             &session.current_agent_summary()?,
             session,
@@ -1887,6 +3044,61 @@ fn print_agent_list(agents: &[AgentSummary]) {
     }
 }
 
+fn print_remote_agent_summary(agent: &Value) {
+    println!("    Agent: {}", format_remote_agent_label(agent));
+    println!(
+        "      Status: {}{}",
+        json_str(agent, "enabled").unwrap_or("?"),
+        if json_bool(agent, "current").unwrap_or(false) {
+            " (current)"
+        } else {
+            ""
+        }
+    );
+    if let Some(model) = json_str(agent, "model") {
+        println!("      Model: {model}");
+    }
+    if let Some(description) = json_str(agent, "description") {
+        println!("      Description: {description}");
+    }
+}
+
+fn print_remote_agent_list(data: &Value) {
+    println!("    Agents:");
+    let Some(agents) = data.get("agents").and_then(Value::as_array) else {
+        println!("      (unavailable)");
+        return;
+    };
+    for agent in agents {
+        let marker = if json_bool(agent, "current").unwrap_or(false) {
+            "*"
+        } else {
+            " "
+        };
+        let mut line = format!(
+            "      {marker} {} [{}]",
+            format_remote_agent_label(agent),
+            json_str(agent, "enabled").unwrap_or("?")
+        );
+        if let Some(description) = json_str(agent, "description") {
+            line.push_str(&format!(" - {description}"));
+        }
+        println!("{line}");
+    }
+}
+
+fn format_remote_agent_label(agent: &Value) -> String {
+    match (
+        json_str(agent, "id"),
+        json_str(agent, "display_name").filter(|name| !name.is_empty()),
+    ) {
+        (Some(id), Some(name)) => format!("{id} ({name})"),
+        (Some(id), None) => id.to_string(),
+        (None, Some(name)) => name.to_string(),
+        (None, None) => "?".to_string(),
+    }
+}
+
 fn describe_agent_enabled(enabled: SwitchPosition) -> &'static str {
     match enabled {
         SwitchPosition::Yes => "YES",
@@ -1980,6 +3192,46 @@ fn validate_runtime_mode(
         return Err(cli_error(
             "invalid_cli_args",
             "--bash-debug cannot be combined with --prompt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_connect_mode(
+    raw: bool,
+    listen: Option<&str>,
+    resume: Option<&str>,
+    bash_debug: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<(), SError> {
+    if raw {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --raw",
+        ));
+    }
+    if listen.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --listen",
+        ));
+    }
+    if resume.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --resume",
+        ));
+    }
+    if bash_debug.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --bash-debug",
+        ));
+    }
+    if prompt.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --prompt",
         ));
     }
     Ok(())
@@ -2131,6 +3383,94 @@ fn print_config(stats: &SessionStats) {
     print_stop_sequences(&stats.stop_sequences);
 }
 
+fn print_remote_stats(stats: &Value) {
+    println!("    Session Statistics:");
+    println!("      Model: {}", json_str(stats, "model").unwrap_or("?"));
+    println!(
+        "      Messages: {}",
+        json_u64(stats, "message_count").unwrap_or(0)
+    );
+    println!(
+        "      Max tokens: {}",
+        json_u64(stats, "max_tokens").unwrap_or(0)
+    );
+    println!(
+        "      Temperature: {}",
+        describe_json_float(stats, "temperature")
+    );
+    println!("      Top-p: {}", describe_json_float(stats, "top_p"));
+    println!("      Top-k: {}", describe_json_u64(stats, "top_k"));
+    if let Some(prompt) = json_str(stats, "system_prompt") {
+        println!("      System prompt: {prompt}");
+    } else {
+        println!("      System prompt: (none)");
+    }
+    println!(
+        "      Thinking: {}",
+        json_str(stats, "thinking").unwrap_or("disabled")
+    );
+    print_stop_sequences(&json_string_array(stats, "stop_sequences"));
+    println!(
+        "      Total tokens: {} in / {} out ({} requests)",
+        json_u64(stats, "total_input_tokens").unwrap_or(0),
+        json_u64(stats, "total_output_tokens").unwrap_or(0),
+        json_u64(stats, "total_requests").unwrap_or(0)
+    );
+    if json_bool(stats, "caching_enabled").unwrap_or(false) {
+        println!(
+            "      Cache tokens: {} created / {} read",
+            json_u64(stats, "total_cache_creation_tokens").unwrap_or(0),
+            json_u64(stats, "total_cache_read_tokens").unwrap_or(0)
+        );
+    }
+    if let Some(input) = json_u64(stats, "last_turn_input_tokens") {
+        let output = json_u64(stats, "last_turn_output_tokens").unwrap_or(0);
+        println!("      Last turn tokens: {input} in / {output} out");
+    }
+    if let Some(limit) = json_u64(stats, "session_spend_micro_cents") {
+        let spent = json_u64(stats, "spend_used_micro_cents").unwrap_or(0);
+        let spent_dollars = spent as f64 / 100_000_000.0;
+        let total = limit as f64 / 100_000_000.0;
+        let remaining = limit.saturating_sub(spent) as f64 / 100_000_000.0;
+        println!("      Spend limit: ${spent_dollars:.4}/${total:.2} (${remaining:.4} remaining)");
+    } else {
+        println!("      Spend limit: (not set)");
+    }
+}
+
+fn print_remote_config(config: &Value) {
+    println!("    Current Configuration:");
+    println!("      Model: {}", json_str(config, "model").unwrap_or("?"));
+    println!(
+        "      Max tokens: {}",
+        json_u64(config, "max_tokens").unwrap_or(0)
+    );
+    println!(
+        "      Temperature: {}",
+        describe_json_float(config, "temperature")
+    );
+    println!("      Top-p: {}", describe_json_float(config, "top_p"));
+    println!("      Top-k: {}", describe_json_u64(config, "top_k"));
+    println!(
+        "      Thinking: {}",
+        json_str(config, "thinking").unwrap_or("disabled")
+    );
+    println!(
+        "      Caching: {}",
+        if json_bool(config, "caching_enabled").unwrap_or(false) {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(prompt) = json_str(config, "system_prompt") {
+        println!("      System prompt: {prompt}");
+    } else {
+        println!("      System prompt: (none)");
+    }
+    print_stop_sequences(&json_string_array(config, "stop_sequences"));
+}
+
 fn print_stop_sequences(stop_sequences: &[String]) {
     if stop_sequences.is_empty() {
         println!("      Stop sequences: (none)");
@@ -2152,6 +3492,48 @@ fn describe_top_k(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn describe_json_float(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn describe_json_u64(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn json_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn invoke_external_editor() -> io::Result<Option<String>> {
@@ -2196,17 +3578,21 @@ fn invoke_external_editor() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, SANDBOX_UNAVAILABLE_WARNING,
-        SidArgs, SidCommand, SidRuntimeSession, SwitchPosition, parse_confirmation,
-        parse_sid_command, validate_no_free_args, validate_runtime_mode,
+        AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer,
+        SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SpendTurnClamp,
+        SwitchPosition, dollars_to_micro_cents, handle_raw_request, parse_confirmation,
+        parse_sid_command, validate_connect_mode, validate_no_free_args, validate_runtime_mode,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
     use claudius::MessageParam;
     use claudius::chat::{ChatConfig, ChatSession};
     use serde::Deserialize;
+    use sid_isnt_done::raw_mode::RawServer;
+    use sid_isnt_done::raw_protocol::{RAW_PROTOCOL_VERSION, RawRequest, RawRequestEnvelope};
     use sid_isnt_done::{SidAgent, append_resumed_bash_reset_marker, session::SidSession};
     use std::fs;
+    use std::io::{BufReader, Cursor};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2279,6 +3665,14 @@ mod tests {
         assert_eq!(status, 0, "unexpected parser status: {messages:?}");
         assert!(free.is_empty());
         assert_eq!(args.listen.as_deref(), Some("unix:///tmp/sid.sock"));
+    }
+
+    #[test]
+    fn parse_args_accept_connect_option() {
+        let (args, free, status, messages) = parse_args(&["--connect", "unix:///tmp/sid.sock"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert_eq!(args.connect.as_deref(), Some("unix:///tmp/sid.sock"));
     }
 
     #[test]
@@ -2428,6 +3822,228 @@ mod tests {
                 messages: vec![MessageParam::user("resume me")],
             }
         );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sid_spend_blocks_next_turn_after_cumulative_cost_exhausts_limit() {
+        let root = unique_workspace_root("spend-block");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("claude-sonnet-4-5");
+        session.set_session_spend(Some(0.000015));
+        session
+            .sid_spend
+            .as_mut()
+            .unwrap()
+            .record_cost(dollars_to_micro_cents(0.000015));
+
+        let mut renderer = QuietRenderer;
+        let err = session
+            .send_message(
+                MessageParam::user("should not reach the API"),
+                &mut renderer,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("session spend exhausted"),
+            "error: {err}"
+        );
+        assert!(session.clone_messages().is_empty());
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn sid_spend_clamps_max_tokens_to_affordable_output_tokens() {
+        let root = unique_workspace_root("spend-clamp");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("claude-sonnet-4-5");
+        session.set_max_tokens(100);
+        session.set_session_spend(Some(0.000045));
+
+        assert_eq!(
+            session.spend_turn_clamp().unwrap(),
+            Some(SpendTurnClamp {
+                original_max_tokens: Some(100),
+                clamped_max_tokens: 3,
+            })
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn sid_spend_uses_sonnet_rates_for_custom_model_clamping() {
+        let root = unique_workspace_root("spend-custom-model");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("custom-model");
+        session.set_max_tokens(100);
+        session.set_session_spend(Some(0.000030));
+
+        assert_eq!(
+            session.spend_turn_clamp().unwrap(),
+            Some(SpendTurnClamp {
+                original_max_tokens: Some(100),
+                clamped_max_tokens: 2,
+            })
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn sid_spend_switch_agent_preserves_used_spend_and_effective_limit() {
+        let root = unique_workspace_root("spend-agent-switch");
+        write_multi_agent_config(&root);
+        let mut session = configured_runtime_session(&root, "build");
+        session.set_model("claude-sonnet-4-5");
+        session.set_max_tokens(100);
+        session.set_session_spend(Some(0.000030));
+        session
+            .sid_spend
+            .as_mut()
+            .unwrap()
+            .record_cost(dollars_to_micro_cents(0.000015));
+
+        assert_eq!(
+            session.switch_agent("review").unwrap(),
+            AgentSwitchResult::Switched(AgentSummary {
+                id: "review".to_string(),
+                display_name: Some("Reviewer".to_string()),
+                description: Some("Review changes".to_string()),
+                enabled: SwitchPosition::Manual,
+                current: true,
+            })
+        );
+        let stats = session.stats();
+        assert_eq!(
+            stats.session_spend_micro_cents,
+            Some(dollars_to_micro_cents(0.000030))
+        );
+        assert_eq!(
+            stats.spend_used_micro_cents,
+            dollars_to_micro_cents(0.000015)
+        );
+        assert_eq!(
+            session.spend_turn_clamp().unwrap(),
+            Some(SpendTurnClamp {
+                original_max_tokens: Some(100),
+                clamped_max_tokens: 1,
+            })
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn sid_spend_clear_removes_local_guard() {
+        let root = unique_workspace_root("spend-clear");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("claude-sonnet-4-5");
+        session.set_session_spend(Some(0.000015));
+        session
+            .sid_spend
+            .as_mut()
+            .unwrap()
+            .record_cost(dollars_to_micro_cents(0.000015));
+
+        session.set_session_spend(None);
+
+        assert!(session.spend_turn_clamp().unwrap().is_none());
+        let stats = session.stats();
+        assert_eq!(stats.session_spend_micro_cents, None);
+        assert_eq!(stats.spend_used_micro_cents, 0);
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn sid_spend_set_after_prior_spend_starts_new_cap() {
+        let root = unique_workspace_root("spend-reset");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("claude-sonnet-4-5");
+        session.set_session_spend(Some(0.000015));
+        session
+            .sid_spend
+            .as_mut()
+            .unwrap()
+            .record_cost(dollars_to_micro_cents(0.000015));
+
+        session.set_session_spend(Some(0.000030));
+
+        let stats = session.stats();
+        assert_eq!(
+            stats.session_spend_micro_cents,
+            Some(dollars_to_micro_cents(0.000030))
+        );
+        assert_eq!(stats.spend_used_micro_cents, 0);
+        assert_eq!(
+            session.spend_turn_clamp().unwrap(),
+            Some(SpendTurnClamp {
+                original_max_tokens: Some(4096),
+                clamped_max_tokens: 2,
+            })
+        );
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_set_spend_follows_interactive_reset_behavior() {
+        let root = unique_workspace_root("raw-spend-reset");
+        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let mut session = new_runtime_session(&root, &root, sid_session, None);
+        session.set_model("claude-sonnet-4-5");
+        session.set_session_spend(Some(0.000015));
+        session
+            .sid_spend
+            .as_mut()
+            .unwrap()
+            .record_cost(dollars_to_micro_cents(0.000015));
+        let mut server = RawServer::new(BufReader::new(Cursor::new(Vec::new())), Vec::new());
+
+        handle_raw_request(
+            &mut session,
+            &mut server,
+            RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "set-spend".to_string(),
+                request: RawRequest::SetSpend {
+                    dollars: Some(0.000030),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let stats = match handle_raw_request(
+            &mut session,
+            &mut server,
+            RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "stats".to_string(),
+                request: RawRequest::Stats,
+            },
+        )
+        .await
+        .unwrap()
+        {
+            super::RequestDisposition::Continue(Some(stats)) => stats,
+            _ => panic!("unexpected raw disposition"),
+        };
+
+        assert_eq!(
+            stats["session_spend_micro_cents"].as_u64(),
+            Some(dollars_to_micro_cents(0.000030))
+        );
+        assert_eq!(stats["spend_used_micro_cents"].as_u64(), Some(0));
 
         fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
     }
@@ -2655,6 +4271,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--bash-debug cannot be combined with --prompt"));
+    }
+
+    #[test]
+    fn validate_connect_mode_rejects_raw() {
+        let err = validate_connect_mode(true, None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--connect cannot be combined with --raw"));
     }
 
     #[test]
