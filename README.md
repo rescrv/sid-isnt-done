@@ -53,8 +53,8 @@ terminal results instead of the human-oriented terminal UI.  Requests are
 semantic operations such as user turns, agent switches, compaction, and config
 updates.  Raw mode is intended for alternative frontends and local automation.
 Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
-of stdin/stdout.  `SPEC` is `vsock://CID:PORT` on Linux or
-`unix:///path/to/socket` on Unix platforms.  New connections replace older
+of stdin/stdout.  `SPEC` is `tcp://HOST:PORT`, `vsock://CID:PORT` on Linux,
+or `unix:///path/to/socket` on Unix platforms.  New connections replace older
 connections and receive the server message history before live messages.
 Answered prompts are replayed as `prompt_ack` messages instead of fresh
 prompts, while unanswered prompts are replayed as prompts.
@@ -171,9 +171,9 @@ warning.
 
 `--listen SPEC`
 : Run a reconnectable JSONL protocol server and imply `--raw`.  `SPEC` is
-  `vsock://CID:PORT` on Linux, with `CID` optional or `any` for
-  `VMADDR_CID_ANY`, or `unix:///path/to/socket` on Unix platforms.  When a new
-  client connects, sid disconnects the previous socket, replays all prior
+  `tcp://HOST:PORT`, `vsock://CID:PORT` on Linux, with `CID` optional or `any`
+  for `VMADDR_CID_ANY`, or `unix:///path/to/socket` on Unix platforms.  When a
+  new client connects, sid disconnects the previous socket, replays all prior
   server messages to the new socket, and then continues streaming live output.
   Prompts that were already answered are replayed as `prompt_ack` messages with
   the accepted response; unanswered prompts are replayed as normal `prompt`

@@ -24,6 +24,7 @@ const VMADDR_CID_HOST_VALUE: u32 = 2;
 /// Listen on `spec` and return a raw JSONL server backed by that socket.
 ///
 /// `unix:///absolute/path` binds a Unix-domain socket on Unix platforms.
+/// `tcp://HOST:PORT` binds a TCP listener.
 /// `vsock://CID:PORT` binds an AF_VSOCK stream listener on Linux.  `CID` may
 /// be omitted, `any`, or `-1` to bind `VMADDR_CID_ANY`.
 pub fn listen(spec: &str) -> io::Result<RawServer<Box<dyn RawInput>, Box<dyn Write + Send>>> {
@@ -76,7 +77,8 @@ impl RawConnection {
     /// Connect to a raw JSONL listener.
     ///
     /// `unix:///absolute/path` connects to a Unix-domain socket on Unix
-    /// platforms.  `vsock://CID:PORT` connects to an AF_VSOCK stream peer on
+    /// platforms.  `tcp://HOST:PORT` connects to a TCP listener.
+    /// `vsock://CID:PORT` connects to an AF_VSOCK stream peer on
     /// Linux.  To stay compatible with listener specs, omitted, `any`, or `-1`
     /// CIDs target the host CID by convention.
     pub fn connect(spec: &str) -> io::Result<Self> {
@@ -123,12 +125,14 @@ impl RawConnection {
 #[derive(Debug, Eq, PartialEq)]
 enum ListenSpec {
     Unix(PathBuf),
+    Tcp(String),
     Vsock { cid: u32, port: u32 },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum ConnectSpec {
     Unix(PathBuf),
+    Tcp(String),
     Vsock { cid: u32, port: u32 },
 }
 
@@ -137,12 +141,15 @@ impl ListenSpec {
         if let Some(path) = spec.strip_prefix("unix://") {
             return parse_unix_spec(path).map(ListenSpec::Unix);
         }
+        if let Some(address) = spec.strip_prefix("tcp://") {
+            return parse_tcp_spec(address).map(ListenSpec::Tcp);
+        }
         if let Some(address) = spec.strip_prefix("vsock://") {
             return parse_vsock_spec(address);
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "listen spec must start with unix:// or vsock://",
+            "listen spec must start with unix://, tcp://, or vsock://",
         ))
     }
 }
@@ -152,12 +159,15 @@ impl ConnectSpec {
         if let Some(path) = spec.strip_prefix("unix://") {
             return parse_unix_spec(path).map(ConnectSpec::Unix);
         }
+        if let Some(address) = spec.strip_prefix("tcp://") {
+            return parse_tcp_spec(address).map(ConnectSpec::Tcp);
+        }
         if let Some(address) = spec.strip_prefix("vsock://") {
             return parse_vsock_connect_spec(address);
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "connect spec must start with unix:// or vsock://",
+            "connect spec must start with unix://, tcp://, or vsock://",
         ))
     }
 }
@@ -170,6 +180,34 @@ fn parse_unix_spec(path: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(PathBuf::from(percent_decode(path)?))
+}
+
+fn parse_tcp_spec(address: &str) -> io::Result<String> {
+    if address.is_empty() || address.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tcp listener URL must be tcp://HOST:PORT",
+        ));
+    }
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tcp listener URL must be tcp://HOST:PORT",
+        ));
+    };
+    if host.is_empty() || port.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tcp listener URL must be tcp://HOST:PORT",
+        ));
+    }
+    port.parse::<u16>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid tcp port {port:?}: {err}"),
+        )
+    })?;
+    Ok(address.to_string())
 }
 
 fn parse_vsock_spec(address: &str) -> io::Result<ListenSpec> {
@@ -294,6 +332,7 @@ fn start_accept_loop(
 ) -> io::Result<ListenGuard> {
     match spec {
         ListenSpec::Unix(path) => start_unix_accept_loop(path, sender, state),
+        ListenSpec::Tcp(address) => start_tcp_accept_loop(address, sender, state),
         ListenSpec::Vsock { cid, port } => start_vsock_accept_loop(cid, port, sender, state),
     }
 }
@@ -301,8 +340,13 @@ fn start_accept_loop(
 fn connect_socket(spec: &str) -> io::Result<Box<dyn ConnectedSocket>> {
     match ConnectSpec::parse(spec)? {
         ConnectSpec::Unix(path) => connect_unix_socket(path),
+        ConnectSpec::Tcp(address) => connect_tcp_socket(address),
         ConnectSpec::Vsock { cid, port } => connect_vsock_socket(cid, port),
     }
+}
+
+fn connect_tcp_socket(address: String) -> io::Result<Box<dyn ConnectedSocket>> {
+    Ok(Box::new(std::net::TcpStream::connect(address.as_str())?))
 }
 
 #[cfg(unix)]
@@ -377,6 +421,24 @@ fn start_unix_accept_loop(
         io::ErrorKind::Unsupported,
         "unix:// listeners are not supported on this platform",
     ))
+}
+
+fn start_tcp_accept_loop(
+    address: String,
+    sender: Sender<InputLine>,
+    state: Arc<Mutex<ListenState>>,
+) -> io::Result<ListenGuard> {
+    let listener = std::net::TcpListener::bind(address.as_str())?;
+    thread::spawn(move || {
+        for accepted in listener.incoming() {
+            match accepted {
+                Ok(stream) => install_connected_socket(Box::new(stream), &sender, &state),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(ListenGuard::default())
 }
 
 #[cfg(target_os = "linux")]
@@ -468,6 +530,16 @@ trait ConnectedSocket: Read + Write + Send {
 
 #[cfg(unix)]
 impl ConnectedSocket for std::os::unix::net::UnixStream {
+    fn try_clone_socket(&self) -> io::Result<Box<dyn ConnectedSocket>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
+    fn shutdown_socket(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl ConnectedSocket for std::net::TcpStream {
     fn try_clone_socket(&self) -> io::Result<Box<dyn ConnectedSocket>> {
         Ok(Box::new(self.try_clone()?))
     }
@@ -946,6 +1018,96 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
+    #[test]
+    fn parse_tcp_spec_accepts_host_port() {
+        assert_eq!(
+            ListenSpec::parse("tcp://127.0.0.1:4545").unwrap(),
+            ListenSpec::Tcp("127.0.0.1:4545".to_string())
+        );
+        assert_eq!(
+            ConnectSpec::parse("tcp://localhost:4545").unwrap(),
+            ConnectSpec::Tcp("localhost:4545".to_string())
+        );
+        assert_eq!(
+            ListenSpec::parse("tcp://[::1]:4545").unwrap(),
+            ListenSpec::Tcp("[::1]:4545".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tcp_spec_requires_host_and_port() {
+        assert!(ListenSpec::parse("tcp://").is_err());
+        assert!(ListenSpec::parse("tcp://localhost").is_err());
+        assert!(ListenSpec::parse("tcp://:4545").is_err());
+        assert!(ListenSpec::parse("tcp://localhost:").is_err());
+        assert!(ListenSpec::parse("tcp://localhost:not-a-port").is_err());
+        assert!(ListenSpec::parse("tcp://localhost:70000").is_err());
+        assert!(ConnectSpec::parse("tcp://localhost:1234/path").is_err());
+    }
+
+    #[test]
+    fn tcp_listener_replays_history_to_reconnecting_client() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let mut started = None;
+        let mut last_error = None;
+        for _ in 0..16 {
+            let port = match TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener.local_addr().unwrap().port(),
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(err) => panic!("failed to reserve tcp listener port: {err}"),
+            };
+            let spec = format!("tcp://127.0.0.1:{port}");
+            match listen(&spec) {
+                Ok(server) => {
+                    started = Some((server, port));
+                    break;
+                }
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                    last_error = Some(err);
+                }
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(err) => panic!("failed to start tcp listener: {err}"),
+            }
+        }
+        let Some((server, port)) = started else {
+            panic!("failed to reserve tcp listener port: {last_error:?}");
+        };
+
+        server.write_ok_result("first", None).unwrap();
+
+        let first = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut first_reader = BufReader::new(first.try_clone().unwrap());
+        assert_eq!(read_request_id(&mut first_reader), "first");
+        assert_eq!(read_type(&mut first_reader), "replay_complete");
+
+        server.write_ok_result("second", None).unwrap();
+        assert_eq!(read_request_id(&mut first_reader), "second");
+
+        let second = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut second_reader = BufReader::new(second);
+        assert_eq!(read_request_id(&mut second_reader), "first");
+        assert_eq!(read_request_id(&mut second_reader), "second");
+        assert_eq!(read_type(&mut second_reader), "replay_complete");
+
+        server.write_ok_result("third", None).unwrap();
+        assert_eq!(read_request_id(&mut second_reader), "third");
+
+        let mut stale = String::new();
+        let result = first_reader.read_line(&mut stale);
+        assert!(
+            matches!(result, Ok(0) | Err(_)),
+            "previous stream stayed readable: {result:?}, line={stale:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_listener_replays_history_to_reconnecting_client() {
@@ -1275,12 +1437,12 @@ mod tests {
 
     #[test]
     fn listen_spec_rejects_unknown_scheme() {
-        assert!(ListenSpec::parse("tcp://localhost:1234").is_err());
+        assert!(ListenSpec::parse("ssh://localhost:1234").is_err());
     }
 
     #[test]
     fn connect_spec_rejects_unknown_scheme() {
-        assert!(ConnectSpec::parse("tcp://localhost:1234").is_err());
+        assert!(ConnectSpec::parse("ssh://localhost:1234").is_err());
     }
 
     #[test]
