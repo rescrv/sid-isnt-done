@@ -1,10 +1,11 @@
 //! Socket listener and connector transport for `sid --listen` and `sid --connect`.
 //!
 //! The listener keeps the raw JSONL stream process-local and lets frontends
-//! reconnect without restarting the agent session.  Complete server messages
-//! are retained in memory and replayed to the newest connection.  Prompts are
-//! replayed semantically: unanswered prompts stay as prompts, while answered
-//! prompts are represented by their later `prompt_ack` messages.
+//! reconnect without restarting the agent session.  Complete server messages,
+//! including accepted user-turn request markers, are retained in memory and
+//! replayed to the newest connection.  Prompts are replayed semantically:
+//! unanswered prompts stay as prompts, while answered prompts are represented
+//! by their later `prompt_ack` messages.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -1222,6 +1223,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn replay_output_replays_accepted_request_before_result() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let state = Arc::new(Mutex::new(ListenState::default()));
+        let input = BufReader::new([].as_slice());
+        let server = RawServer::new(input, ReplayOutput::new(state.clone()));
+        server
+            .write_accepted_request(&RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "turn-1".to_string(),
+                request: crate::raw_protocol::RawRequest::UserTurn {
+                    text: "what did I ask?".to_string(),
+                },
+            })
+            .unwrap();
+        server.write_ok_result("turn-1", None).unwrap();
+
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .connect(Box::new(server_socket))
+            .unwrap();
+
+        let mut reader = BufReader::new(client_socket);
+        let request = read_value(&mut reader);
+        assert_eq!(request["type"], "request");
+        assert_eq!(request["request_id"], "turn-1");
+        assert_eq!(request["op"], "user_turn");
+        assert_eq!(request["text"], "what did I ask?");
+
+        assert_eq!(read_type(&mut reader), "result");
+        assert_eq!(read_type(&mut reader), "replay_complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replay_output_replays_only_unacknowledged_prompts_as_prompts() {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
@@ -1271,12 +1313,13 @@ mod tests {
     }
 
     fn read_type(reader: &mut impl BufRead) -> String {
+        read_value(reader)["type"].as_str().unwrap().to_string()
+    }
+
+    fn read_value(reader: &mut impl BufRead) -> serde_json::Value {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
     }
 
     fn prompt_line(prompt_id: &str) -> String {

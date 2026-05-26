@@ -10,9 +10,9 @@ use std::sync::Mutex as StdMutex;
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use crate::raw_protocol::{
-    RAW_PROTOCOL_VERSION, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck, RawRequest,
-    RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage, ToolOutputEvent,
-    ToolOutputObserver, UsageReportEvent, UsageReportObserver,
+    RAW_PROTOCOL_VERSION, RawAcceptedRequest, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck,
+    RawRequest, RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage,
+    ToolOutputEvent, ToolOutputObserver, UsageReportEvent, UsageReportObserver,
 };
 
 /// Raw request input with optional nonblocking line polling.
@@ -165,6 +165,14 @@ where
     /// Write one JSONL server message.
     pub fn write_message(&self, message: &RawServerMessage) -> io::Result<()> {
         self.output.write_message(message)
+    }
+
+    /// Write replayable context for an accepted request when useful.
+    pub fn write_accepted_request(&self, request: &RawRequestEnvelope) -> io::Result<()> {
+        if let Some(request) = RawAcceptedRequest::from_envelope(request) {
+            self.write_message(&RawServerMessage::Request(request))?;
+        }
+        Ok(())
     }
 
     /// Write a successful terminal result.
@@ -690,6 +698,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[test]
+    fn write_accepted_request_emits_user_turn_marker() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_accepted_request(&RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "turn-1".to_string(),
+                request: RawRequest::UserTurn {
+                    text: "hello replay".to_string(),
+                },
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "request");
+        assert_eq!(value["request_id"], "turn-1");
+        assert_eq!(value["op"], "user_turn");
+        assert_eq!(value["text"], "hello replay");
+    }
+
+    #[test]
+    fn write_accepted_request_skips_stats_request() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_accepted_request(&RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "stats".to_string(),
+                request: RawRequest::Stats,
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        assert!(text.is_empty());
     }
 
     // ── write_ok_result / write_error_result ─────────────────────────────

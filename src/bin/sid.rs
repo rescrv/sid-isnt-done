@@ -1772,7 +1772,9 @@ impl RawTerminalClient {
                 RawServerMessage::Event(event) => {
                     render_raw_event(event.event, terminal)?;
                 }
-                RawServerMessage::PromptAck(_) | RawServerMessage::Result(_) => {}
+                RawServerMessage::Request(_)
+                | RawServerMessage::PromptAck(_)
+                | RawServerMessage::Result(_) => {}
             }
         }
         if let Some(request_id) = resumed_request_id {
@@ -2250,6 +2252,7 @@ impl RawTerminalClient {
                 self.replay_complete = true;
                 Ok(None)
             }
+            RawServerMessage::Request(_) => Ok(None),
             RawServerMessage::Event(event) => {
                 render_raw_event(event.event, terminal)?;
                 Ok(None)
@@ -2719,6 +2722,9 @@ async fn run_raw_session(
                 .map_err(|err| raw_io_error("failed to write raw protocol error", &err))?;
             continue;
         }
+        server
+            .write_accepted_request(&request)
+            .map_err(|err| raw_io_error("failed to write raw accepted request", &err))?;
         server.set_request_id(request_id.clone());
         let usage_observer = Arc::new(RawUsageReportObserver::new(server.output(), &request_id));
         let _usage_observer = install_usage_report_observer(Some(usage_observer));

@@ -145,6 +145,8 @@ pub enum RawServerMessage {
     Hello(RawHello),
     /// End marker for the history replay sent by reconnectable transports.
     ReplayComplete(RawReplayComplete),
+    /// Accepted client request context that frontends can replay.
+    Request(RawAcceptedRequest),
     /// Incremental event associated with a request.
     Event(RawEventEnvelope),
     /// Interactive prompt that requires a `prompt_response`.
@@ -161,6 +163,7 @@ impl RawServerMessage {
         match &mut self {
             RawServerMessage::Hello(message) => message.sequence = sequence,
             RawServerMessage::ReplayComplete(message) => message.sequence = sequence,
+            RawServerMessage::Request(message) => message.sequence = sequence,
             RawServerMessage::Event(message) => message.sequence = sequence,
             RawServerMessage::Prompt(message) => message.sequence = sequence,
             RawServerMessage::PromptAck(message) => message.sequence = sequence,
@@ -210,6 +213,45 @@ pub struct RawHello {
     pub startup_confirmation_required: bool,
     /// Whether sandboxing support is available.
     pub sandbox_available: bool,
+}
+
+/// Accepted request context replayed to raw frontends.
+///
+/// The listener retains this message in history before request-scoped events so
+/// reconnecting frontends can reconstruct the user-visible transcript without
+/// reading a filesystem-local saved transcript.  The server currently emits
+/// this marker for accepted `user_turn` requests.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RawAcceptedRequest {
+    /// Protocol version emitted by the server.
+    pub protocol_version: u32,
+    /// Monotonic server-message sequence number.
+    ///
+    /// Listening transports replay previously emitted messages to reconnecting
+    /// clients.  Clients can use this value to de-duplicate replayed messages.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Request identifier chosen by the client.
+    pub request_id: String,
+    /// Accepted request payload.
+    #[serde(flatten)]
+    pub request: RawRequest,
+}
+
+impl RawAcceptedRequest {
+    /// Build a replayable request marker when the request affects transcript
+    /// reconstruction.
+    pub fn from_envelope(envelope: &RawRequestEnvelope) -> Option<Self> {
+        match &envelope.request {
+            RawRequest::UserTurn { .. } => Some(Self {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
+                request_id: envelope.request_id.clone(),
+                request: envelope.request.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Incremental event associated with a single request.
@@ -741,6 +783,23 @@ mod tests {
     }
 
     #[test]
+    fn server_request_user_turn_roundtrip() {
+        let msg = RawServerMessage::Request(RawAcceptedRequest {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 4,
+            request_id: "r-0".to_string(),
+            request: RawRequest::UserTurn {
+                text: "hello".to_string(),
+            },
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"request""#), "got: {json}");
+        assert!(json.contains(r#""op":"user_turn""#), "got: {json}");
+        let decoded: RawServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
     fn server_result_ok_roundtrip() {
         let msg = RawServerMessage::Result(RawResultEnvelope {
             protocol_version: RAW_PROTOCOL_VERSION,
@@ -917,6 +976,23 @@ mod tests {
     }
 
     #[test]
+    fn with_sequence_stamps_request() {
+        let msg = RawServerMessage::Request(RawAcceptedRequest {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
+            request_id: "r".to_string(),
+            request: RawRequest::UserTurn {
+                text: "hello".to_string(),
+            },
+        });
+        let stamped = msg.with_sequence(6);
+        match stamped {
+            RawServerMessage::Request(r) => assert_eq!(r.sequence, 6),
+            _ => panic!("expected Request"),
+        }
+    }
+
+    #[test]
     fn with_sequence_stamps_replay_complete() {
         let msg = RawServerMessage::ReplayComplete(RawReplayComplete {
             protocol_version: RAW_PROTOCOL_VERSION,
@@ -1011,6 +1087,17 @@ mod tests {
             "got: {replay_complete}"
         );
 
+        let request = serde_json::to_string(&RawServerMessage::Request(RawAcceptedRequest {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            sequence: 0,
+            request_id: "r".to_string(),
+            request: RawRequest::UserTurn {
+                text: "hello".to_string(),
+            },
+        }))
+        .unwrap();
+        assert!(request.contains(r#""type":"request""#), "got: {request}");
+
         let prompt_ack = serde_json::to_string(&RawServerMessage::PromptAck(RawPromptAck {
             protocol_version: RAW_PROTOCOL_VERSION,
             sequence: 0,
@@ -1083,5 +1170,50 @@ mod tests {
             RawServerMessage::ReplayComplete(replay) => assert_eq!(replay.sequence, 0),
             _ => panic!("expected ReplayComplete"),
         }
+    }
+
+    #[test]
+    fn request_sequence_defaults_to_zero_when_absent() {
+        let json = r#"{
+            "type": "request",
+            "protocol_version": 2,
+            "request_id": "r",
+            "op": "user_turn",
+            "text": "hello"
+        }"#;
+        let msg: RawServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            RawServerMessage::Request(request) => assert_eq!(request.sequence, 0),
+            _ => panic!("expected Request"),
+        }
+    }
+
+    #[test]
+    fn accepted_request_from_envelope_keeps_user_turn_text() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "turn-1".to_string(),
+            request: RawRequest::UserTurn {
+                text: "what did I ask?".to_string(),
+            },
+        };
+        let request = RawAcceptedRequest::from_envelope(&envelope).unwrap();
+        assert_eq!(request.request_id, "turn-1");
+        assert_eq!(
+            request.request,
+            RawRequest::UserTurn {
+                text: "what did I ask?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepted_request_from_envelope_skips_non_transcript_requests() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "stats".to_string(),
+            request: RawRequest::Stats,
+        };
+        assert!(RawAcceptedRequest::from_envelope(&envelope).is_none());
     }
 }
