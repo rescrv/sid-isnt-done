@@ -29,10 +29,10 @@ that virtual mount is not an operating-system chroot.  Agent definitions, tool
 definitions, and optional skills are read from rc-style configuration files
 rather than from hardcoded tool lists.
 
-When no `sid` configuration exists, `sid` starts the built-in `sid` agent with
-no configured external tools.  When `agents.conf` or `tools.conf` exists,
-configuration is loaded from `SID_HOME` if it is set and non-empty; otherwise
-configuration is loaded from the current directory.
+`sid` requires `SID_HOME` to be set and non-empty.  When no `sid` configuration
+exists in `SID_HOME`, `sid` starts the built-in `sid` agent with no configured
+external tools.  When `agents.conf` or `tools.conf` exists, configuration is
+loaded from `SID_HOME`.
 
 The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for chat commands such as changing the model,
@@ -754,8 +754,7 @@ Protocol rules:
 ## ENVIRONMENT
 
 `SID_HOME`
-: Configuration root.  If unset or empty, the current working directory is
-  used.
+: Configuration root.  Must be set and non-empty.
 
 `SID_SESSIONS`
 : Session directory root.  If unset or empty, `sid` stores sessions under

@@ -1092,7 +1092,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         .with_string_field("cause", &err.to_string())
     })?
     .into_owned();
-    let config_root = resolve_sid_home(&workspace_root)?;
+    let config_root = resolve_sid_home()?;
     let (sid_session, resumed) = match (resume.as_deref(), prompt.as_ref()) {
         (Some(session), _) => (Arc::new(SidSession::resume(&config_root, session)?), true),
         (None, Some(_)) => {
@@ -3258,10 +3258,19 @@ fn warn_if_sandbox_unavailable() {
     eprint!("{SANDBOX_UNAVAILABLE_WARNING}");
 }
 
-fn resolve_sid_home(workspace_root: &Path) -> Result<Path<'static>, SError> {
-    match std::env::var("SID_HOME") {
+fn resolve_sid_home() -> Result<Path<'static>, SError> {
+    resolve_sid_home_from_env(std::env::var("SID_HOME"))
+}
+
+fn resolve_sid_home_from_env(
+    sid_home: Result<String, std::env::VarError>,
+) -> Result<Path<'static>, SError> {
+    match sid_home {
         Ok(path) if !path.is_empty() => Ok(Path::new(&path).into_owned()),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(workspace_root.clone().into_owned()),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Err(cli_error(
+            "missing_sid_home",
+            "SID_HOME must be set and non-empty",
+        )),
         Err(std::env::VarError::NotUnicode(_)) => {
             Err(cli_error("invalid_sid_home", "SID_HOME is not valid UTF-8"))
         }
@@ -3581,7 +3590,8 @@ mod tests {
         AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer,
         SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SpendTurnClamp,
         SwitchPosition, dollars_to_micro_cents, handle_raw_request, parse_confirmation,
-        parse_sid_command, validate_connect_mode, validate_no_free_args, validate_runtime_mode,
+        parse_sid_command, resolve_sid_home_from_env, validate_connect_mode, validate_no_free_args,
+        validate_runtime_mode,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
@@ -3637,6 +3647,34 @@ mod tests {
     fn parse_confirmation_rejects_other_values() {
         assert_eq!(parse_confirmation(""), None);
         assert_eq!(parse_confirmation("maybe"), None);
+    }
+
+    #[test]
+    fn resolve_sid_home_accepts_non_empty_sid_home() {
+        let root = resolve_sid_home_from_env(Ok("init".to_string())).unwrap();
+        assert_eq!(root.as_str(), "init");
+    }
+
+    #[test]
+    fn resolve_sid_home_rejects_missing_sid_home() {
+        let err = resolve_sid_home_from_env(Err(std::env::VarError::NotPresent))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("SID_HOME must be set and non-empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_sid_home_rejects_empty_sid_home() {
+        let err = resolve_sid_home_from_env(Ok(String::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("SID_HOME must be set and non-empty"),
+            "error: {err}"
+        );
     }
 
     #[test]
