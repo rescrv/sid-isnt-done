@@ -24,7 +24,7 @@ use claudius::{Anthropic, Effort, KnownModel, Model, TokenRates};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{
-    AGENTS_CONF_FILE, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
+    AGENTS_CONF_FILE, AnthropicConfig, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
 };
 use sid_isnt_done::raw_mode::{RawInput, RawServer, RawToolOutputObserver, RawUsageReportObserver};
 use sid_isnt_done::raw_protocol::{
@@ -891,13 +891,15 @@ impl SidRuntimeSession {
         )?
         .with_session(self.sid_session.clone());
         self.overrides.apply_to(next_agent.config_mut());
+        let next_client = build_anthropic_client(next_agent.anthropic_config())?;
 
         self.auto_compact_tokens = next_agent.auto_compact_tokens();
         self.roll_up_current_stats();
 
-        let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
+        let mut next_chat = ChatSession::with_agent(next_client.clone(), next_agent);
         next_chat.replace_messages(messages);
 
+        self.client = next_client;
         self.chat = next_chat;
         self.current_agent_id = agent_id.to_string();
         self.sync_configured_sid_spend();
@@ -941,7 +943,8 @@ impl SidRuntimeSession {
             .named_prompt_markdown(COMPACTION_PROMPT_ID)
             .unwrap_or(COMPACTION_REQUEST_PROMPT)
             .to_string();
-        let mut compactor_chat = ChatSession::with_agent(self.client.clone(), compactor);
+        let compactor_client = build_anthropic_client(compactor.anthropic_config())?;
+        let mut compactor_chat = ChatSession::with_agent(compactor_client, compactor);
         compactor_chat.replace_messages(messages);
 
         let mut renderer = QuietRenderer;
@@ -989,11 +992,13 @@ impl SidRuntimeSession {
         .with_session(next_sid_session.clone());
         self.overrides.apply_to(next_agent.config_mut());
         next_agent.config_mut().transcript_path = Some(transcript_path);
+        let next_client = build_anthropic_client(next_agent.anthropic_config())?;
         self.auto_compact_tokens = next_agent.auto_compact_tokens();
 
-        let mut next_chat = ChatSession::with_agent(self.client.clone(), next_agent);
+        let mut next_chat = ChatSession::with_agent(next_client.clone(), next_agent);
         next_chat.replace_messages(compacted_transcript(&parent_session_id, &summary));
 
+        self.client = next_client;
         self.chat = next_chat;
         self.sid_session = next_sid_session.clone();
         self.rolled_up_stats = SessionStatsRollup::default();
@@ -1192,13 +1197,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
     let use_color = agent.config().use_color;
 
     if raw {
-        let client = Anthropic::new(None).map_err(|err| {
-            cli_error(
-                "client_init_failed",
-                "failed to initialize the Anthropic client",
-            )
-            .with_string_field("cause", &err.to_string())
-        })?;
+        let client = build_anthropic_client(agent.anthropic_config())?;
         let auto_compact_tokens = agent.auto_compact_tokens();
         let chat = ChatSession::with_agent(client.clone(), agent);
         let mut session = SidRuntimeSession::new(
@@ -1245,13 +1244,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
             return Ok(());
         }
 
-        let client = Anthropic::new(None).map_err(|err| {
-            cli_error(
-                "client_init_failed",
-                "failed to initialize the Anthropic client",
-            )
-            .with_string_field("cause", &err.to_string())
-        })?;
+        let client = build_anthropic_client(agent.anthropic_config())?;
         let auto_compact_tokens = agent.auto_compact_tokens();
         let chat = ChatSession::with_agent(client.clone(), agent);
         let mut session = SidRuntimeSession::new(
@@ -1288,13 +1281,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         .await;
     }
 
-    let client = Anthropic::new(None).map_err(|err| {
-        cli_error(
-            "client_init_failed",
-            "failed to initialize the Anthropic client",
-        )
-        .with_string_field("cause", &err.to_string())
-    })?;
+    let client = build_anthropic_client(agent.anthropic_config())?;
     let auto_compact_tokens = agent.auto_compact_tokens();
     let chat = ChatSession::with_agent(client.clone(), agent);
     let mut session = SidRuntimeSession::new(
@@ -3177,6 +3164,21 @@ fn cli_error(code: &str, message: &str) -> SError {
     SError::new("sid-cli").with_code(code).with_message(message)
 }
 
+fn build_anthropic_client(config: &AnthropicConfig) -> Result<Anthropic, SError> {
+    let client = Anthropic::new(config.api_key.clone()).map_err(|err| {
+        cli_error(
+            "client_init_failed",
+            "failed to initialize the Anthropic client",
+        )
+        .with_string_field("cause", &err.to_string())
+    })?;
+
+    Ok(match config.base_url.as_ref() {
+        Some(base_url) => client.with_base_url(base_url.clone()),
+        None => client,
+    })
+}
+
 fn validate_runtime_mode(
     raw: bool,
     bash_debug: Option<&str>,
@@ -3595,15 +3597,16 @@ mod tests {
     use super::{
         AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer,
         SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SpendTurnClamp,
-        SwitchPosition, dollars_to_micro_cents, handle_raw_request, parse_confirmation,
-        parse_sid_command, resolve_sid_home_from_env, validate_connect_mode, validate_no_free_args,
-        validate_runtime_mode,
+        SwitchPosition, build_anthropic_client, dollars_to_micro_cents, handle_raw_request,
+        parse_confirmation, parse_sid_command, resolve_sid_home_from_env, validate_connect_mode,
+        validate_no_free_args, validate_runtime_mode,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
     use claudius::MessageParam;
     use claudius::chat::{ChatConfig, ChatSession};
     use serde::Deserialize;
+    use sid_isnt_done::config::AnthropicConfig;
     use sid_isnt_done::raw_mode::RawServer;
     use sid_isnt_done::raw_protocol::{RAW_PROTOCOL_VERSION, RawRequest, RawRequestEnvelope};
     use sid_isnt_done::{SidAgent, append_resumed_bash_reset_marker, session::SidSession};
@@ -3635,6 +3638,16 @@ mod tests {
             NoExitCommandLine::<SidArgs>::from_arguments_relaxed("sid [OPTIONS]", argv);
         let (args, messages, status) = parsed.into_parts();
         (args, free, status, messages)
+    }
+
+    #[test]
+    fn build_anthropic_client_uses_configured_credentials() {
+        let config = AnthropicConfig {
+            api_key: Some("test-api-key".to_string()),
+            base_url: Some("http://localhost".to_string()),
+        };
+
+        build_anthropic_client(&config).unwrap();
     }
 
     #[test]
@@ -4088,6 +4101,28 @@ mod tests {
             Some(dollars_to_micro_cents(0.000030))
         );
         assert_eq!(stats["spend_used_micro_cents"].as_u64(), Some(0));
+
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn switch_agent_rebuilds_client_from_target_agent_config() {
+        let root = unique_workspace_root("agent-client-switch");
+        write_multi_agent_config(&root);
+        let agents_conf = fs::read_to_string(root.join("agents.conf").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            format!(
+                "{agents_conf}review_API_KEY='file://{}/missing.key'\n",
+                root.as_str()
+            ),
+        )
+        .unwrap();
+        let mut session = configured_runtime_session(&root, "build");
+
+        let err = session.switch_agent("review").unwrap_err().to_string();
+        assert!(err.contains("client_init_failed"), "error: {err}");
+        assert_eq!(session.current_agent_id(), "build");
 
         fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
     }

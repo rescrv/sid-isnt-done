@@ -62,8 +62,9 @@ use tokio::sync::Mutex;
 use utf8path::Path;
 
 use crate::config::{
-    AGENTS_CONF_FILE, AgentConfig, Config, MEMORY_EXPERT_PROMPT_ID, SYSTEM_PROMPT_ID, SkillConfig,
-    TOOLS_CONF_FILE, ToolConfig, is_valid_anthropic_tool_name, resolve_canonical_tool_id,
+    AGENTS_CONF_FILE, AgentConfig, AnthropicConfig, Config, MEMORY_EXPERT_PROMPT_ID,
+    SYSTEM_PROMPT_ID, SkillConfig, TOOLS_CONF_FILE, ToolConfig, is_valid_anthropic_tool_name,
+    resolve_canonical_tool_id,
 };
 use crate::filesystem::{build_agent_filesystem, build_default_filesystem, resolve_agent_skills};
 use crate::raw_protocol::{UsageReportEvent, notify_usage_report_observer};
@@ -126,6 +127,7 @@ pub struct SidAgent {
     id: String,
     enabled: SwitchPosition,
     ps1: Option<String>,
+    anthropic: AnthropicConfig,
     config: ChatConfig,
     named_prompts: BTreeMap<String, String>,
     tools: Vec<Arc<dyn Tool<Self>>>,
@@ -183,6 +185,7 @@ impl SidAgent {
             id,
             SwitchPosition::Yes,
             None,
+            AnthropicConfig::default(),
             config,
             BTreeMap::new(),
             vec![],
@@ -371,6 +374,11 @@ impl SidAgent {
         self.auto_compact_tokens
     }
 
+    /// Return this agent's Anthropic-compatible client configuration.
+    pub fn anthropic_config(&self) -> &AnthropicConfig {
+        &self.anthropic
+    }
+
     fn append_agents_md_to_system_prompt(&mut self) -> Result<(), SError> {
         append_agents_md_to_system_prompt(
             &mut self.config,
@@ -424,6 +432,7 @@ impl SidAgent {
             agent.to_string(),
             agent_config.enabled,
             agent_config.ps1.clone(),
+            agent_config.anthropic.clone(),
             chat_config,
             named_prompts,
             built_tools.tools,
@@ -447,6 +456,7 @@ impl SidAgent {
         id: String,
         enabled: SwitchPosition,
         ps1: Option<String>,
+        anthropic: AnthropicConfig,
         config: ChatConfig,
         named_prompts: BTreeMap<String, String>,
         tools: Vec<Arc<dyn Tool<Self>>>,
@@ -467,6 +477,7 @@ impl SidAgent {
             id,
             enabled,
             ps1,
+            anthropic,
             config,
             named_prompts,
             tools,
@@ -1824,6 +1835,12 @@ enum BuiltinToolKind {
     Edit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinToolParamMode {
+    NativeAnthropic,
+    CustomClient,
+}
+
 impl BuiltinToolKind {
     fn from_canonical_id(canonical_id: &str) -> Option<Self> {
         match canonical_id {
@@ -1833,10 +1850,10 @@ impl BuiltinToolKind {
         }
     }
 
-    fn tool(self) -> Arc<dyn Tool<SidAgent>> {
+    fn tool(self, param_mode: BuiltinToolParamMode) -> Arc<dyn Tool<SidAgent>> {
         match self {
-            Self::Bash => Arc::new(SidBashTool::new()) as Arc<dyn Tool<SidAgent>>,
-            Self::Edit => Arc::new(SidTextEditorTool::new()) as Arc<dyn Tool<SidAgent>>,
+            Self::Bash => Arc::new(SidBashTool::new(param_mode)) as Arc<dyn Tool<SidAgent>>,
+            Self::Edit => Arc::new(SidTextEditorTool::new(param_mode)) as Arc<dyn Tool<SidAgent>>,
         }
     }
 }
@@ -1844,12 +1861,16 @@ impl BuiltinToolKind {
 #[derive(Clone, Debug)]
 struct SidBashTool {
     param: ToolBash20250124,
+    custom_param: ToolParam,
+    param_mode: BuiltinToolParamMode,
 }
 
 impl SidBashTool {
-    fn new() -> Self {
+    fn new(param_mode: BuiltinToolParamMode) -> Self {
         Self {
             param: ToolBash20250124::new(),
+            custom_param: bash_custom_tool_param(),
+            param_mode,
         }
     }
 }
@@ -1864,7 +1885,14 @@ impl Tool<SidAgent> for SidBashTool {
     }
 
     fn to_param(&self) -> ToolUnionParam {
-        ToolUnionParam::Bash20250124(self.param.clone())
+        match self.param_mode {
+            BuiltinToolParamMode::NativeAnthropic => {
+                ToolUnionParam::Bash20250124(self.param.clone())
+            }
+            BuiltinToolParamMode::CustomClient => {
+                ToolUnionParam::CustomTool(self.custom_param.clone())
+            }
+        }
     }
 }
 
@@ -1935,12 +1963,16 @@ impl ToolCallback<SidAgent> for SidBashCallback {
 #[derive(Clone, Debug)]
 struct SidTextEditorTool {
     param: ToolTextEditor20250728,
+    custom_param: ToolParam,
+    param_mode: BuiltinToolParamMode,
 }
 
 impl SidTextEditorTool {
-    fn new() -> Self {
+    fn new(param_mode: BuiltinToolParamMode) -> Self {
         Self {
             param: ToolTextEditor20250728::new(),
+            custom_param: text_editor_custom_tool_param(),
+            param_mode,
         }
     }
 }
@@ -1955,7 +1987,14 @@ impl Tool<SidAgent> for SidTextEditorTool {
     }
 
     fn to_param(&self) -> ToolUnionParam {
-        ToolUnionParam::TextEditor20250728(self.param.clone())
+        match self.param_mode {
+            BuiltinToolParamMode::NativeAnthropic => {
+                ToolUnionParam::TextEditor20250728(self.param.clone())
+            }
+            BuiltinToolParamMode::CustomClient => {
+                ToolUnionParam::CustomTool(self.custom_param.clone())
+            }
+        }
     }
 }
 
@@ -2005,6 +2044,83 @@ impl ToolCallback<SidAgent> for SidTextEditorCallback {
     ) -> ToolResult {
         apply_computed_tool_result(intermediate)
     }
+}
+
+fn bash_custom_tool_param() -> ToolParam {
+    ToolParam::new(
+        "bash".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute in the workspace."
+                },
+                "restart": {
+                    "type": "boolean",
+                    "description": "Discard the current bash session and start a fresh shell before running the command."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .with_description(
+        "Execute a bash command in the workspace. The shell state persists between calls unless restart is true."
+            .to_string(),
+    )
+}
+
+fn text_editor_custom_tool_param() -> ToolParam {
+    ToolParam::new(
+        "str_replace_based_edit_tool".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "str_replace", "insert"],
+                    "description": "Editor operation to perform."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-rooted path to view or modify."
+                },
+                "view_range": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Optional one-based inclusive start and end lines for view."
+                },
+                "file_text": {
+                    "type": "string",
+                    "description": "Full file contents for create."
+                },
+                "old_str": {
+                    "type": "string",
+                    "description": "Exact text to replace for str_replace."
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "Replacement text for str_replace, or insertion text for compatibility."
+                },
+                "insert_line": {
+                    "type": "integer",
+                    "description": "Line after which to insert text."
+                },
+                "insert_text": {
+                    "type": "string",
+                    "description": "Text to insert for insert."
+                }
+            },
+            "required": ["command", "path"],
+            "additionalProperties": false
+        }),
+    )
+    .with_description(
+        "View and edit files in the workspace using create, str_replace, insert, and view commands."
+            .to_string(),
+    )
 }
 
 fn apply_computed_tool_result(intermediate: Box<dyn IntermediateToolResult>) -> ToolResult {
@@ -2928,6 +3044,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
     let mut tools = Vec::new();
     let mut seen = BTreeSet::new();
     let mut builtin_bindings = BuiltinToolBindings::default();
+    let builtin_param_mode = builtin_tool_param_mode(&agent_config.anthropic);
     for tool_name in &agent_config.tools {
         let tool_config = config.tools.get(tool_name).ok_or_else(|| {
             SError::new("sid-agent")
@@ -2955,7 +3072,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
             }
             continue;
         };
-        let tool = builtin_kind.tool();
+        let tool = builtin_kind.tool(builtin_param_mode);
         let exposed_name = tool.name();
         if seen.insert(exposed_name) {
             match builtin_kind {
@@ -2986,6 +3103,23 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
         tools,
         builtin_bindings,
     })
+}
+
+fn builtin_tool_param_mode(config: &AnthropicConfig) -> BuiltinToolParamMode {
+    let base_url = config
+        .base_url
+        .clone()
+        .or_else(|| std::env::var("CLAUDIUS_BASE_URL").ok())
+        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
+    if base_url.as_deref().is_some_and(is_fireworks_base_url) {
+        BuiltinToolParamMode::CustomClient
+    } else {
+        BuiltinToolParamMode::NativeAnthropic
+    }
+}
+
+fn is_fireworks_base_url(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("fireworks.ai")
 }
 
 fn exposed_tool_name(agent: &str, tool_name: &str) -> Result<String, SError> {
@@ -3639,6 +3773,50 @@ build_PROMPT_MEMORY_EXPERT='agents/memory-expert.md'
                     ToolUnionParam::TextEditor20250728(ToolTextEditor20250728::new()),
                 ),
             ]
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn fireworks_builtin_tools_use_custom_client_tool_params() {
+        let root = temp_config_root("agent");
+        write_builtin_config_without_manifests(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let agents_conf = fs::read_to_string(root.join("agents.conf").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            format!("{agents_conf}build_BASE_URL=\"https://api.fireworks.ai/inference\"\n"),
+        )
+        .unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let tools = runtime.block_on(agent.tools());
+        let params = tools
+            .iter()
+            .map(|tool| (tool.name(), tool.to_param()))
+            .collect::<Vec<_>>();
+
+        let ToolUnionParam::CustomTool(bash) = &params[0].1 else {
+            panic!("expected bash to use a custom client tool schema");
+        };
+        assert_eq!(params[0].0, "bash");
+        assert_eq!(bash.name, "bash");
+        assert_eq!(
+            bash.input_schema["properties"]["command"]["type"],
+            json!("string")
+        );
+
+        let ToolUnionParam::CustomTool(editor) = &params[1].1 else {
+            panic!("expected edit to use a custom client tool schema");
+        };
+        assert_eq!(params[1].0, "str_replace_based_edit_tool");
+        assert_eq!(editor.name, "str_replace_based_edit_tool");
+        assert_eq!(
+            editor.input_schema["properties"]["command"]["enum"],
+            json!(["view", "create", "str_replace", "insert"])
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();

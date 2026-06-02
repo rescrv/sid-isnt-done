@@ -117,9 +117,12 @@ cargo install --path .
 ```
 
 Interactive sessions use the Anthropic client from `claudius`.  Set
-`CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`.  Values that
-begin with `file://` are treated by `claudius` as paths to files containing the
-API key.
+`CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`, or set
+per-agent `<agent>_API_KEY` in `agents.conf`.  Values that begin with
+`file://` are treated by `claudius` as paths to files containing the API key.
+Set per-agent `<agent>_BASE_URL` in `agents.conf` to use an
+Anthropic-compatible endpoint; omit the `/v1` suffix because the client appends
+it to request URLs.
 
 macOS is the only platform where `sid` can use `/usr/bin/sandbox-exec`.  On
 other systems, or on macOS systems where that program is unavailable, `sid`
@@ -244,10 +247,24 @@ build_NAME="Let's Go"
 build_DESC="buildit"
 build_TOOLS="bash edit format"
 build_SKILLS="*"
+build_API_KEY="file:///path/to/anthropic.key"
+build_BASE_URL="https://api.anthropic.com"
 build_MODEL="claude-sonnet-4-5"
 build_MAX_TOKENS="8192"
 build_THINKING="on"
 ```
+
+`<agent>_API_KEY`, `<agent>_BASE_URL`
+: Optional per-agent Anthropic-compatible client settings.  `API_KEY` is passed
+  to `claudius` and supports `file://` key files.  `BASE_URL` should be the
+  provider root without `/v1`.  Values are resolved through the agent's
+  `rc_conf` variable provider.
+
+  For Fireworks' Anthropic-compatible endpoint, use
+  `https://api.fireworks.ai/inference`, not a `/v1/responses` or
+  `/v1/chat/completions` URL.  `sid` advertises its built-in bash and edit
+  tools as client-side custom tools on Fireworks because Fireworks does not
+  support Anthropic server tool families.
 
 `<agent>_ENABLED`
 : Controls whether the agent can start.  `YES` starts immediately, `MANUAL`
@@ -861,7 +878,8 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 ## FILES
 
 `agents.conf`
-: Agent services and default-agent selection.
+: Agent services, default-agent selection, and optional per-agent `API_KEY` and
+  `BASE_URL` client settings.
 
 `agents/<agent>.md`
 : Agent prompt markdown.
@@ -901,7 +919,8 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 ## TROUBLESHOOTING
 
 `API key not provided and ANTHROPIC_API_KEY environment variable not set`
-: Set `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`.
+: Set `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`, or set
+  per-agent `<agent>_API_KEY` in `agents.conf`.
 
 `agent references an undefined tool`
 : The agent listed a name in `<agent>_TOOLS` that does not have a matching

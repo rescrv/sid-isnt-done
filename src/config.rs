@@ -162,6 +162,37 @@ impl Config {
     }
 }
 
+/// Anthropic-compatible client settings declared in `agents.conf`.
+///
+/// These per-agent fields let an agent provide API credentials and an alternate
+/// compatible endpoint without relying on process environment variables.  When
+/// omitted, `claudius` falls back to its normal environment variable handling.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct AnthropicConfig {
+    /// API key value passed to `claudius::Anthropic::new`.
+    pub api_key: Option<String>,
+    /// Base URL passed to `claudius::Anthropic::with_base_url`.
+    pub base_url: Option<String>,
+}
+
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+impl AnthropicConfig {
+    fn from_provider(provider: &impl VariableProvider, agent: &str) -> Result<Self, SError> {
+        Ok(Self {
+            api_key: lookup_nonempty_field(provider, agent, "API_KEY")?,
+            base_url: lookup_nonempty_field(provider, agent, "BASE_URL")?,
+        })
+    }
+}
+
 /// Configuration for a single agent declared in `agents.conf`.
 ///
 /// Each agent has an identity, an enablement switch, a system prompt, a list
@@ -191,6 +222,8 @@ pub struct AgentConfig {
     pub prompt_markdown: Option<String>,
     /// Additional named markdown prompts loaded for the agent.
     pub prompts: BTreeMap<String, PromptConfig>,
+    /// Anthropic-compatible client configuration for this agent.
+    pub anthropic: AnthropicConfig,
     /// Merged chat configuration (model, thinking budget, etc.).
     pub chat_config: ChatConfig,
     /// Whether user-instruction injection is enabled for this agent.
@@ -232,6 +265,7 @@ impl AgentConfig {
         let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
         let user_instructions_hook =
             lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
+        let anthropic = AnthropicConfig::from_provider(&provider, agent)?;
         let auto_compact_tokens = match lookup_expanded(&provider, agent, "AUTO_COMPACT")? {
             Some(value) => Some(parse_u64_field(agent, "AUTO_COMPACT", &value)?),
             None => None,
@@ -282,6 +316,7 @@ impl AgentConfig {
             prompt_paths,
             prompt_markdown,
             prompts: non_system_prompts,
+            anthropic,
             chat_config,
             user_instructions_enabled,
             agents_md_enabled,
@@ -1290,11 +1325,15 @@ mod tests {
         fs::write(
             root.join("agents.conf").as_str(),
             r#"
+API_KEY="file://secrets/default.key"
+BASE_URL="https://default.example.test/anthropic"
 ROLE='principal engineer'
 build_ENABLED="YES"
 plan_ENABLED="MANUAL"
 evil_ENABLED="NO"
 
+build_API_KEY="file://secrets/build.key"
+build_BASE_URL="https://build.example.test/anthropic"
 build_NAME="Let's go ${ROLE}"
 build_DESC="buildit"
 build_TOOLS='format bash'
@@ -1344,6 +1383,13 @@ format_ALIASES="fmt"
         assert_eq!(config.tools.len(), 3);
 
         let build = config.agents.get("build").unwrap();
+        assert_eq!(
+            build.anthropic,
+            AnthropicConfig {
+                api_key: Some("file://secrets/build.key".to_string()),
+                base_url: Some("https://build.example.test/anthropic".to_string()),
+            }
+        );
         assert_eq!(build.enabled, SwitchPosition::Yes);
         assert_eq!(
             build.display_name.as_deref(),
@@ -1363,6 +1409,13 @@ format_ALIASES="fmt"
         );
 
         let plan = config.agents.get("plan").unwrap();
+        assert_eq!(
+            plan.anthropic,
+            AnthropicConfig {
+                api_key: Some("file://secrets/default.key".to_string()),
+                base_url: Some("https://default.example.test/anthropic".to_string()),
+            }
+        );
         assert_eq!(plan.enabled, SwitchPosition::Manual);
         assert_eq!(
             plan.chat_config.model(),
