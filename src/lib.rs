@@ -30,6 +30,8 @@ pub mod seatbelt;
 pub mod session;
 /// Semantic diff rendering with syntax-aware annotations.
 pub mod sidiff;
+/// Terminal diff review pager.
+pub mod sidreview;
 /// Skill-reference injection into user messages.
 pub mod skill_inject;
 #[cfg(test)]

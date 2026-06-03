@@ -13,6 +13,7 @@ async-trait = "0.1"
 base64 = "0.22"
 libc = "0.2"
 ctrlc = { version = "3.5", features = ["termination"] }
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 getopts = "0.2.24"
 regex = "1"
 rustyline = "17.0"
@@ -24,6 +25,7 @@ tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 
 arrrg = "^0.9"
 arrrg_derive = "^0.9"
@@ -61,6 +63,10 @@ path = "src/bin/sid-init.rs"
 [[bin]]
 name = "sidiff"
 path = "src/bin/sidiff.rs"
+
+[[bin]]
+name = "sidreview"
+path = "src/bin/sidreview.rs"
 
 [profile.release]
 debug = true
