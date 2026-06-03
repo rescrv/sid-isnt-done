@@ -1,9 +1,9 @@
 //! Semantic diff renderer with syntax-aware annotations.
 //!
 //! Parses git-style or plain unified diffs into an intermediate representation
-//! ([`Diff`], [`DiffFile`], [`Hunk`], [`DiffLine`]), optionally annotates
-//! hunks with tree-sitter role information, and renders the result with ANSI
-//! truecolor highlighting.
+//! (`Diff`, `DiffFile`, `Hunk`, `DiffLine`), optionally annotates hunks with
+//! tree-sitter role information, and renders the result with ANSI truecolor
+//! highlighting.
 
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,6 +11,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
+use std::thread;
 use tree_sitter::{Language, Node, Parser};
 
 const DEFAULT_PAGER: &str = "less -R";
@@ -1812,6 +1813,12 @@ fn build_rendered_lines(
                 text: paint_fg(header, Rgb::new(120, 120, 120), options.use_color),
             });
         }
+        if file_is_pure_addition(file)
+            && let Some(lines) = render_pure_addition_with_bat(file, options)
+        {
+            out.extend(lines);
+            continue;
+        }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             out.push(RenderedLine {
                 text: paint_fg(&hunk.header, Rgb::new(105, 180, 255), options.use_color),
@@ -1867,6 +1874,104 @@ fn build_rendered_lines(
         }
     }
     out
+}
+
+fn file_is_pure_addition(file: &DiffFile) -> bool {
+    let mut saw_addition = false;
+    for hunk in &file.hunks {
+        for line in &hunk.lines {
+            match line.op {
+                DiffOp::Add => saw_addition = true,
+                DiffOp::Note => {}
+                DiffOp::Context | DiffOp::Remove => return false,
+            }
+        }
+    }
+    saw_addition
+}
+
+fn render_pure_addition_with_bat(
+    file: &DiffFile,
+    options: SidiffOptions,
+) -> Option<Vec<RenderedLine>> {
+    let content = pure_addition_content(file);
+    let rendered = run_bat_filter(&display_new_path(file), &content, options).ok()?;
+    Some(
+        rendered
+            .lines()
+            .map(|line| RenderedLine {
+                text: line.to_string(),
+            })
+            .collect(),
+    )
+}
+
+fn pure_addition_content(file: &DiffFile) -> String {
+    let mut out = String::new();
+    let mut last_was_addition = false;
+    for hunk in &file.hunks {
+        for line in &hunk.lines {
+            match line.op {
+                DiffOp::Add => {
+                    out.push_str(&line.content);
+                    out.push('\n');
+                    last_was_addition = true;
+                }
+                DiffOp::Note if last_was_addition && line.content.starts_with("\\ No newline") => {
+                    out.pop();
+                    last_was_addition = false;
+                }
+                DiffOp::Note => {
+                    last_was_addition = false;
+                }
+                DiffOp::Context | DiffOp::Remove => {
+                    last_was_addition = false;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_bat_filter(path: &str, input: &str, options: SidiffOptions) -> io::Result<String> {
+    let mut child = Command::new("bat")
+        .arg("--color")
+        .arg(if options.use_color { "always" } else { "never" })
+        .arg("--paging")
+        .arg("never")
+        .arg("--style")
+        .arg("plain")
+        .arg("--file-name")
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open bat stdin"))?;
+    let input = input.as_bytes().to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&input));
+
+    let output = child.wait_with_output()?;
+    match writer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if err.kind() == io::ErrorKind::BrokenPipe => {}
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(io::Error::other("bat stdin writer panicked")),
+    }
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(io::Error::other(format!(
+            "bat exited with status {}",
+            output.status
+        )))
+    }
 }
 
 fn should_hide_line(
@@ -2334,6 +2439,70 @@ index 3333333..4444444 100644
         assert_eq!(diff.files[1].hunks.len(), 1);
         assert_eq!(diff.files[0].hunks[0].lines.len(), 2);
         assert_eq!(diff.files[1].hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn pure_addition_file_reconstructs_added_content() {
+        let input = "\
+diff --git a/new.rs b/new.rs
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1,3 @@
++fn main() {
++    println!(\"hello\");
++}
+";
+        let diff = parse_unified_diff(input);
+        let file = &diff.files[0];
+        assert!(file_is_pure_addition(file));
+        assert_eq!(
+            pure_addition_content(file),
+            "fn main() {\n    println!(\"hello\");\n}\n"
+        );
+    }
+
+    #[test]
+    fn pure_addition_content_respects_missing_final_newline_note() {
+        let input = "\
+diff --git a/new.txt b/new.txt
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++without newline
+\\ No newline at end of file
+";
+        let diff = parse_unified_diff(input);
+        let file = &diff.files[0];
+        assert!(file_is_pure_addition(file));
+        assert_eq!(pure_addition_content(file), "without newline");
+    }
+
+    #[test]
+    fn context_or_removed_lines_are_not_pure_additions() {
+        let input = "\
+diff --git a/existing.rs b/existing.rs
+--- a/existing.rs
++++ b/existing.rs
+@@ -1,2 +1,3 @@
+ fn main() {
++    println!(\"hello\");
+ }
+";
+        let diff = parse_unified_diff(input);
+        assert!(!file_is_pure_addition(&diff.files[0]));
+
+        let input = "\
+diff --git a/changed.rs b/changed.rs
+--- a/changed.rs
++++ b/changed.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let diff = parse_unified_diff(input);
+        assert!(!file_is_pure_addition(&diff.files[0]));
     }
 
     #[test]
