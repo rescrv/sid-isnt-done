@@ -7,15 +7,18 @@ use std::time::Duration;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::sidiff::{Diff, DiffFile, DiffLine, DiffOp, parse_unified_diff};
+use crate::sidiff::{
+    Diff, DiffFile, DiffLine, DiffOp, file_is_pure_addition, parse_unified_diff,
+    render_pure_addition_file_with_bat,
+};
 
 /// Run the sidreview terminal UI for a unified diff.
 pub fn run_tui(input: &str) -> io::Result<()> {
-    let mut app = ReviewApp::from_input(input);
+    let mut app = ReviewApp::from_input_with_color(input, true);
     let mut terminal = ratatui::try_init()?;
     let result = run_app(&mut terminal, &mut app);
     let restore_result = ratatui::try_restore();
@@ -28,7 +31,7 @@ pub fn run_tui(input: &str) -> io::Result<()> {
 
 /// Render the review pager's current expanded text without terminal styling.
 pub fn render_plain(input: &str) -> String {
-    let app = ReviewApp::from_input(input);
+    let app = ReviewApp::from_input_with_color(input, false);
     let mut out = app
         .rows()
         .into_iter()
@@ -64,10 +67,7 @@ fn render_review(frame: &mut Frame, app: &mut ReviewApp) {
     let rows = app
         .rows()
         .into_iter()
-        .map(|row| {
-            let style = row_style(&row, app.selected);
-            Line::styled(row.text, style)
-        })
+        .map(|row| render_row_line(row, app.selected))
         .collect::<Vec<_>>();
     let body = Paragraph::new(rows).scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(body, body_area);
@@ -90,6 +90,7 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
         ReviewRowKind::Add => Style::default().fg(Color::Rgb(95, 220, 145)),
         ReviewRowKind::Remove => Style::default().fg(Color::Rgb(245, 115, 125)),
         ReviewRowKind::Note => Style::default().fg(Color::Rgb(160, 160, 160)),
+        ReviewRowKind::Bat => Style::default().fg(Color::Rgb(210, 210, 210)),
         ReviewRowKind::Empty => Style::default().fg(Color::Rgb(160, 160, 160)),
     };
     if row.block == selected {
@@ -99,6 +100,149 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
         }
     }
     style
+}
+
+fn render_row_line(row: ReviewRow, selected: Option<usize>) -> Line<'static> {
+    let style = row_style(&row, selected);
+    if row.kind == ReviewRowKind::Bat {
+        ansi_styled_line(&row.text, style)
+    } else {
+        Line::styled(row.text, style)
+    }
+}
+
+fn ansi_styled_line(text: &str, base: Style) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut style = base;
+    let mut segment_start = 0usize;
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] != b'\x1b' {
+            index += 1;
+            continue;
+        }
+
+        if index > segment_start {
+            spans.push(Span::styled(text[segment_start..index].to_string(), style));
+        }
+
+        if let Some(end) = csi_sequence_end(text, index) {
+            if bytes.get(index + 1) == Some(&b'[') && bytes[end - 1] == b'm' {
+                apply_sgr(&mut style, base, &text[index + 2..end - 1]);
+            }
+            index = end;
+            segment_start = index;
+        } else {
+            index += 1;
+            segment_start = index;
+        }
+    }
+
+    if segment_start < text.len() {
+        spans.push(Span::styled(text[segment_start..].to_string(), style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    Line::from(spans)
+}
+
+fn csi_sequence_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'\x1b') || bytes.get(start + 1) != Some(&b'[') {
+        return None;
+    }
+    bytes[start + 2..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|offset| start + 2 + offset + 1)
+}
+
+fn apply_sgr(style: &mut Style, base: Style, params: &str) {
+    let codes = sgr_codes(params);
+    let mut index = 0usize;
+    while index < codes.len() {
+        match codes[index] {
+            0 => *style = base,
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            9 => *style = style.add_modifier(Modifier::CROSSED_OUT),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            29 => *style = style.remove_modifier(Modifier::CROSSED_OUT),
+            30..=37 | 90..=97 => style.fg = ansi_color(codes[index]),
+            39 => style.fg = base.fg,
+            40..=47 | 100..=107 => style.bg = ansi_color(codes[index] - 10),
+            49 => style.bg = base.bg,
+            38 | 48 => {
+                let target_foreground = codes[index] == 38;
+                let Some((color, consumed)) = extended_ansi_color(&codes[index + 1..]) else {
+                    index += 1;
+                    continue;
+                };
+                if target_foreground {
+                    style.fg = Some(color);
+                } else {
+                    style.bg = Some(color);
+                }
+                index += consumed + 1;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn sgr_codes(params: &str) -> Vec<u16> {
+    if params.is_empty() {
+        return vec![0];
+    }
+    params
+        .split(';')
+        .map(|param| {
+            if param.is_empty() {
+                0
+            } else {
+                param.parse::<u16>().unwrap_or(u16::MAX)
+            }
+        })
+        .collect()
+}
+
+fn extended_ansi_color(codes: &[u16]) -> Option<(Color, usize)> {
+    match codes {
+        [2, r, g, b, ..] => Some((Color::Rgb(*r as u8, *g as u8, *b as u8), 4)),
+        [5, index, ..] => Some((Color::Indexed(*index as u8), 2)),
+        _ => None,
+    }
+}
+
+fn ansi_color(code: u16) -> Option<Color> {
+    Some(match code {
+        30 => Color::Black,
+        31 => Color::Red,
+        32 => Color::Green,
+        33 => Color::Yellow,
+        34 => Color::Blue,
+        35 => Color::Magenta,
+        36 => Color::Cyan,
+        37 => Color::Gray,
+        90 => Color::DarkGray,
+        91 => Color::LightRed,
+        92 => Color::LightGreen,
+        93 => Color::LightYellow,
+        94 => Color::LightBlue,
+        95 => Color::LightMagenta,
+        96 => Color::LightCyan,
+        97 => Color::White,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,8 +255,16 @@ struct ReviewApp {
 }
 
 impl ReviewApp {
+    #[cfg(test)]
     fn from_input(input: &str) -> Self {
-        Self::new(build_blocks(&parse_unified_diff(input)))
+        Self::from_input_with_color(input, false)
+    }
+
+    fn from_input_with_color(input: &str, use_color: bool) -> Self {
+        Self::new(build_blocks_with_color(
+            &parse_unified_diff(input),
+            use_color,
+        ))
     }
 
     fn new(blocks: Vec<ReviewBlock>) -> Self {
@@ -337,6 +489,16 @@ impl ReviewLine {
         }
     }
 
+    fn bat(content: impl Into<String>) -> Self {
+        Self {
+            kind: ReviewRowKind::Bat,
+            old_lineno: None,
+            new_lineno: None,
+            marker: " ",
+            content: content.into(),
+        }
+    }
+
     fn from_diff_line(line: &DiffLine) -> Self {
         let (kind, marker, content) = match line.op {
             DiffOp::Context => (ReviewRowKind::Context, " ", line.content.as_str()),
@@ -361,6 +523,9 @@ impl ReviewLine {
         if self.kind == ReviewRowKind::Header {
             return format!("     {}", self.content);
         }
+        if self.kind == ReviewRowKind::Bat {
+            return self.content.clone();
+        }
         format!(
             "{:>4} {:>4} {} {}",
             display_lineno(self.old_lineno),
@@ -379,6 +544,7 @@ enum ReviewRowKind {
     Add,
     Remove,
     Note,
+    Bat,
     Empty,
 }
 
@@ -389,7 +555,12 @@ struct ReviewRow {
     text: String,
 }
 
+#[cfg(test)]
 fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
+    build_blocks_with_color(diff, false)
+}
+
+fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
     let mut blocks = Vec::new();
     if !diff.preamble.is_empty() {
         blocks.push(ReviewBlock::new(
@@ -399,6 +570,19 @@ fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
     }
 
     for file in &diff.files {
+        if file_is_pure_addition(file)
+            && let Ok(rendered) = render_pure_addition_file_with_bat(file, use_color)
+        {
+            let mut lines = Vec::new();
+            lines.extend(file.header.iter().map(ReviewLine::header));
+            lines.extend(rendered.lines().map(ReviewLine::bat));
+            blocks.push(ReviewBlock::new(
+                format!("file {}", display_path(file)),
+                lines,
+            ));
+            continue;
+        }
+
         if file.hunks.is_empty() {
             blocks.push(ReviewBlock::new(
                 format!("file {}", display_path(file)),
@@ -478,6 +662,63 @@ diff --git a/a.rs b/a.rs
  keep_eight
  keep_nine
 ";
+
+    const PURE_ADDITION: &str = "\
+diff --git a/new.rs b/new.rs
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1,3 @@
++fn main() {
++    println!(\"hello\");
++}
+";
+
+    #[test]
+    fn ansi_styled_line_parses_sgr_colors_and_reset() {
+        let base = Style::default().bg(Color::Rgb(43, 48, 58));
+        let line = ansi_styled_line("plain \x1b[38;2;1;2;3mbold\x1b[0m base", base);
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content, "plain ");
+        assert_eq!(line.spans[0].style, base);
+        assert_eq!(line.spans[1].content, "bold");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(line.spans[1].style.bg, base.bg);
+        assert_eq!(line.spans[2].content, " base");
+        assert_eq!(line.spans[2].style, base);
+    }
+
+    #[test]
+    fn pure_addition_file_uses_bat_block_when_available() {
+        let diff = parse_unified_diff(PURE_ADDITION);
+        if render_pure_addition_file_with_bat(&diff.files[0], false).is_err() {
+            return;
+        }
+
+        let blocks = build_blocks_with_color(&diff, false);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].title, "file new.rs");
+        assert!(
+            blocks[0]
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewRowKind::Bat && line.content == "fn main() {")
+        );
+        assert!(
+            !blocks[0]
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewRowKind::Add)
+        );
+        assert!(
+            !blocks[0]
+                .lines
+                .iter()
+                .any(|line| line.content == "@@ -0,0 +1,3 @@")
+        );
+    }
 
     #[test]
     fn builds_one_selectable_block_per_hunk() {

@@ -1876,7 +1876,7 @@ fn build_rendered_lines(
     out
 }
 
-fn file_is_pure_addition(file: &DiffFile) -> bool {
+pub(crate) fn file_is_pure_addition(file: &DiffFile) -> bool {
     let mut saw_addition = false;
     for hunk in &file.hunks {
         for line in &hunk.lines {
@@ -1894,8 +1894,7 @@ fn render_pure_addition_with_bat(
     file: &DiffFile,
     options: SidiffOptions,
 ) -> Option<Vec<RenderedLine>> {
-    let content = pure_addition_content(file);
-    let rendered = run_bat_filter(&display_new_path(file), &content, options).ok()?;
+    let rendered = render_pure_addition_file_with_bat(file, options.use_color).ok()?;
     Some(
         rendered
             .lines()
@@ -1903,6 +1902,21 @@ fn render_pure_addition_with_bat(
                 text: line.to_string(),
             })
             .collect(),
+    )
+}
+
+pub(crate) fn render_pure_addition_file_with_bat(
+    file: &DiffFile,
+    use_color: bool,
+) -> io::Result<String> {
+    let content = pure_addition_content(file);
+    run_bat_filter(
+        &display_new_path(file),
+        &content,
+        SidiffOptions {
+            use_color,
+            ..SidiffOptions::default()
+        },
     )
 }
 
