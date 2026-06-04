@@ -185,12 +185,35 @@ impl std::fmt::Debug for AnthropicConfig {
 }
 
 impl AnthropicConfig {
-    fn from_provider(provider: &impl VariableProvider, agent: &str) -> Result<Self, SError> {
+    fn from_provider(
+        config_root: &Path,
+        provider: &impl VariableProvider,
+        agent: &str,
+    ) -> Result<Self, SError> {
+        let api_key = lookup_nonempty_field(provider, agent, "API_KEY")?
+            .map(|value| rewrite_relative_file_api_key(config_root, value));
         Ok(Self {
-            api_key: lookup_nonempty_field(provider, agent, "API_KEY")?,
+            api_key,
             base_url: lookup_nonempty_field(provider, agent, "BASE_URL")?,
         })
     }
+}
+
+/// Rewrites a `file://`-prefixed API key that names a relative path so it points
+/// at the directory containing `agents.conf`.
+///
+/// Keys that do not begin with `file://`, or whose path is already absolute, are
+/// returned unchanged.
+fn rewrite_relative_file_api_key(config_root: &Path, value: String) -> String {
+    let Some(rest) = value.strip_prefix("file://") else {
+        return value;
+    };
+    let path = std::path::Path::new(rest);
+    if path.is_absolute() {
+        return value;
+    }
+    let resolved = std::path::PathBuf::from(config_root.as_str()).join(path);
+    format!("file://{}", resolved.display())
 }
 
 /// Configuration for a single agent declared in `agents.conf`.
@@ -265,7 +288,7 @@ impl AgentConfig {
         let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
         let user_instructions_hook =
             lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
-        let anthropic = AnthropicConfig::from_provider(&provider, agent)?;
+        let anthropic = AnthropicConfig::from_provider(config_root, &provider, agent)?;
         let auto_compact_tokens = match lookup_expanded(&provider, agent, "AUTO_COMPACT")? {
             Some(value) => Some(parse_u64_field(agent, "AUTO_COMPACT", &value)?),
             None => None,
@@ -1336,6 +1359,33 @@ mod tests {
     };
 
     #[test]
+    fn rewrite_relative_file_api_key_rewrites_relative_paths() {
+        let root = Path::from("/config/dir");
+        assert_eq!(
+            rewrite_relative_file_api_key(&root, "file://secrets/key".to_string()),
+            "file:///config/dir/secrets/key".to_string()
+        );
+    }
+
+    #[test]
+    fn rewrite_relative_file_api_key_preserves_absolute_paths() {
+        let root = Path::from("/config/dir");
+        assert_eq!(
+            rewrite_relative_file_api_key(&root, "file:///etc/secrets/key".to_string()),
+            "file:///etc/secrets/key".to_string()
+        );
+    }
+
+    #[test]
+    fn rewrite_relative_file_api_key_ignores_non_file_keys() {
+        let root = Path::from("/config/dir");
+        assert_eq!(
+            rewrite_relative_file_api_key(&root, "sk-ant-literal".to_string()),
+            "sk-ant-literal".to_string()
+        );
+    }
+
+    #[test]
     fn load_config_from_readme_style_files() {
         let root = unique_temp_dir("config");
         fs::create_dir_all(root.join("agents").as_str()).unwrap();
@@ -1404,7 +1454,10 @@ format_ALIASES="fmt"
         assert_eq!(
             build.anthropic,
             AnthropicConfig {
-                api_key: Some("file://secrets/build.key".to_string()),
+                api_key: Some(format!(
+                    "file://{}/secrets/build.key",
+                    root.as_str()
+                )),
                 base_url: Some("https://build.example.test/anthropic".to_string()),
             }
         );
@@ -1430,7 +1483,10 @@ format_ALIASES="fmt"
         assert_eq!(
             plan.anthropic,
             AnthropicConfig {
-                api_key: Some("file://secrets/default.key".to_string()),
+                api_key: Some(format!(
+                    "file://{}/secrets/default.key",
+                    root.as_str()
+                )),
                 base_url: Some("https://default.example.test/anthropic".to_string()),
             }
         );

@@ -120,6 +120,8 @@ Interactive sessions use the Anthropic client from `claudius`.  Set
 `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`, or set
 per-agent `<agent>_API_KEY` in `agents.conf`.  Values that begin with
 `file://` are treated by `claudius` as paths to files containing the API key.
+A `file://` value naming a relative path is resolved against the directory
+containing `agents.conf`; absolute `file://` paths are used as-is.
 Set per-agent `<agent>_BASE_URL` in `agents.conf` to use an
 Anthropic-compatible endpoint; omit the `/v1` suffix because the client appends
 it to request URLs.
@@ -256,7 +258,9 @@ build_THINKING="on"
 
 `<agent>_API_KEY`, `<agent>_BASE_URL`
 : Optional per-agent Anthropic-compatible client settings.  `API_KEY` is passed
-  to `claudius` and supports `file://` key files.  `BASE_URL` should be the
+  to `claudius` and supports `file://` key files.  A `file://` value with a
+  relative path is resolved against the directory containing `agents.conf`,
+  while absolute `file://` paths are used unchanged.  `BASE_URL` should be the
   provider root without `/v1`.  Values are resolved through the agent's
   `rc_conf` variable provider.
 
