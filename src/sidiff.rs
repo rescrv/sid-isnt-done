@@ -6,7 +6,7 @@
 //! highlighting.
 
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
@@ -1304,9 +1304,27 @@ fn run_similarity(remove: &[String], add: &[String]) -> f32 {
     common as f32 / min(remove.len(), add.len()) as f32
 }
 
-pub(crate) fn build_bat_line_color_map(diff: &Diff, use_color: bool) -> BatLineColorMap {
+pub(crate) fn build_review_line_metadata(
+    diff: &Diff,
+    use_color: bool,
+) -> (BatLineColorMap, BTreeSet<(usize, usize, usize)>) {
     let analysis = analyze_diff(diff);
-    build_bat_line_color_map_with_analysis(diff, &analysis, use_color)
+    let bat_lines = build_bat_line_color_map_with_analysis(diff, &analysis, use_color);
+    let muted_moved_additions = analysis
+        .lines
+        .iter()
+        .filter_map(|(id, meta)| {
+            let line = diff
+                .files
+                .get(id.file)?
+                .hunks
+                .get(id.hunk)?
+                .lines
+                .get(id.line)?;
+            should_mute_moved_addition(line.op, Some(meta)).then_some((id.file, id.hunk, id.line))
+        })
+        .collect();
+    (bat_lines, muted_moved_additions)
 }
 
 fn build_bat_line_color_map_with_analysis(
@@ -2268,8 +2286,7 @@ fn render_content(
     if content.is_empty() {
         return String::new();
     }
-    let mute_moved_addition = op == DiffOp::Add
-        && meta.is_some_and(|meta| meta.move_id.is_some() && meta.paired_with.is_none());
+    let mute_moved_addition = should_mute_moved_addition(op, meta);
     let boundaries = span_boundaries(content, meta, syntax);
     let mut out = String::new();
     for pair in boundaries.windows(2) {
@@ -2299,6 +2316,11 @@ fn render_content(
         ));
     }
     out
+}
+
+fn should_mute_moved_addition(op: DiffOp, meta: Option<&LineAnalysis>) -> bool {
+    op == DiffOp::Add
+        && meta.is_some_and(|meta| meta.move_id.is_some() && meta.paired_with.is_none())
 }
 
 fn span_boundaries(

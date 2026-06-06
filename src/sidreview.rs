@@ -17,7 +17,7 @@ use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 
 use crate::sidiff::{
-    Diff, DiffFile, DiffLine, DiffOp, build_bat_line_color_map, file_is_pure_addition,
+    Diff, DiffFile, DiffLine, DiffOp, build_review_line_metadata, file_is_pure_addition,
     parse_unified_diff, render_pure_addition_file_with_bat,
 };
 
@@ -105,6 +105,7 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
         ReviewRowKind::Header => Style::default().fg(Color::Rgb(145, 145, 145)),
         ReviewRowKind::Context => Style::default().fg(Color::Rgb(210, 210, 210)),
         ReviewRowKind::Add => Style::default().fg(Color::Rgb(95, 220, 145)),
+        ReviewRowKind::MovedAdd => Style::default().fg(Color::Rgb(125, 125, 125)),
         ReviewRowKind::Remove => Style::default().fg(Color::Rgb(245, 115, 125)),
         ReviewRowKind::Note => Style::default().fg(Color::Rgb(160, 160, 160)),
         ReviewRowKind::Bat => Style::default().fg(Color::Rgb(210, 210, 210)),
@@ -652,7 +653,11 @@ impl ReviewLine {
         }
     }
 
-    fn from_diff_line_with_content(line: &DiffLine, content: Option<&str>) -> Self {
+    fn from_diff_line_with_content(
+        line: &DiffLine,
+        content: Option<&str>,
+        muted_moved_addition: bool,
+    ) -> Self {
         let (kind, marker, content) = match line.op {
             DiffOp::Context => (
                 ReviewRowKind::Context,
@@ -660,7 +665,11 @@ impl ReviewLine {
                 content.unwrap_or(line.content.as_str()),
             ),
             DiffOp::Add => (
-                ReviewRowKind::Add,
+                if muted_moved_addition {
+                    ReviewRowKind::MovedAdd
+                } else {
+                    ReviewRowKind::Add
+                },
                 "+",
                 content.unwrap_or(line.content.as_str()),
             ),
@@ -708,6 +717,7 @@ enum ReviewRowKind {
     Header,
     Context,
     Add,
+    MovedAdd,
     Remove,
     Note,
     Bat,
@@ -727,7 +737,7 @@ fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
 }
 
 fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
-    let bat_lines = build_bat_line_color_map(diff, use_color);
+    let (bat_lines, muted_moved_additions) = build_review_line_metadata(diff, use_color);
     let mut blocks = Vec::new();
     if !diff.preamble.is_empty() {
         blocks.push(ReviewBlock::new(
@@ -765,10 +775,14 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
             }
             lines.push(ReviewLine::header(&hunk.header));
             lines.extend(hunk.lines.iter().enumerate().map(|(line_idx, line)| {
-                ReviewLine::from_diff_line_with_content(
-                    line,
-                    bat_lines.get(file_idx, hunk_idx, line_idx),
-                )
+                let muted_moved_addition =
+                    muted_moved_additions.contains(&(file_idx, hunk_idx, line_idx));
+                let content = if muted_moved_addition {
+                    None
+                } else {
+                    bat_lines.get(file_idx, hunk_idx, line_idx)
+                };
+                ReviewLine::from_diff_line_with_content(line, content, muted_moved_addition)
             }));
             blocks.push(ReviewBlock::new(
                 format!("{} {}", display_path(file), hunk.header),
@@ -883,6 +897,22 @@ index 0000000..1111111
 +}
 ";
 
+    const MOVED_BLOCKS: &str = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,4 +1,1 @@
+-moved alpha
+-moved beta
+-moved gamma
+ stay
+@@ -10,1 +7,4 @@
+ elsewhere
++moved alpha
++moved beta
++moved gamma
+";
+
     #[test]
     fn ansi_styled_line_parses_sgr_colors_and_reset() {
         let base = Style::default().bg(Color::Rgb(43, 48, 58));
@@ -913,6 +943,29 @@ index 0000000..1111111
         assert_eq!(line.spans[0].content, "       1 + ");
         assert_eq!(line.spans[1].content, "fn main");
         assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn moved_addition_rows_render_muted_gray() {
+        let blocks = build_blocks_with_color(&parse_unified_diff(MOVED_BLOCKS), true);
+        let moved = blocks[1]
+            .lines
+            .iter()
+            .find(|line| line.content == "moved alpha")
+            .unwrap();
+
+        assert_eq!(moved.kind, ReviewRowKind::MovedAdd);
+        assert_eq!(moved.render(), "        8 + moved alpha");
+
+        let rendered = render_row_line(
+            ReviewRow {
+                block: Some(1),
+                kind: moved.kind,
+                text: moved.render(),
+            },
+            None,
+        );
+        assert_eq!(rendered.style.fg, Some(Color::Rgb(125, 125, 125)));
     }
 
     #[test]
