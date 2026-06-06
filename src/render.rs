@@ -151,6 +151,18 @@ impl PlainTextRenderer {
         self.flush();
     }
 
+    /// Returns the prefix that introduces a thinking block.
+    ///
+    /// Top-level agents get a leading blank line to separate thinking from prior
+    /// output; nested agents (which already carry indentation and a label) do not.
+    fn thinking_prefix(context: &dyn StreamContext) -> &'static str {
+        if context.depth() == 0 && context.label().is_none() {
+            "\n[thinking] "
+        } else {
+            "[thinking] "
+        }
+    }
+
     /// Render the accumulated tool input in a human-readable format.
     fn render_tool_input(&mut self, context: &dyn StreamContext) {
         let json_str = std::mem::take(&mut self.tool_input_buf);
@@ -523,17 +535,13 @@ impl Renderer for PlainTextRenderer {
                 self.write_with_indent(context, ANSI_THINKING);
                 self.write_with_indent(context, ANSI_DIM);
                 self.write_with_indent(context, ANSI_ITALIC);
+                self.write_with_indent(context, Self::thinking_prefix(context));
                 self.in_thinking = true;
             }
             self.write_with_indent(context, text);
         } else {
             if !self.in_thinking {
-                let prefix = if context.depth() == 0 && context.label().is_none() {
-                    "\n[thinking] "
-                } else {
-                    "[thinking] "
-                };
-                self.write_with_indent(context, prefix);
+                self.write_with_indent(context, Self::thinking_prefix(context));
                 self.in_thinking = true;
             }
             self.write_with_indent(context, text);
