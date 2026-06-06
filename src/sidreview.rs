@@ -1,7 +1,11 @@
 //! Terminal review pager for unified diffs.
 
 use std::cmp::min;
+use std::collections::BTreeSet;
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -10,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
+use serde::{Deserialize, Serialize};
 
 use crate::sidiff::{
     Diff, DiffFile, DiffLine, DiffOp, file_is_pure_addition, parse_unified_diff,
@@ -19,8 +24,14 @@ use crate::sidiff::{
 /// Run the sidreview terminal UI for a unified diff.
 pub fn run_tui(input: &str) -> io::Result<()> {
     let mut app = ReviewApp::from_input_with_color(input, true);
+    let fold_store = FoldStateStore::for_current_ref()?;
+    if let Some(store) = &fold_store
+        && let Some(state) = store.load()?
+    {
+        app.apply_fold_state(&state);
+    }
     let mut terminal = ratatui::try_init()?;
-    let result = run_app(&mut terminal, &mut app);
+    let result = run_app(&mut terminal, &mut app, fold_store.as_ref());
     let restore_result = ratatui::try_restore();
     match (result, restore_result) {
         (Err(err), _) => Err(err),
@@ -44,7 +55,11 @@ pub fn render_plain(input: &str) -> String {
     out
 }
 
-fn run_app(terminal: &mut DefaultTerminal, app: &mut ReviewApp) -> io::Result<()> {
+fn run_app(
+    terminal: &mut DefaultTerminal,
+    app: &mut ReviewApp,
+    fold_store: Option<&FoldStateStore>,
+) -> io::Result<()> {
     loop {
         terminal.draw(|frame| render_review(frame, app))?;
         if app.should_quit {
@@ -54,7 +69,11 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut ReviewApp) -> io::Result<()
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            app.handle_key(key.code);
+            if app.handle_key(key.code) == ReviewAction::FoldStateChanged
+                && let Some(store) = fold_store
+            {
+                store.save(&app.fold_state())?;
+            }
         }
     }
 }
@@ -278,17 +297,30 @@ impl ReviewApp {
         }
     }
 
-    fn handle_key(&mut self, key: KeyCode) {
+    fn handle_key(&mut self, key: KeyCode) -> ReviewAction {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.select_next()
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.should_quit = true;
+                ReviewAction::Quit
             }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => self.select_previous(),
-            KeyCode::Char('g') | KeyCode::Home => self.select_first(),
-            KeyCode::Char('G') | KeyCode::End => self.select_last_and_scroll_to_end(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.select_next();
+                ReviewAction::None
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                self.select_previous();
+                ReviewAction::None
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.select_first();
+                ReviewAction::None
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.select_last_and_scroll_to_end();
+                ReviewAction::None
+            }
             KeyCode::Char('f') | KeyCode::Enter => self.toggle_selected_fold(),
-            _ => {}
+            _ => ReviewAction::None,
         }
     }
 
@@ -337,12 +369,32 @@ impl ReviewApp {
         self.scroll_to_end();
     }
 
-    fn toggle_selected_fold(&mut self) {
+    fn toggle_selected_fold(&mut self) -> ReviewAction {
         let Some(selected) = self.selected else {
-            return;
+            return ReviewAction::None;
         };
         self.blocks[selected].folded = !self.blocks[selected].folded;
         self.ensure_selected_visible();
+        ReviewAction::FoldStateChanged
+    }
+
+    fn apply_fold_state(&mut self, state: &FoldState) {
+        let folded = state.folded.iter().collect::<BTreeSet<_>>();
+        for block in &mut self.blocks {
+            block.folded = folded.contains(&block.title);
+        }
+        self.ensure_selected_visible();
+    }
+
+    fn fold_state(&self) -> FoldState {
+        FoldState {
+            folded: self
+                .blocks
+                .iter()
+                .filter(|block| block.folded)
+                .map(|block| block.title.clone())
+                .collect(),
+        }
     }
 
     fn scroll_selected_to_start(&mut self) {
@@ -445,6 +497,109 @@ impl ReviewApp {
             .take(self.viewport_height)
             .map(|row| row.text)
             .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewAction {
+    None,
+    Quit,
+    FoldStateChanged,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct FoldState {
+    folded: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FoldStateStore {
+    path: PathBuf,
+}
+
+impl FoldStateStore {
+    fn for_current_ref() -> io::Result<Option<Self>> {
+        Self::for_current_ref_in(None)
+    }
+
+    fn for_current_ref_in(cwd: Option<&Path>) -> io::Result<Option<Self>> {
+        let Some(ref_name) = current_git_ref(cwd)? else {
+            return Ok(None);
+        };
+        let Some(git_dir) = git_output(cwd, &["rev-parse", "--absolute-git-dir"])? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            path: PathBuf::from(git_dir).join("sidreview").join(ref_name),
+        }))
+    }
+
+    fn load(&self) -> io::Result<Option<FoldState>> {
+        let payload = match fs::read(&self.path) {
+            Ok(payload) => payload,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        serde_json::from_slice(&payload)
+            .map(Some)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    fn save(&self, state: &FoldState) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut payload = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+        payload.push(b'\n');
+        let temp_path = self.path.with_extension("tmp");
+        fs::write(&temp_path, payload)?;
+        fs::rename(temp_path, &self.path)
+    }
+}
+
+fn current_git_ref(cwd: Option<&Path>) -> io::Result<Option<String>> {
+    if let Some(ref_name) = git_output(cwd, &["symbolic-ref", "-q", "HEAD"])? {
+        return Ok(Some(ref_name));
+    }
+    let Some(tag_refs) = git_output(
+        cwd,
+        &[
+            "for-each-ref",
+            "--points-at",
+            "HEAD",
+            "--format=%(refname)",
+            "refs/tags",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(tag_refs
+        .lines()
+        .find(|line| *line == "refs/tags/latest")
+        .or_else(|| tag_refs.lines().next())
+        .map(str::to_string))
+}
+
+fn git_output(cwd: Option<&Path>, args: &[&str]) -> io::Result<Option<String>> {
+    let mut command = Command::new("git");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = match command.args(args).output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
     }
 }
 
@@ -624,6 +779,42 @@ fn display_lineno(lineno: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> io::Result<Self> {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("sidreview-{name}-{}-{unique}", process::id()));
+            fs::create_dir(&path)?;
+            let path = fs::canonicalize(path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
 
     const TWO_HUNKS: &str = "\
 diff --git a/a.rs b/a.rs
@@ -920,6 +1111,91 @@ index 0000000..1111111
                     text: "  11   11   keep_two".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn fold_state_round_trips_as_json() {
+        let temp = TestDir::new("fold-json").unwrap();
+        let store = FoldStateStore {
+            path: temp.path.join(".git/sidreview/refs/heads/main"),
+        };
+
+        let mut app = ReviewApp::from_input(TWO_HUNKS);
+        app.select_next();
+        assert_eq!(app.toggle_selected_fold(), ReviewAction::FoldStateChanged);
+        store.save(&app.fold_state()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"folded": ["a.rs @@ -10,2 +10,2 @@"]}));
+
+        let mut restored = ReviewApp::from_input(TWO_HUNKS);
+        restored.apply_fold_state(&store.load().unwrap().unwrap());
+        assert!(!restored.blocks[0].folded);
+        assert!(restored.blocks[1].folded);
+    }
+
+    #[test]
+    fn fold_state_save_records_unfolds() {
+        let temp = TestDir::new("fold-unfold").unwrap();
+        let store = FoldStateStore {
+            path: temp.path.join(".git/sidreview/refs/heads/main"),
+        };
+
+        let mut app = ReviewApp::from_input(TWO_HUNKS);
+        app.toggle_selected_fold();
+        app.toggle_selected_fold();
+        store.save(&app.fold_state()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"folded": []}));
+    }
+
+    #[test]
+    fn fold_state_store_uses_current_branch_ref() {
+        let temp = TestDir::new("branch-ref").unwrap();
+        if !run_git(&temp.path, &["init"]) {
+            return;
+        }
+        assert!(run_git(&temp.path, &["checkout", "-b", "main"]));
+
+        let store = FoldStateStore::for_current_ref_in(Some(&temp.path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.path, temp.path.join(".git/sidreview/refs/heads/main"));
+    }
+
+    #[test]
+    fn fold_state_store_uses_exact_tag_ref_for_detached_head() {
+        let temp = TestDir::new("tag-ref").unwrap();
+        if !run_git(&temp.path, &["init"]) {
+            return;
+        }
+        assert!(run_git(&temp.path, &["checkout", "-b", "main"]));
+        assert!(run_git(
+            &temp.path,
+            &[
+                "-c",
+                "user.name=sidreview test",
+                "-c",
+                "user.email=sidreview@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ));
+        assert!(run_git(&temp.path, &["tag", "latest"]));
+        assert!(run_git(&temp.path, &["checkout", "latest"]));
+
+        let store = FoldStateStore::for_current_ref_in(Some(&temp.path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.path,
+            temp.path.join(".git/sidreview/refs/tags/latest")
         );
     }
 
