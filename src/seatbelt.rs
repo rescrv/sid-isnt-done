@@ -75,7 +75,14 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 ///
 /// These cover the user's source tree, the standard Rust toolchain and package
 /// cache locations used by `cargo`, and common Git configuration locations.
-const HOME_READ_SUBPATHS: &[&str] = &[".cargo", ".config/git", ".rustup", "src"];
+const HOME_READ_SUBPATHS: &[&str] = &[".cache", ".cargo", ".config/git", ".rustup", "src"];
+
+/// Home-directory subpaths that a sandboxed process may both read and write.
+///
+/// The XDG cache directory (`~/.cache`) is used by a wide range of tools to
+/// persist regenerable artifacts; permitting writes here keeps those tools
+/// working without exposing the rest of the home directory.
+const HOME_WRITE_SUBPATHS: &[&str] = &[".cache"];
 
 /// Individual home-directory files kept readable inside the sandbox.
 const HOME_READ_FILES: &[&str] = &[
@@ -619,6 +626,16 @@ fn collect_read_roots(
     read_roots
 }
 
+fn collect_home_write_roots(home_dir: Option<&Path>) -> BTreeSet<String> {
+    let mut write_roots = BTreeSet::new();
+    if let Some(home_dir) = home_dir {
+        for suffix in HOME_WRITE_SUBPATHS {
+            append_path_variants(&mut write_roots, &home_dir.join(suffix));
+        }
+    }
+    write_roots
+}
+
 fn append_read_rules(
     policy: &mut String,
     writable_roots: &WritableRoots,
@@ -646,8 +663,9 @@ fn home_dir() -> Option<PathBuf> {
 ///
 /// Writable roots always become write rules.  Read rules are generated from a
 /// fixed home-directory allowlist plus writable roots that are not under
-/// disallowed locations in the user's home directory.  Path strings are
-/// escaped to prevent SBPL injection.  The per-user cache and temp roots
+/// disallowed locations in the user's home directory.  The home cache
+/// directory (`~/.cache`) is always both readable and writable.  Path strings
+/// are escaped to prevent SBPL injection.  The per-user cache and temp roots
 /// remain `sandbox-exec` parameters.
 pub fn build_policy(writable_roots: &WritableRoots) -> String {
     build_policy_with_home(writable_roots, home_dir().as_deref())
@@ -675,17 +693,22 @@ fn build_policy_with_home_and_read_roots(
 ) -> String {
     let roots = writable_roots.as_slice();
     let read_roots = collect_read_roots(writable_roots, extra_read_roots, home_dir);
+    let home_write_roots = collect_home_write_roots(home_dir);
     let mut policy = String::with_capacity(
         POLICY_PREAMBLE.len()
             + POLICY_BEFORE_WRITE_RULES.len()
             + POLICY_AFTER_WRITE_RULES.len()
             + read_roots.len() * 128
-            + roots.len() * 64,
+            + (roots.len() + home_write_roots.len()) * 64,
     );
     policy.push_str(POLICY_PREAMBLE);
     append_read_rules(&mut policy, writable_roots, extra_read_roots, home_dir);
     policy.push_str(POLICY_BEFORE_WRITE_RULES);
     for root in roots {
+        let escaped = escape_sbpl_string(root);
+        policy.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
+    }
+    for root in &home_write_roots {
         let escaped = escape_sbpl_string(root);
         policy.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
     }
@@ -853,6 +876,22 @@ mod tests {
         assert!(policy.contains("(subpath \"/Users/tester/.gitconfig\")"));
         assert!(policy.contains("(subpath \"/Users/tester/.rustup\")"));
         assert!(policy.contains("(subpath \"/Users/tester/src\")"));
+    }
+
+    #[test]
+    fn build_policy_allows_reading_and_writing_home_cache() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(
+            policy.contains(
+                "(allow file-read* file-test-existence (subpath \"/Users/tester/.cache\"))"
+            ),
+            "home cache must be readable"
+        );
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/Users/tester/.cache\"))"),
+            "home cache must be writable"
+        );
     }
 
     #[test]
