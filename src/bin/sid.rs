@@ -27,12 +27,12 @@ use sid_isnt_done::config::{
     AGENTS_CONF_FILE, AnthropicConfig, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
 };
 use sid_isnt_done::raw_mode::{RawInput, RawServer, RawToolOutputObserver, RawUsageReportObserver};
-use sid_isnt_done::render::PlainTextRenderer;
 use sid_isnt_done::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawEvent, RawHello, RawPrompt, RawRequest, RawRequestEnvelope,
     RawResultEnvelope, RawServerMessage, install_tool_output_observer,
     install_usage_report_observer,
 };
+use sid_isnt_done::render::PlainTextRenderer;
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, append_resumed_bash_reset_marker, compacted_transcript,
     extract_last_assistant_text, sanitize_transcript_messages, seatbelt, session,
@@ -1503,12 +1503,10 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                         }
                         ChatCommand::Effort(effort) => {
                             session.set_effort(Some(effort));
-                            let label = match effort {
-                                Effort::Low => "low",
-                                Effort::Medium => "medium",
-                                Effort::High => "high",
-                            };
-                            terminal.print_info(&context, &format!("Effort level set to {label}."));
+                            terminal.print_info(
+                                &context,
+                                &format!("Effort level set to {}.", effort_name(effort)),
+                            );
                         }
                         ChatCommand::ClearEffort => {
                             session.set_effort(None);
@@ -3015,6 +3013,8 @@ fn effort_name(effort: Effort) -> &'static str {
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
     }
 }
 
@@ -3338,9 +3338,7 @@ fn parse_confirmation(input: &str) -> Option<bool> {
 fn describe_thinking(stats: &SessionStats) -> String {
     if stats.thinking_adaptive {
         match stats.effort {
-            Some(Effort::Low) => "adaptive (effort: low)".to_string(),
-            Some(Effort::Medium) => "adaptive (effort: medium)".to_string(),
-            Some(Effort::High) => "adaptive (effort: high)".to_string(),
+            Some(effort) => format!("adaptive (effort: {})", effort_name(effort)),
             None => "adaptive".to_string(),
         }
     } else {

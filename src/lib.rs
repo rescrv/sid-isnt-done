@@ -21,12 +21,12 @@ pub mod containers;
 mod filesystem;
 /// Socket listener transport for `sid --listen`.
 pub mod raw_listen;
-/// Human-readable tool-call rendering for terminal output.
-pub mod render;
 /// JSONL transport utilities for `sid --raw`.
 pub mod raw_mode;
 /// JSONL protocol types and raw-mode support hooks.
 pub mod raw_protocol;
+/// Human-readable tool-call rendering for terminal output.
+pub mod render;
 mod retry;
 /// macOS Seatbelt sandbox integration.
 pub mod seatbelt;
@@ -668,7 +668,7 @@ impl SidAgent {
         }
 
         if let (Some(renderer), Some(stream_context), Some(stream_tool_use_id)) =
-            (renderer.as_deref_mut(), stream_context, stream_tool_use_id)
+            (renderer, stream_context, stream_tool_use_id)
         {
             let Some(session) = session_slot.as_mut() else {
                 return Err(bash_session_missing_error());

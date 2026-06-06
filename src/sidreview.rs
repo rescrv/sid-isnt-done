@@ -68,12 +68,10 @@ fn run_app(
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
+            && app.handle_key(key.code) == ReviewAction::FoldStateChanged
+            && let Some(store) = fold_store
         {
-            if app.handle_key(key.code) == ReviewAction::FoldStateChanged
-                && let Some(store) = fold_store
-            {
-                store.save(&app.fold_state())?;
-            }
+            store.save(&app.fold_state())?;
         }
     }
 }
