@@ -358,13 +358,21 @@ impl SidSession {
             let root = sessions_root.join(&timestamp.id);
             match fs::create_dir(&root) {
                 Ok(()) => {
-                    return Self::from_created_root(
+                    let result = Self::from_created_root(
                         timestamp,
                         sessions_root,
-                        root,
+                        root.clone(),
                         workspace_root.clone(),
                         provenance.clone(),
                     );
+                    if result.is_err() {
+                        // Roll back the partially-initialized session directory so a
+                        // failed creation never leaves an orphan behind (in
+                        // particular one with metadata but no session_start event,
+                        // which find_latest_for_workspace would happily resume).
+                        let _ = fs::remove_dir_all(&root);
+                    }
+                    return result;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
