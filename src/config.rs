@@ -285,7 +285,7 @@ impl AgentConfig {
                     system_prompt.paths.clone(),
                     Some(system_prompt.markdown.clone()),
                 )
-            } else if default_prompt_path.exists() {
+            } else if path_exists(&default_prompt_path) {
                 (
                     default_prompt_path.clone(),
                     vec![default_prompt_path.clone()],
@@ -434,7 +434,7 @@ fn resolve_tool_configs(
         };
 
         let manifest_path = tools_dir.join(format!("{canonical_id}.json")).into_owned();
-        let manifest = if manifest_path.is_file() {
+        let manifest = if path_is_file(&manifest_path) {
             Some(load_tool_manifest(canonical_id, &manifest_path)?)
         } else if builtin_tool_manifest_is_optional(canonical_id) {
             None
@@ -839,14 +839,24 @@ fn require_file_with_code(
     name: &str,
     path_field: &str,
 ) -> Result<(), SError> {
-    if path.is_file() {
-        Ok(())
-    } else {
-        Err(SError::new("config")
+    match path.is_file() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SError::new("config")
             .with_code(code)
             .with_message(message)
             .with_string_field(name_field, name)
-            .with_string_field(path_field, path.as_str()))
+            .with_string_field(path_field, path.as_str())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(SError::new("config")
+            .with_code(code)
+            .with_message(message)
+            .with_string_field(name_field, name)
+            .with_string_field(path_field, path.as_str())),
+        Err(err) => Err(SError::new("config")
+            .with_code("io_error")
+            .with_message("failed to inspect config file")
+            .with_string_field(name_field, name)
+            .with_string_field(path_field, path.as_str())
+            .with_string_field("cause", &err.to_string())),
     }
 }
 
@@ -897,7 +907,7 @@ fn load_named_prompts(
 fn resolve_agent_prompt_path(agents_dir: &Path, rc_conf: &RcConf, agent: &str) -> Path<'static> {
     for candidate in rc_conf.alias_lookup_order(agent).0 {
         let path = agents_dir.join(format!("{candidate}.md")).into_owned();
-        if path.is_file() {
+        if path_is_file(&path) {
             return path;
         }
     }
@@ -939,7 +949,7 @@ fn resolve_prompt_paths(
                 format!("prompt path {component:?} is not valid UTF-8: {err:?}"),
             )
         })?;
-        if !path.is_file() {
+        if !path_is_file(&path) {
             return Err(SError::new("config")
                 .with_code("missing_prompt_file")
                 .with_message("configured prompt markdown file does not exist")
@@ -958,6 +968,14 @@ fn resolve_prompt_paths(
         ));
     }
     Ok(paths)
+}
+
+fn path_exists(path: &Path) -> bool {
+    path.exists().unwrap_or(false)
+}
+
+fn path_is_file(path: &Path) -> bool {
+    path.is_file().unwrap_or(false)
 }
 
 fn resolve_prompt_path_component(config_root: &Path, component: &str) -> std::path::PathBuf {

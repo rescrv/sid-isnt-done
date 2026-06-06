@@ -19,9 +19,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "arrrg"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eda3694a24280f421624896fb2569652f70b913a3878a19fa71fb318b8b5b469"
+checksum = "a0bd7359e48a0191f6baed1ac38a32617f95df16a7a4e042b1b6745b2c5692a4"
 dependencies = [
  "arrrg_derive",
  "getopts",
@@ -29,9 +29,9 @@ dependencies = [
 
 [[package]]
 name = "arrrg_derive"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4585f9b46f3fcc3bf7d30760a7cc9ca854a5646b62d10ba8e53c045b1541451f"
+checksum = "46e1e7c77dc97a128996bac1b44c16126db0529158528c61bcaaa11ddb36e506"
 dependencies = [
  "derive_util",
  "proc-macro2",
@@ -68,7 +68,16 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ddd039cbff0bc4f970b7d66a0387fe82636d538a9c8f6f4da46c3d6b0757962"
 dependencies = [
- "sig_fig_histogram",
+ "sig_fig_histogram 0.7.0",
+]
+
+[[package]]
+name = "biometrics"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf193ddd596699ae71581d7d22907e65fd9ad2a6f02e8e5efc85fb5e0b44694b"
+dependencies = [
+ "sig_fig_histogram 0.8.0",
 ]
 
 [[package]]
@@ -140,22 +149,20 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "claudius"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5efb070e75dd9e048fc04668f8b0d965a6feb0ac7a5820138afa61f5e4ce1711"
+version = "0.31.0"
 dependencies = [
  "arrrg",
  "arrrg_derive",
  "async-trait",
  "base64",
- "biometrics",
+ "biometrics 0.14.0",
  "bytes",
  "ctrlc",
  "futures",
  "getopts",
  "libc",
  "reqwest",
- "rustyline",
+ "rustyline 18.0.0",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -340,9 +347,9 @@ dependencies = [
 
 [[package]]
 name = "derive_util"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3a9876c3067abf7869e80b7b69ed32ef2fa2fda5a7e5f91cb838447e2fd096"
+checksum = "51816aa9de22f9b37a46a94c23b3284f4d8e43361f5a1a49ed60d8cccacb08ff"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -402,6 +409,12 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "endian-type"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "equivalent"
@@ -614,7 +627,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbb2b49e23e8185f53b614cb374f0df660ec92b0009fdd9d211c7f1fcf52851"
 dependencies = [
- "biometrics",
+ "biometrics 0.13.0",
 ]
 
 [[package]]
@@ -953,9 +966,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "line-clipping"
@@ -1248,7 +1261,17 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c069c179fcdc6a2fe24d8d18305cf085fdbd4f922c041943e203685d6a1c58fd"
 dependencies = [
- "endian-type",
+ "endian-type 0.1.2",
+ "nibble_vec",
+]
+
+[[package]]
+name = "radix_trie"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b4431027dcd37fc2a73ef740b5f233aa805897935b8bce0195e41bbf9a3289a"
+dependencies = [
+ "endian-type 0.2.0",
  "nibble_vec",
 ]
 
@@ -1317,11 +1340,11 @@ dependencies = [
 
 [[package]]
 name = "rc_conf"
-version = "0.14.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1317ea6d66d2b88aeb4c8b4019314c663269be39316b0d8b997029cbf64ae83"
+checksum = "67fb57408ef3d6b4f5439c26a193fd5158de74ce3710ab3bda67ed583c33b068"
 dependencies = [
- "biometrics",
+ "biometrics 0.14.0",
  "shvar",
  "utf8path",
 ]
@@ -1366,9 +1389,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reqwest"
-version = "0.13.2"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
@@ -1455,11 +1478,32 @@ dependencies = [
  "log",
  "memchr",
  "nix 0.30.1",
- "radix_trie",
+ "radix_trie 0.2.1",
  "unicode-segmentation",
  "unicode-width",
  "utf8parse",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "rustyline"
+version = "18.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a990b25f351b25139ddc7f21ee3f6f56f86d6846b74ac8fad3a719a287cd4a0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "clipboard-win",
+ "home",
+ "libc",
+ "log",
+ "memchr",
+ "nix 0.31.2",
+ "radix_trie 0.3.0",
+ "unicode-segmentation",
+ "unicode-width",
+ "utf8parse",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1544,9 +1588,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "indexmap",
  "itoa",
@@ -1583,9 +1627,9 @@ dependencies = [
 
 [[package]]
 name = "setsum"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fefd906d1fd2cb72c99cdd6de5dafbed6a2a1cd5b652778c587e134b0ff93287"
+checksum = "0122e6b6da18bf35920eaa52ce8f66528f255a3bf7a72311fc1c6e079234b6a8"
 dependencies = [
  "sha3",
 ]
@@ -1608,9 +1652,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shvar"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92d5418f3474aeaacebcd76b944c6aa903d23dc6040d7c1c4ae37d4f7ab1aea5"
+checksum = "f82993487a0ae32810febb62bd73cb7e010375f730088ddf76afcb4bdc12ffba"
 
 [[package]]
 name = "sid-isnt-done"
@@ -1629,7 +1673,7 @@ dependencies = [
  "ratatui",
  "rc_conf",
  "regex",
- "rustyline",
+ "rustyline 17.0.2",
  "serde",
  "serde_json",
  "setsum",
@@ -1648,6 +1692,12 @@ name = "sig_fig_histogram"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a40db928c2ca27031a2bbbc4194cbbf1e0602b8109d4eff103e95d8f3b53578d"
+
+[[package]]
+name = "sig_fig_histogram"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8eb9b8c3a3af35c531d0963c516adadea3f464efdcc8bdd1c9db50d95d3b77"
 
 [[package]]
 name = "signal-hook"
@@ -1887,9 +1937,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.51.1"
+version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
  "bytes",
  "libc",
@@ -2123,9 +2173,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utf8path"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a2b00318057c4570f7b8de9a962f76b0639bfb0b229fe5b69ad950ef4c53db3"
+checksum = "d30e170854b782fbdba8314945783b756fe12e07572c612c6b7be15990fc449e"
 
 [[package]]
 name = "vcpkg"

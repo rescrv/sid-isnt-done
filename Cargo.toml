@@ -27,14 +27,14 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 
-arrrg = "^0.9"
-arrrg_derive = "^0.9"
-claudius = { version = "^0.30" }
+arrrg = "^0.10"
+arrrg_derive = "^0.10"
+claudius = { version = "^0.31", path = "../claudius" }
 handled = { version = "^0.7" }
-rc_conf = { version = "^0.14", default-features = false }
-setsum = "^0.8"
-shvar = "^0.9"
-utf8path = "^0.10"
+rc_conf = { version = "^0.18", default-features = false }
+setsum = "^0.9"
+shvar = "^0.10"
+utf8path = "^0.11"
 
 [[bin]]
 name = "sid"

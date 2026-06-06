@@ -231,7 +231,7 @@ fn resolve_agent_executable_path(
 ) -> Path<'static> {
     for candidate in rc_conf.alias_lookup_order(service_name).0 {
         let path = agents_dir.join(candidate).into_owned();
-        if path.is_file() {
+        if utf8_path_is_file(&path) {
             return path;
         }
     }
@@ -239,7 +239,7 @@ fn resolve_agent_executable_path(
 }
 
 fn require_hook_executable(service_name: &str, path: &Path) -> Result<(), SError> {
-    if !path.is_file() {
+    if !utf8_path_is_file(path) {
         return Err(user_instruction_config_error(
             "missing_user_instructions_hook",
             "configured user-instructions hook executable does not exist",
@@ -295,7 +295,7 @@ fn resolve_agents_md_files(
         .filter(|component| !component.is_empty())
     {
         let resolved = resolve_agents_md_component(component, workspace_root)?;
-        if resolved.path.is_file() {
+        if std_path_is_file(&resolved.path) {
             if resolved.workspace_relative {
                 require_workspace_relative_agents_md_file(
                     component,
@@ -307,6 +307,14 @@ fn resolve_agents_md_files(
         }
     }
     Ok(files)
+}
+
+fn utf8_path_is_file(path: &Path) -> bool {
+    path.is_file().unwrap_or(false)
+}
+
+fn std_path_is_file(path: &StdPath) -> bool {
+    path.is_file()
 }
 
 fn resolve_agents_md_component(

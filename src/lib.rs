@@ -550,8 +550,9 @@ impl SidAgent {
         command: &str,
         restart: bool,
     ) -> Result<String, std::io::Error> {
-        self.run_bash_command_with_renderer(Some(command), restart, None)
+        self.run_bash_command_with_renderer(Some(command), restart, None, None, None)
             .await
+            .map(|output| output.text)
     }
 
     /// Execute a bash command in the agent's PTY session, streaming output to `renderer`.
@@ -569,16 +570,19 @@ impl SidAgent {
         restart: bool,
         renderer: &mut dyn Renderer,
     ) -> Result<String, std::io::Error> {
-        self.run_bash_command_with_renderer(Some(command), restart, Some(renderer))
+        self.run_bash_command_with_renderer(Some(command), restart, Some(renderer), None, None)
             .await
+            .map(|output| output.text)
     }
 
     async fn run_bash_command_with_renderer(
         &self,
         command: Option<&str>,
         restart: bool,
-        renderer: Option<&mut dyn Renderer>,
-    ) -> Result<String, std::io::Error> {
+        mut renderer: Option<&mut dyn Renderer>,
+        stream_context: Option<&dyn StreamContext>,
+        stream_tool_use_id: Option<&str>,
+    ) -> Result<BashCommandOutput, std::io::Error> {
         let Some(binding) = self.builtin_bindings.bash.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -613,7 +617,7 @@ impl SidAgent {
                     "bash",
                     &serde_json::Value::Object(input_value),
                     None,
-                    renderer,
+                    &mut renderer,
                 ) {
                     Ok(ManualToolConfirmation::Allow) => {}
                     Ok(ManualToolConfirmation::Deny) => {
@@ -635,33 +639,75 @@ impl SidAgent {
             }
         }
 
-        let mut session = self.bash_session.lock().await;
+        let mut session_slot = self.bash_session.lock().await;
         if restart {
-            *session = None;
+            *session_slot = None;
         }
         let Some(command) = command else {
             if restart {
-                return Ok(BASH_CONSOLE_RESET_MESSAGE.to_string());
+                let text = BASH_CONSOLE_RESET_MESSAGE.to_string();
+                let streamed = stream_bash_result_text(
+                    &mut renderer,
+                    stream_context,
+                    stream_tool_use_id,
+                    &text,
+                );
+                return Ok(BashCommandOutput { text, streamed });
             }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "bash requires a command unless restart is true",
             ));
         };
-        if session.is_none() {
-            *session = Some(self.spawn_bash_session().await?);
+        if session_slot.is_none() {
+            *session_slot = Some(self.spawn_bash_session().await?);
+        }
+
+        if let (Some(renderer), Some(stream_context), Some(stream_tool_use_id)) =
+            (renderer.as_deref_mut(), stream_context, stream_tool_use_id)
+        {
+            let Some(session) = session_slot.as_mut() else {
+                return Err(bash_session_missing_error());
+            };
+            let mut streamer =
+                BashToolResultStreamer::new(renderer, stream_context, stream_tool_use_id);
+            let result = run_bash_pty_with_streamer(session, command, &mut streamer).await;
+            return match result {
+                Ok(result) => match render_bash_pty_result(result) {
+                    Ok(text) => {
+                        if text == "success\n" && !streamer.started() {
+                            streamer.emit_text(&text);
+                        }
+                        let streamed = streamer.started();
+                        streamer.finish_if_started();
+                        Ok(BashCommandOutput { text, streamed })
+                    }
+                    Err(err) => {
+                        streamer.finish_if_started();
+                        Err(err)
+                    }
+                },
+                Err(err) => {
+                    streamer.finish_if_started();
+                    *session_slot = None;
+                    Err(err)
+                }
+            };
         }
 
         let result = {
-            let session = session
-                .as_mut()
-                .expect("bash PTY session should be initialized");
+            let Some(session) = session_slot.as_mut() else {
+                return Err(bash_session_missing_error());
+            };
             session.run(command, false).await
         };
         match result {
-            Ok(result) => render_bash_pty_result(result),
+            Ok(result) => render_bash_pty_result(result).map(|text| BashCommandOutput {
+                text,
+                streamed: false,
+            }),
             Err(err) => {
-                *session = None;
+                *session_slot = None;
                 Err(err)
             }
         }
@@ -1905,7 +1951,8 @@ impl SidBashCallback {
         agent: &SidAgent,
         tool_use: &ToolUseBlock,
         renderer: Option<&mut dyn Renderer>,
-    ) -> ToolResult {
+        stream_context: Option<&AgentStreamContext>,
+    ) -> ComputedToolResult {
         #[derive(serde::Deserialize)]
         struct BashInput {
             #[serde(default)]
@@ -1916,15 +1963,26 @@ impl SidBashCallback {
 
         let bash: BashInput = match serde_json::from_value(tool_use.input.clone()) {
             Ok(input) => input,
-            Err(err) => return tool_error_result(&tool_use.id, err.to_string()),
+            Err(err) => {
+                return ComputedToolResult::new(tool_error_result(&tool_use.id, err.to_string()));
+            }
         };
 
         match agent
-            .run_bash_command_with_renderer(bash.command.as_deref(), bash.restart, renderer)
+            .run_bash_command_with_renderer(
+                bash.command.as_deref(),
+                bash.restart,
+                renderer,
+                stream_context.map(|context| context as &dyn StreamContext),
+                stream_context.map(|_| tool_use.id.as_str()),
+            )
             .await
         {
-            Ok(output) => tool_success_result(&tool_use.id, output),
-            Err(err) => tool_error_result(&tool_use.id, err.to_string()),
+            Ok(output) => ComputedToolResult::with_render_result(
+                tool_success_result(&tool_use.id, output.text),
+                !output.streamed,
+            ),
+            Err(err) => ComputedToolResult::new(tool_error_result(&tool_use.id, err.to_string())),
         }
     }
 }
@@ -1937,7 +1995,7 @@ impl ToolCallback<SidAgent> for SidBashCallback {
         agent: &SidAgent,
         tool_use: &ToolUseBlock,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(Self::compute(agent, tool_use, None).await)
+        Box::new(Self::compute(agent, tool_use, None, None).await)
     }
 
     async fn compute_tool_result_streaming(
@@ -1946,9 +2004,9 @@ impl ToolCallback<SidAgent> for SidBashCallback {
         agent: &SidAgent,
         tool_use: &ToolUseBlock,
         renderer: &mut dyn Renderer,
-        _context: &AgentStreamContext,
+        context: &AgentStreamContext,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(Self::compute(agent, tool_use, Some(renderer)).await)
+        Box::new(Self::compute(agent, tool_use, Some(renderer), Some(context)).await)
     }
 
     async fn apply_tool_result(
@@ -2656,7 +2714,7 @@ async fn confirm_manual_prepared_tool_call(
     confirm_preview: bool,
     prepared: &tool_runtime::PreparedRcToolInvocation,
     session: Option<&SidSession>,
-    renderer: Option<&mut dyn Renderer>,
+    mut renderer: Option<&mut dyn Renderer>,
 ) -> Result<ManualToolConfirmation, String> {
     let preview = if confirm_preview {
         tool_runtime::render_rc_tool_confirmation_preview(prepared, session)
@@ -2665,14 +2723,14 @@ async fn confirm_manual_prepared_tool_call(
     } else {
         None
     };
-    confirm_manual_tool_call(tool_name, input, preview.as_deref(), renderer)
+    confirm_manual_tool_call(tool_name, input, preview.as_deref(), &mut renderer)
 }
 
 fn confirm_manual_tool_call(
     tool_name: &str,
     input: &serde_json::Value,
     preview: Option<&str>,
-    mut renderer: Option<&mut dyn Renderer>,
+    renderer: &mut Option<&mut dyn Renderer>,
 ) -> Result<ManualToolConfirmation, String> {
     let input_display = preview.map(str::to_string).unwrap_or_else(|| {
         serde_json::to_string_pretty(input).unwrap_or_else(|_| format!("{input:?}"))
@@ -2681,7 +2739,7 @@ fn confirm_manual_tool_call(
     loop {
         let prompt =
             format!("Tool '{tool_name}' is MANUAL.\n{input_display}\nAllow this call? [yes/no]: ");
-        let input = read_operator_line(&mut renderer, &prompt)?;
+        let input = read_operator_line(renderer, &prompt)?;
         let ManualToolInput::Line(buf) = input else {
             return Ok(ManualToolConfirmation::Cancel);
         };
@@ -2737,6 +2795,123 @@ fn read_operator_line(
             "failed to read manual-tool confirmation input: {err}"
         )),
     }
+}
+
+struct BashCommandOutput {
+    text: String,
+    streamed: bool,
+}
+
+struct BashToolResultStreamer<'a> {
+    renderer: &'a mut dyn Renderer,
+    context: &'a dyn StreamContext,
+    tool_use_id: &'a str,
+    started: bool,
+    emitted_line: bool,
+}
+
+impl<'a> BashToolResultStreamer<'a> {
+    fn new(
+        renderer: &'a mut dyn Renderer,
+        context: &'a dyn StreamContext,
+        tool_use_id: &'a str,
+    ) -> Self {
+        Self {
+            renderer,
+            context,
+            tool_use_id,
+            started: false,
+            emitted_line: false,
+        }
+    }
+
+    fn started(&self) -> bool {
+        self.started
+    }
+
+    fn emit_line(&mut self, line: &str) {
+        let text = strip_ansi_escapes(line);
+        if text.is_empty() && !line.is_empty() {
+            return;
+        }
+        self.ensure_started();
+        if self.emitted_line {
+            self.renderer.print_tool_result_text(self.context, "\n");
+        }
+        self.renderer.print_tool_result_text(self.context, &text);
+        self.emitted_line = true;
+    }
+
+    fn emit_text(&mut self, text: &str) {
+        self.ensure_started();
+        self.renderer.print_tool_result_text(self.context, text);
+        self.emitted_line = true;
+    }
+
+    fn finish_if_started(&mut self) {
+        if self.started {
+            self.renderer.finish_tool_result(self.context);
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if !self.started {
+            self.renderer
+                .start_tool_result(self.context, self.tool_use_id, false);
+            self.started = true;
+        }
+    }
+}
+
+async fn run_bash_pty_with_streamer(
+    session: &mut BashPtySession,
+    command: &str,
+    streamer: &mut BashToolResultStreamer<'_>,
+) -> Result<BashPtyResult, std::io::Error> {
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut run = Box::pin(session.run_with_output_channel(command, false, output_tx));
+    let mut output_open = true;
+
+    loop {
+        tokio::select! {
+            result = &mut run => {
+                while let Ok(line) = output_rx.try_recv() {
+                    streamer.emit_line(&line);
+                }
+                return result;
+            }
+            line = output_rx.recv(), if output_open => {
+                match line {
+                    Some(line) => streamer.emit_line(&line),
+                    None => output_open = false,
+                }
+            }
+        }
+    }
+}
+
+fn bash_session_missing_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "bash PTY session was not initialized",
+    )
+}
+
+fn stream_bash_result_text(
+    renderer: &mut Option<&mut dyn Renderer>,
+    context: Option<&dyn StreamContext>,
+    tool_use_id: Option<&str>,
+    text: &str,
+) -> bool {
+    let (Some(renderer), Some(context), Some(tool_use_id)) =
+        (renderer.as_deref_mut(), context, tool_use_id)
+    else {
+        return false;
+    };
+    renderer.start_tool_result(context, tool_use_id, false);
+    renderer.print_tool_result_text(context, text);
+    renderer.finish_tool_result(context);
+    true
 }
 
 fn parse_tool_confirmation(input: &str) -> Option<bool> {
@@ -2997,7 +3172,8 @@ fn append_writable_root(roots: &mut WritableRoots, root: &std::path::Path) {
 }
 
 fn workspace_has_config(root: &Path) -> bool {
-    root.join(AGENTS_CONF_FILE).is_file() || root.join(TOOLS_CONF_FILE).is_file()
+    root.join(AGENTS_CONF_FILE).is_file().unwrap_or(false)
+        || root.join(TOOLS_CONF_FILE).is_file().unwrap_or(false)
 }
 
 /// Determine the default agent to use when none is explicitly requested.
@@ -4041,9 +4217,10 @@ compact_TOOLS='bash'
             OperatorLine::Line("maybe".to_string()),
             OperatorLine::Line("yes".to_string()),
         ]);
+        let mut renderer_ref = Some(&mut renderer as &mut dyn Renderer);
 
         assert_eq!(
-            confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap(),
+            confirm_manual_tool_call("bash", &input, None, &mut renderer_ref).unwrap(),
             ManualToolConfirmation::Allow
         );
         assert_eq!(renderer.prompts.len(), 2);
@@ -4054,9 +4231,10 @@ compact_TOOLS='bash'
     fn manual_tool_confirmation_interrupted_renderer_cancels() {
         let input = json!({ "command": "pwd" });
         let mut renderer = ScriptedRenderer::new([OperatorLine::Interrupted]);
+        let mut renderer_ref = Some(&mut renderer as &mut dyn Renderer);
 
         assert_eq!(
-            confirm_manual_tool_call("bash", &input, None, Some(&mut renderer)).unwrap(),
+            confirm_manual_tool_call("bash", &input, None, &mut renderer_ref).unwrap(),
             ManualToolConfirmation::Cancel
         );
         assert_eq!(renderer.prompts.len(), 1);
@@ -5169,6 +5347,35 @@ esac
     }
 
     #[test]
+    fn builtin_bash_tool_streams_pty_output_to_renderer_once() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut renderer = RecordingRenderer::default();
+
+        let result = invoke_bash_tool_streaming(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_stream",
+            json!({
+                "command": "printf 'first\\n'; printf 'second\\n'",
+                "restart": true
+            }),
+            &mut renderer,
+        );
+
+        assert_eq!(unwrap_success_text(result), "first\nsecond");
+        assert_eq!(renderer.output, "first\nsecond");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn resumed_session_starts_with_fresh_bash_state() {
         let root = temp_config_root("agent");
         write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
@@ -5935,14 +6142,40 @@ format_ALIASES="fmt"
         tool_use_id: &str,
         input: serde_json::Value,
     ) -> ToolResult {
-        let tool = runtime
+        let tool_use = ToolUseBlock::new(tool_use_id, "bash", input);
+        let Some(tool) = runtime
             .block_on(agent.tools())
             .into_iter()
             .find(|tool| tool.name() == "bash")
-            .expect("agent should expose the builtin bash tool");
-        let tool_use = ToolUseBlock::new(tool_use_id, "bash", input);
+        else {
+            return tool_error_result(tool_use_id, "bash tool missing".to_string());
+        };
         let callback = tool.callback();
         let intermediate = runtime.block_on(callback.compute_tool_result(client, agent, &tool_use));
+        runtime.block_on(callback.apply_tool_result(client, agent, &tool_use, intermediate))
+    }
+
+    fn invoke_bash_tool_streaming(
+        runtime: &tokio::runtime::Runtime,
+        client: &Anthropic,
+        agent: &mut SidAgent,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        renderer: &mut dyn Renderer,
+    ) -> ToolResult {
+        let tool_use = ToolUseBlock::new(tool_use_id, "bash", input);
+        let Some(tool) = runtime
+            .block_on(agent.tools())
+            .into_iter()
+            .find(|tool| tool.name() == "bash")
+        else {
+            return tool_error_result(tool_use_id, "bash tool missing".to_string());
+        };
+        let context = AgentStreamContext::root("build").child("tool:bash");
+        let callback = tool.callback();
+        let intermediate = runtime.block_on(
+            callback.compute_tool_result_streaming(client, agent, &tool_use, renderer, &context),
+        );
         runtime.block_on(callback.apply_tool_result(client, agent, &tool_use, intermediate))
     }
 

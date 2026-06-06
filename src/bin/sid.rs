@@ -2587,7 +2587,11 @@ fn load_agent_summaries(
     config_root: &Path,
     current_agent_id: &str,
 ) -> Result<Vec<AgentSummary>, SError> {
-    if !config_root.join(AGENTS_CONF_FILE).is_file() && !config_root.join(TOOLS_CONF_FILE).is_file()
+    if !config_root
+        .join(AGENTS_CONF_FILE)
+        .is_file()
+        .unwrap_or(false)
+        && !config_root.join(TOOLS_CONF_FILE).is_file().unwrap_or(false)
     {
         return Ok(vec![AgentSummary {
             id: BUILTIN_AGENT_ID.to_string(),
