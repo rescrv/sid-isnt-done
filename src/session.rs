@@ -329,9 +329,25 @@ impl SidSession {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn create_in(sessions_root: PathBuf) -> Result<Self, SError> {
+    /// Create a fresh session under an explicit sessions root.
+    ///
+    /// Unlike [`Self::create`], this does not consult [`SID_SESSIONS_ENV`].
+    /// Callers that already resolved the session storage location can use this
+    /// to avoid process-environment coupling.
+    pub fn create_in(sessions_root: PathBuf) -> Result<Self, SError> {
         Self::create_in_with_provenance(sessions_root, None, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_workspace_in(
+        sessions_root: PathBuf,
+        workspace_root: &Path,
+    ) -> Result<Self, SError> {
+        Self::create_in_with_provenance(
+            sessions_root,
+            Some(workspace_root.as_str().to_string()),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -1206,10 +1222,11 @@ mod tests {
 
     #[test]
     fn session_create_with_workspace_persists_workspace_root() {
-        let config_root = unique_temp_dir("config-root");
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
         let workspace_root = unique_temp_dir("workspace-root");
         fs::create_dir_all(workspace_root.as_str()).unwrap();
-        let session = SidSession::create_with_workspace(&config_root, &workspace_root).unwrap();
+        let session =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_root).unwrap();
 
         let metadata: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(session.root().join(SESSION_METADATA_FILE)).unwrap(),
@@ -1217,7 +1234,7 @@ mod tests {
         .unwrap();
         assert_eq!(metadata["workspace_root"], json!(workspace_root.as_str()));
 
-        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
     }
 
@@ -1435,51 +1452,67 @@ mod tests {
 
     #[test]
     fn find_latest_for_workspace_prefers_newest_matching_workspace() {
-        let config_root = unique_temp_dir("config-root");
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
         let workspace_a = unique_temp_dir("workspace-a");
         let workspace_b = unique_temp_dir("workspace-b");
         fs::create_dir_all(workspace_a.as_str()).unwrap();
         fs::create_dir_all(workspace_b.as_str()).unwrap();
-        let older = SidSession::create_with_workspace(&config_root, &workspace_a).unwrap();
-        let _other = SidSession::create_with_workspace(&config_root, &workspace_b).unwrap();
-        let newer = SidSession::create_with_workspace(&config_root, &workspace_a).unwrap();
+        let older =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_a).unwrap();
+        let _other =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_b).unwrap();
+        let newer =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_a).unwrap();
 
-        let found = SidSession::find_latest_for_workspace(&config_root, &workspace_a)
-            .unwrap()
-            .unwrap();
+        let found = SidSession::find_latest_for_workspace_in(
+            sessions_root.clone(),
+            workspace_a.as_str(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(found.root(), newer.root());
         assert_ne!(found.root(), older.root());
 
-        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
         fs::remove_dir_all(PathBuf::from(workspace_a.as_str())).unwrap();
         fs::remove_dir_all(PathBuf::from(workspace_b.as_str())).unwrap();
     }
 
     #[test]
     fn find_latest_for_workspace_ignores_legacy_sessions_in_shared_sid_home() {
-        let config_root = unique_temp_dir("config-root");
+        let sessions_root = PathBuf::from(unique_temp_dir("sessions").as_str());
         let workspace_root = unique_temp_dir("workspace-root");
         fs::create_dir_all(workspace_root.as_str()).unwrap();
-        let session = SidSession::create_with_workspace(&config_root, &workspace_root).unwrap();
+        let session =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_root).unwrap();
         remove_workspace_root_metadata(session.root());
 
-        let found = SidSession::find_latest_for_workspace(&config_root, &workspace_root).unwrap();
+        let found = SidSession::find_latest_for_workspace_in(
+            sessions_root.clone(),
+            workspace_root.as_str(),
+            false,
+        )
+        .unwrap();
         assert!(found.is_none());
 
-        fs::remove_dir_all(PathBuf::from(config_root.as_str())).unwrap();
+        fs::remove_dir_all(sessions_root).unwrap();
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
     }
 
     #[test]
     fn find_latest_for_workspace_allows_legacy_sessions_in_workspace_local_root() {
         let workspace_root = unique_temp_dir("workspace-root");
+        let sessions_root = PathBuf::from(workspace_root.join(SESSIONS_DIR).as_str());
         fs::create_dir_all(workspace_root.as_str()).unwrap();
-        let session = SidSession::create_with_workspace(&workspace_root, &workspace_root).unwrap();
+        let session =
+            SidSession::create_with_workspace_in(sessions_root.clone(), &workspace_root).unwrap();
         remove_workspace_root_metadata(session.root());
 
-        let found = SidSession::find_latest_for_workspace(&workspace_root, &workspace_root)
-            .unwrap()
-            .unwrap();
+        let found =
+            SidSession::find_latest_for_workspace_in(sessions_root, workspace_root.as_str(), true)
+                .unwrap()
+                .unwrap();
         assert_eq!(found.root(), session.root());
 
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();

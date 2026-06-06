@@ -3755,7 +3755,7 @@ mod tests {
     #[test]
     fn load_resumed_transcript_restores_saved_history_and_appends_bash_reset_marker() {
         let workspace_root = unique_workspace_root("resume-transcript");
-        let sid_session = Arc::new(SidSession::create(&workspace_root).unwrap());
+        let sid_session = test_sid_session(&workspace_root);
 
         fs::write(
             sid_session.transcript_path(),
@@ -3898,7 +3898,7 @@ mod tests {
     #[tokio::test]
     async fn sid_spend_blocks_next_turn_after_cumulative_cost_exhausts_limit() {
         let root = unique_workspace_root("spend-block");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("claude-sonnet-4-5");
         session.set_session_spend(Some(0.000015));
@@ -3929,7 +3929,7 @@ mod tests {
     #[test]
     fn sid_spend_clamps_max_tokens_to_affordable_output_tokens() {
         let root = unique_workspace_root("spend-clamp");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("claude-sonnet-4-5");
         session.set_max_tokens(100);
@@ -3949,7 +3949,7 @@ mod tests {
     #[test]
     fn sid_spend_uses_sonnet_rates_for_custom_model_clamping() {
         let root = unique_workspace_root("spend-custom-model");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("custom-model");
         session.set_max_tokens(100);
@@ -4013,7 +4013,7 @@ mod tests {
     #[test]
     fn sid_spend_clear_removes_local_guard() {
         let root = unique_workspace_root("spend-clear");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("claude-sonnet-4-5");
         session.set_session_spend(Some(0.000015));
@@ -4036,7 +4036,7 @@ mod tests {
     #[test]
     fn sid_spend_set_after_prior_spend_starts_new_cap() {
         let root = unique_workspace_root("spend-reset");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("claude-sonnet-4-5");
         session.set_session_spend(Some(0.000015));
@@ -4068,7 +4068,7 @@ mod tests {
     #[tokio::test]
     async fn raw_set_spend_follows_interactive_reset_behavior() {
         let root = unique_workspace_root("raw-spend-reset");
-        let sid_session = Arc::new(SidSession::create(&root).unwrap());
+        let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
         session.set_model("claude-sonnet-4-5");
         session.set_session_spend(Some(0.000015));
@@ -4207,8 +4207,13 @@ mod tests {
     }
 
     fn configured_runtime_session(root: &Path, agent: &str) -> SidRuntimeSession {
-        let sid_session = Arc::new(SidSession::create(root).unwrap());
+        let sid_session = test_sid_session(root);
         new_runtime_session(root, root, sid_session, Some(agent))
+    }
+
+    fn test_sid_session(root: &Path) -> Arc<SidSession> {
+        let sessions_root = PathBuf::from(root.join("test-sessions").as_str());
+        Arc::new(SidSession::create_in(sessions_root).unwrap())
     }
 
     fn write_multi_agent_config(root: &Path) {
