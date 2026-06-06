@@ -21,6 +21,8 @@ pub mod containers;
 mod filesystem;
 /// Socket listener transport for `sid --listen`.
 pub mod raw_listen;
+/// Human-readable tool-call rendering for terminal output.
+pub mod render;
 /// JSONL transport utilities for `sid --raw`.
 pub mod raw_mode;
 /// JSONL protocol types and raw-mode support hooks.

@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use utf8path::Path;
 
 use claudius::chat::{
-    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, SessionStats,
-    help_text, parse_command,
+    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, SessionStats, help_text,
+    parse_command,
 };
 use claudius::{Anthropic, Effort, KnownModel, Model, TokenRates};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
@@ -27,6 +27,7 @@ use sid_isnt_done::config::{
     AGENTS_CONF_FILE, AnthropicConfig, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
 };
 use sid_isnt_done::raw_mode::{RawInput, RawServer, RawToolOutputObserver, RawUsageReportObserver};
+use sid_isnt_done::render::PlainTextRenderer;
 use sid_isnt_done::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawEvent, RawHello, RawPrompt, RawRequest, RawRequestEnvelope,
     RawResultEnvelope, RawServerMessage, install_tool_output_observer,
