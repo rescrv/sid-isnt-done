@@ -59,6 +59,8 @@ pub struct PlainTextRenderer {
     current_tool_name: Option<String>,
     /// Accumulated JSON chunks for the current tool input.
     tool_input_buf: String,
+    /// Last command-like preview rendered from a partially parsed tool input.
+    tool_input_preview: Option<ToolInputPreview>,
 }
 
 impl PlainTextRenderer {
@@ -73,6 +75,7 @@ impl PlainTextRenderer {
             interrupted: None,
             current_tool_name: None,
             tool_input_buf: String::new(),
+            tool_input_preview: None,
         }
     }
 
@@ -87,6 +90,7 @@ impl PlainTextRenderer {
             interrupted: None,
             current_tool_name: None,
             tool_input_buf: String::new(),
+            tool_input_preview: None,
         }
     }
 
@@ -151,6 +155,7 @@ impl PlainTextRenderer {
     fn render_tool_input(&mut self, context: &dyn StreamContext) {
         let json_str = std::mem::take(&mut self.tool_input_buf);
         let tool_name = self.current_tool_name.take();
+        let preview = self.tool_input_preview.take();
 
         let parsed: Result<serde_json::Value, _> = serde_json::from_str(&json_str);
         let obj = match parsed {
@@ -171,9 +176,65 @@ impl PlainTextRenderer {
 
         let tool = tool_name.as_deref().unwrap_or("");
         match tool {
-            "bash" => self.render_bash_input(context, &obj),
-            "str_replace_based_edit_tool" => self.render_editor_input(context, &obj),
+            "bash" => self.render_bash_input(context, &obj, preview.as_ref()),
+            "str_replace_based_edit_tool" => {
+                self.render_editor_input(context, &obj, preview.as_ref())
+            }
             _ => self.render_generic_input(context, &obj),
+        }
+    }
+
+    fn render_partial_tool_input_preview(&mut self, context: &dyn StreamContext) {
+        let Some(obj) = parse_partial_tool_input_object(&self.tool_input_buf) else {
+            return;
+        };
+        let tool_name = self.current_tool_name.as_deref().unwrap_or("");
+        let Some(preview) = tool_input_preview(tool_name, &obj) else {
+            return;
+        };
+        if self.tool_input_preview.as_ref() == Some(&preview) {
+            return;
+        }
+
+        self.write_tool_input_preview(context, &preview);
+        self.tool_input_preview = Some(preview);
+    }
+
+    fn write_tool_input_preview(
+        &mut self,
+        context: &dyn StreamContext,
+        preview: &ToolInputPreview,
+    ) {
+        match preview {
+            ToolInputPreview::BashCommand(command) => {
+                if self.use_color {
+                    self.write_with_indent(
+                        context,
+                        &format!("{ANSI_TOOL_INPUT}{command}{ANSI_RESET}\n"),
+                    );
+                } else {
+                    self.write_with_indent(context, &format!("{command}\n"));
+                }
+            }
+            ToolInputPreview::EditorCommand { command, path } => {
+                if self.use_color {
+                    self.write_with_indent(context, &format!("{ANSI_FIELD_LABEL}{command}"));
+                    if let Some(path) = path {
+                        self.write_with_indent(
+                            context,
+                            &format!("{ANSI_RESET} {ANSI_TOOL_INPUT}{path}"),
+                        );
+                    }
+                    self.write_with_indent(context, &format!("{ANSI_RESET}\n"));
+                } else if let Some(path) = path {
+                    self.write_with_indent(context, &format!("{command} {path}\n"));
+                } else {
+                    self.write_with_indent(context, &format!("{command}\n"));
+                }
+            }
+            ToolInputPreview::GenericField { label, value } => {
+                self.write_field(context, label, value);
+            }
         }
     }
 
@@ -182,24 +243,22 @@ impl PlainTextRenderer {
         &mut self,
         context: &dyn StreamContext,
         obj: &serde_json::Map<String, serde_json::Value>,
+        preview: Option<&ToolInputPreview>,
     ) {
         if let Some(serde_json::Value::Bool(true)) = obj.get("restart") {
             if self.use_color {
-                self.write_with_indent(
-                    context,
-                    &format!("{ANSI_METADATA}(restart){ANSI_RESET}\n"),
-                );
+                self.write_with_indent(context, &format!("{ANSI_METADATA}(restart){ANSI_RESET}\n"));
             } else {
                 self.write_with_indent(context, "(restart)\n");
             }
         }
 
         if let Some(serde_json::Value::String(cmd)) = obj.get("command") {
+            if preview.is_some_and(|preview| preview.is_bash_command(cmd)) {
+                return;
+            }
             if self.use_color {
-                self.write_with_indent(
-                    context,
-                    &format!("{ANSI_TOOL_INPUT}{cmd}{ANSI_RESET}\n"),
-                );
+                self.write_with_indent(context, &format!("{ANSI_TOOL_INPUT}{cmd}{ANSI_RESET}\n"));
             } else {
                 self.write_with_indent(context, &format!("{cmd}\n"));
             }
@@ -211,18 +270,18 @@ impl PlainTextRenderer {
         &mut self,
         context: &dyn StreamContext,
         obj: &serde_json::Map<String, serde_json::Value>,
+        preview: Option<&ToolInputPreview>,
     ) {
         let command = obj
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let path = obj
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("???");
+        let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("???");
 
         // Show the sub-command and path.
-        if self.use_color {
+        if preview.is_some_and(|preview| preview.is_editor_command(command, path)) {
+            // Already shown while the tool input was streaming.
+        } else if self.use_color {
             self.write_with_indent(
                 context,
                 &format!(
@@ -326,6 +385,88 @@ impl PlainTextRenderer {
             if !content.ends_with('\n') {
                 self.write_with_indent(context, "\n");
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolInputPreview {
+    BashCommand(String),
+    EditorCommand {
+        command: String,
+        path: Option<String>,
+    },
+    GenericField {
+        label: String,
+        value: String,
+    },
+}
+
+impl ToolInputPreview {
+    fn is_bash_command(&self, command: &str) -> bool {
+        matches!(self, Self::BashCommand(previewed) if previewed == command)
+    }
+
+    fn is_editor_command(&self, command: &str, path: &str) -> bool {
+        matches!(
+            self,
+            Self::EditorCommand {
+                command: previewed_command,
+                path: Some(previewed_path),
+            } if previewed_command == command && previewed_path == path
+        )
+    }
+}
+
+fn parse_partial_tool_input_object(
+    json_str: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut candidate = String::with_capacity(json_str.len() + 1);
+    candidate.push_str(json_str);
+    candidate.push('}');
+
+    let parsed: serde_json::Value = serde_json::from_str(&candidate).ok()?;
+    match parsed {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn tool_input_preview(
+    tool_name: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<ToolInputPreview> {
+    match tool_name {
+        "bash" => obj
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(|command| ToolInputPreview::BashCommand(command.to_string())),
+        "str_replace_based_edit_tool" => {
+            let command = obj.get("command").and_then(|value| value.as_str())?;
+            let path = obj
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            Some(ToolInputPreview::EditorCommand {
+                command: command.to_string(),
+                path,
+            })
+        }
+        _ => {
+            for label in ["command", "cmd"] {
+                if let Some(value) = obj.get(label).and_then(|value| value.as_str()) {
+                    return Some(ToolInputPreview::GenericField {
+                        label: label.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+            }
+            obj.get("path")
+                .and_then(|value| value.as_str())
+                .map(|path| ToolInputPreview::GenericField {
+                    label: "path".to_string(),
+                    value: path.to_string(),
+                })
         }
     }
 }
@@ -444,11 +585,14 @@ impl Renderer for PlainTextRenderer {
         // Start accumulating tool input.
         self.current_tool_name = Some(name.to_string());
         self.tool_input_buf.clear();
+        self.tool_input_preview = None;
     }
 
-    fn print_tool_input(&mut self, _context: &dyn StreamContext, partial_json: &str) {
-        // Accumulate instead of printing directly.
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        // Accumulate and opportunistically render a command-like preview.  The
+        // final structured input is still rendered at tool-use end.
         self.tool_input_buf.push_str(partial_json);
+        self.render_partial_tool_input_preview(context);
     }
 
     fn finish_tool_use(&mut self, context: &dyn StreamContext) {
@@ -612,6 +756,61 @@ mod tests {
         renderer.start_tool_use(&(), "bash", "test_id");
         renderer.print_tool_input(&(), "this is not json");
         renderer.finish_tool_use(&());
+    }
+
+    #[test]
+    fn partial_tool_input_parse_appends_one_closing_brace() {
+        let parsed = parse_partial_tool_input_object(r#"{"command":"echo hi""#).unwrap();
+        assert_eq!(
+            parsed.get("command").and_then(serde_json::Value::as_str),
+            Some("echo hi")
+        );
+
+        assert!(parse_partial_tool_input_object(r#"{"command":"echo hi","#).is_none());
+        assert!(parse_partial_tool_input_object(r#"{"command":"echo hi"}"#).is_none());
+    }
+
+    #[test]
+    fn partial_tool_input_preview_extracts_bash_command() {
+        let parsed = parse_partial_tool_input_object(r#"{"command":"echo hi""#).unwrap();
+        assert_eq!(
+            tool_input_preview("bash", &parsed),
+            Some(ToolInputPreview::BashCommand("echo hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_tool_input_preview_extracts_editor_command_and_path() {
+        let command_only = parse_partial_tool_input_object(r#"{"command":"create""#).unwrap();
+        assert_eq!(
+            tool_input_preview("str_replace_based_edit_tool", &command_only),
+            Some(ToolInputPreview::EditorCommand {
+                command: "create".to_string(),
+                path: None,
+            })
+        );
+
+        let with_path =
+            parse_partial_tool_input_object(r#"{"command":"create","path":"/src/new.rs""#).unwrap();
+        assert_eq!(
+            tool_input_preview("str_replace_based_edit_tool", &with_path),
+            Some(ToolInputPreview::EditorCommand {
+                command: "create".to_string(),
+                path: Some("/src/new.rs".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_tool_input_preview_extracts_generic_command_field() {
+        let parsed = parse_partial_tool_input_object(r#"{"cmd":"rg foo""#).unwrap();
+        assert_eq!(
+            tool_input_preview("custom_tool", &parsed),
+            Some(ToolInputPreview::GenericField {
+                label: "cmd".to_string(),
+                value: "rg foo".to_string(),
+            })
+        );
     }
 
     #[test]
