@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use claudius::{Renderer, StopReason, StreamContext};
 
+use crate::sidiff::{SidiffOptions, render_diff};
+
 /// ANSI escape code for dim text (used for thinking blocks).
 const ANSI_DIM: &str = "\x1b[2m";
 
@@ -42,6 +44,8 @@ const ANSI_TOOL_RESULT_BODY: &str = "\x1b[38;5;187m";
 
 /// ANSI escape code for field labels within tool input.
 const ANSI_FIELD_LABEL: &str = "\x1b[38;5;109m";
+
+const MAX_REPLACEMENT_DIFF_CELLS: usize = 250_000;
 
 /// Plain text renderer with optional ANSI styling.
 ///
@@ -317,13 +321,24 @@ impl PlainTextRenderer {
                 }
             }
             "str_replace" => {
-                if let Some(serde_json::Value::String(text)) = obj.get("old_str") {
-                    self.write_content_block(context, "old_str", text);
-                }
-                if let Some(serde_json::Value::String(text)) = obj.get("new_str") {
-                    self.write_content_block(context, "new_str", text);
-                } else if obj.get("new_str") == Some(&serde_json::Value::Null) {
-                    self.write_field(context, "new_str", "(delete)");
+                match (
+                    obj.get("old_str").and_then(|value| value.as_str()),
+                    replacement_text(obj),
+                ) {
+                    (Some(old_str), Some(new_str)) => {
+                        let diff = render_str_replace_diff(path, old_str, new_str, self.use_color);
+                        self.write_diff_block(context, &diff);
+                    }
+                    _ => {
+                        if let Some(serde_json::Value::String(text)) = obj.get("old_str") {
+                            self.write_content_block(context, "old_str", text);
+                        }
+                        if let Some(serde_json::Value::String(text)) = obj.get("new_str") {
+                            self.write_content_block(context, "new_str", text);
+                        } else if obj.get("new_str") == Some(&serde_json::Value::Null) {
+                            self.write_field(context, "new_str", "(delete)");
+                        }
+                    }
                 }
             }
             "insert" => {
@@ -397,6 +412,18 @@ impl PlainTextRenderer {
             if !content.ends_with('\n') {
                 self.write_with_indent(context, "\n");
             }
+        }
+    }
+
+    fn write_diff_block(&mut self, context: &dyn StreamContext, content: &str) {
+        if self.use_color {
+            self.write_with_indent(context, &format!("{ANSI_FIELD_LABEL}diff:{ANSI_RESET}\n"));
+        } else {
+            self.write_with_indent(context, "diff:\n");
+        }
+        self.write_with_indent(context, content);
+        if !content.ends_with('\n') {
+            self.write_with_indent(context, "\n");
         }
     }
 }
@@ -481,6 +508,201 @@ fn tool_input_preview(
                 })
         }
     }
+}
+
+fn replacement_text(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    match obj.get("new_str") {
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(serde_json::Value::Null) | None => Some(""),
+        Some(_) => None,
+    }
+}
+
+fn render_str_replace_diff(path: &str, old_str: &str, new_str: &str, use_color: bool) -> String {
+    let unified_diff = build_str_replace_unified_diff(path, old_str, new_str);
+    render_diff(
+        &unified_diff,
+        SidiffOptions {
+            use_color,
+            ..SidiffOptions::default()
+        },
+    )
+}
+
+fn build_str_replace_unified_diff(path: &str, old_str: &str, new_str: &str) -> String {
+    let old_lines = diff_lines(old_str);
+    let new_lines = diff_lines(new_str);
+    let mut output = String::new();
+    let path = diff_display_path(path);
+    output.push_str(&format!("--- a/{path}\n"));
+    output.push_str(&format!("+++ b/{path}\n"));
+    output.push_str(&format!(
+        "@@ -{} +{} @@\n",
+        format_hunk_range(old_lines.len()),
+        format_hunk_range(new_lines.len())
+    ));
+
+    for line in replacement_diff_lines(&old_lines, &new_lines) {
+        match line {
+            ReplacementDiffLine::Context(text) => {
+                output.push(' ');
+                output.push_str(text);
+            }
+            ReplacementDiffLine::Remove(text) => {
+                output.push('-');
+                output.push_str(text);
+            }
+            ReplacementDiffLine::Add(text) => {
+                output.push('+');
+                output.push_str(text);
+            }
+        }
+        output.push('\n');
+    }
+
+    output
+}
+
+fn diff_display_path(path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        "selection".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn format_hunk_range(line_count: usize) -> String {
+    match line_count {
+        0 => "0,0".to_string(),
+        1 => "1".to_string(),
+        count => format!("1,{count}"),
+    }
+}
+
+fn diff_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_terminator('\n').collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementDiffLine<'a> {
+    Context(&'a str),
+    Remove(&'a str),
+    Add(&'a str),
+}
+
+fn replacement_diff_lines<'a>(
+    old_lines: &'a [&'a str],
+    new_lines: &'a [&'a str],
+) -> Vec<ReplacementDiffLine<'a>> {
+    if old_lines
+        .len()
+        .checked_mul(new_lines.len())
+        .is_none_or(|cells| cells > MAX_REPLACEMENT_DIFF_CELLS)
+    {
+        return replacement_diff_lines_by_edges(old_lines, new_lines);
+    }
+
+    let cols = new_lines.len() + 1;
+    let mut suffix_lengths = vec![0usize; (old_lines.len() + 1) * cols];
+    for old_idx in (0..old_lines.len()).rev() {
+        for new_idx in (0..new_lines.len()).rev() {
+            let idx = old_idx * cols + new_idx;
+            suffix_lengths[idx] = if old_lines[old_idx] == new_lines[new_idx] {
+                suffix_lengths[(old_idx + 1) * cols + new_idx + 1] + 1
+            } else {
+                usize::max(
+                    suffix_lengths[(old_idx + 1) * cols + new_idx],
+                    suffix_lengths[old_idx * cols + new_idx + 1],
+                )
+            };
+        }
+    }
+
+    let mut output = Vec::new();
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    while old_idx < old_lines.len() || new_idx < new_lines.len() {
+        if old_idx < old_lines.len()
+            && new_idx < new_lines.len()
+            && old_lines[old_idx] == new_lines[new_idx]
+        {
+            output.push(ReplacementDiffLine::Context(old_lines[old_idx]));
+            old_idx += 1;
+            new_idx += 1;
+        } else if old_idx < old_lines.len()
+            && (new_idx == new_lines.len()
+                || suffix_lengths[(old_idx + 1) * cols + new_idx]
+                    >= suffix_lengths[old_idx * cols + new_idx + 1])
+        {
+            output.push(ReplacementDiffLine::Remove(old_lines[old_idx]));
+            old_idx += 1;
+        } else if new_idx < new_lines.len() {
+            output.push(ReplacementDiffLine::Add(new_lines[new_idx]));
+            new_idx += 1;
+        }
+    }
+    output
+}
+
+fn replacement_diff_lines_by_edges<'a>(
+    old_lines: &'a [&'a str],
+    new_lines: &'a [&'a str],
+) -> Vec<ReplacementDiffLine<'a>> {
+    let prefix = common_prefix_len(old_lines, new_lines);
+    let suffix = common_suffix_len(&old_lines[prefix..], &new_lines[prefix..]);
+    let old_changed_end = old_lines.len().saturating_sub(suffix);
+    let new_changed_end = new_lines.len().saturating_sub(suffix);
+    let mut output = Vec::new();
+
+    output.extend(
+        old_lines[..prefix]
+            .iter()
+            .copied()
+            .map(ReplacementDiffLine::Context),
+    );
+    output.extend(
+        old_lines[prefix..old_changed_end]
+            .iter()
+            .copied()
+            .map(ReplacementDiffLine::Remove),
+    );
+    output.extend(
+        new_lines[prefix..new_changed_end]
+            .iter()
+            .copied()
+            .map(ReplacementDiffLine::Add),
+    );
+    output.extend(
+        old_lines[old_changed_end..]
+            .iter()
+            .copied()
+            .map(ReplacementDiffLine::Context),
+    );
+
+    output
+}
+
+fn common_prefix_len(left: &[&str], right: &[&str]) -> usize {
+    let mut count = 0;
+    let max_count = usize::min(left.len(), right.len());
+    while count < max_count && left[count] == right[count] {
+        count += 1;
+    }
+    count
+}
+
+fn common_suffix_len(left: &[&str], right: &[&str]) -> usize {
+    let mut count = 0;
+    let max_count = usize::min(left.len(), right.len());
+    while count < max_count && left[left.len() - 1 - count] == right[right.len() - 1 - count] {
+        count += 1;
+    }
+    count
 }
 
 /// Format a JSON value for display.  Strings are unquoted; everything else uses compact JSON.
@@ -715,6 +937,54 @@ mod tests {
             r#"{"command":"str_replace","path":"/src/main.rs","old_str":"hello","new_str":"world"}"#,
         );
         renderer.finish_tool_use(&());
+    }
+
+    #[test]
+    fn str_replace_diff_renders_unified_diff() {
+        assert_eq!(
+            build_str_replace_unified_diff("/src/main.rs", "hello", "world"),
+            "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-hello\n+world\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_diff_uses_sidiff_renderer() {
+        assert_eq!(
+            render_str_replace_diff("/src/main.rs", "hello", "world", false),
+            concat!(
+                "file src/main.rs -> src/main.rs\n",
+                "--- a/src/main.rs\n",
+                "+++ b/src/main.rs\n",
+                "@@ -1 +1 @@\n",
+                "      1      - hello\n",
+                "           1 + world\n",
+            )
+        );
+    }
+
+    #[test]
+    fn str_replace_diff_renders_delete() {
+        assert_eq!(
+            build_str_replace_unified_diff("src/main.rs", "hello\nworld\n", ""),
+            "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +0,0 @@\n-hello\n-world\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_diff_preserves_common_middle_lines() {
+        assert_eq!(
+            build_str_replace_unified_diff("file.txt", "before\nkeep\nafter", "start\nkeep\nend"),
+            concat!(
+                "--- a/file.txt\n",
+                "+++ b/file.txt\n",
+                "@@ -1,3 +1,3 @@\n",
+                "-before\n",
+                "+start\n",
+                " keep\n",
+                "-after\n",
+                "+end\n",
+            )
+        );
     }
 
     #[test]

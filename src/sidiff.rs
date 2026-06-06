@@ -291,6 +291,23 @@ struct RenderedLine {
     text: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BatLineColorMap {
+    lines: HashMap<LineId, String>,
+}
+
+impl BatLineColorMap {
+    pub(crate) fn get(&self, file: usize, hunk: usize, line: usize) -> Option<&str> {
+        self.lines
+            .get(&LineId { file, hunk, line })
+            .map(String::as_str)
+    }
+
+    fn get_id(&self, id: LineId) -> Option<&str> {
+        self.lines.get(&id).map(String::as_str)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LineRef {
     id: LineId,
@@ -425,7 +442,8 @@ pub fn parse_unified_diff(input: &str) -> Diff {
 pub fn render_diff(input: &str, options: SidiffOptions) -> String {
     let diff = parse_unified_diff(input);
     let analysis = analyze_diff(&diff);
-    let lines = build_rendered_lines(&diff, &analysis, options);
+    let bat_lines = build_bat_line_color_map_with_analysis(&diff, &analysis, options.use_color);
+    let lines = build_rendered_lines(&diff, &analysis, &bat_lines, options);
     let mut out = String::new();
     for line in lines {
         out.push_str(&line.text);
@@ -1286,6 +1304,125 @@ fn run_similarity(remove: &[String], add: &[String]) -> f32 {
     common as f32 / min(remove.len(), add.len()) as f32
 }
 
+pub(crate) fn build_bat_line_color_map(diff: &Diff, use_color: bool) -> BatLineColorMap {
+    let analysis = analyze_diff(diff);
+    build_bat_line_color_map_with_analysis(diff, &analysis, use_color)
+}
+
+fn build_bat_line_color_map_with_analysis(
+    diff: &Diff,
+    analysis: &Analysis,
+    use_color: bool,
+) -> BatLineColorMap {
+    if !use_color {
+        return BatLineColorMap::default();
+    }
+    build_bat_line_color_map_with_filter(diff, analysis, use_color, run_bat_filter)
+}
+
+fn build_bat_line_color_map_with_filter(
+    diff: &Diff,
+    analysis: &Analysis,
+    use_color: bool,
+    mut filter: impl FnMut(&str, &str, SidiffOptions) -> io::Result<String>,
+) -> BatLineColorMap {
+    let eligible_adds = eligible_bat_add_line_ids(diff, analysis);
+    let mut map = BatLineColorMap::default();
+    for (file_idx, file) in diff.files.iter().enumerate() {
+        if file_is_pure_addition(file) {
+            continue;
+        }
+        for side in [Side::Pre, Side::Post] {
+            let path = match side {
+                Side::Pre => display_old_path(file),
+                Side::Post => display_new_path(file),
+            };
+            let (source, recon) = reconstruct_side(file_idx, file, side);
+            if source.is_empty() {
+                continue;
+            }
+            let Ok(rendered) = filter(
+                &path,
+                &source,
+                SidiffOptions {
+                    use_color,
+                    ..SidiffOptions::default()
+                },
+            ) else {
+                continue;
+            };
+            for (recon_line, rendered_line) in recon.iter().zip(rendered.lines()) {
+                let line = &diff.files[recon_line.id.file].hunks[recon_line.id.hunk].lines
+                    [recon_line.id.line];
+                let should_colorize = match line.op {
+                    DiffOp::Context => true,
+                    DiffOp::Add => side == Side::Post && eligible_adds.contains(&recon_line.id),
+                    DiffOp::Remove | DiffOp::Note => false,
+                };
+                if should_colorize {
+                    map.lines.insert(recon_line.id, rendered_line.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn eligible_bat_add_line_ids(diff: &Diff, analysis: &Analysis) -> HashSet<LineId> {
+    let mut eligible = HashSet::new();
+    for (file_idx, file) in diff.files.iter().enumerate() {
+        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+            let mut index = 0usize;
+            while index < hunk.lines.len() {
+                while index < hunk.lines.len() && hunk.lines[index].op != DiffOp::Add {
+                    index += 1;
+                }
+                let start = index;
+                while index < hunk.lines.len() && hunk.lines[index].op == DiffOp::Add {
+                    index += 1;
+                }
+                let mut run_start = start;
+                while run_start < index {
+                    while run_start < index
+                        && line_has_partial_change_detection(analysis.lines.get(&LineId {
+                            file: file_idx,
+                            hunk: hunk_idx,
+                            line: run_start,
+                        }))
+                    {
+                        run_start += 1;
+                    }
+                    let mut run_end = run_start;
+                    while run_end < index
+                        && !line_has_partial_change_detection(analysis.lines.get(&LineId {
+                            file: file_idx,
+                            hunk: hunk_idx,
+                            line: run_end,
+                        }))
+                    {
+                        run_end += 1;
+                    }
+                    if run_end.saturating_sub(run_start) >= 3 {
+                        for line_idx in run_start..run_end {
+                            eligible.insert(LineId {
+                                file: file_idx,
+                                hunk: hunk_idx,
+                                line: line_idx,
+                            });
+                        }
+                    }
+                    run_start = run_end;
+                }
+            }
+        }
+    }
+    eligible
+}
+
+fn line_has_partial_change_detection(meta: Option<&LineAnalysis>) -> bool {
+    meta.is_some_and(|meta| meta.paired_with.is_some())
+}
+
 fn detect_roles(pairs: &[ChangePair]) -> Vec<RoleGroup> {
     let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
     for pair in pairs {
@@ -1782,6 +1919,7 @@ fn is_operator(text: &str) -> bool {
 fn build_rendered_lines(
     diff: &Diff,
     analysis: &Analysis,
+    bat_lines: &BatLineColorMap,
     options: SidiffOptions,
 ) -> Vec<RenderedLine> {
     let mut out = vec![];
@@ -1858,7 +1996,7 @@ fn build_rendered_lines(
                     }
                 }
                 out.push(RenderedLine {
-                    text: render_diff_line(diff, analysis, id, line, options),
+                    text: render_diff_line(diff, analysis, bat_lines, id, line, options),
                 });
             }
         }
@@ -2039,6 +2177,7 @@ fn render_move_label(
 fn render_diff_line(
     diff: &Diff,
     analysis: &Analysis,
+    bat_lines: &BatLineColorMap,
     id: LineId,
     line: &DiffLine,
     options: SidiffOptions,
@@ -2084,14 +2223,18 @@ fn render_diff_line(
         return line_out;
     }
     let syntax = analysis.syntax.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-    line_out.push_str(&render_content(
-        &line.content,
-        line.op,
-        meta,
-        syntax,
-        roles,
-        options,
-    ));
+    if let Some(colored) = bat_lines.get_id(id) {
+        line_out.push_str(colored);
+    } else {
+        line_out.push_str(&render_content(
+            &line.content,
+            line.op,
+            meta,
+            syntax,
+            roles,
+            options,
+        ));
+    }
     if meta.is_some_and(|meta| meta.paired_with.is_none())
         && matches!(line.op, DiffOp::Add | DiffOp::Remove)
     {
@@ -2520,6 +2663,67 @@ diff --git a/changed.rs b/changed.rs
     }
 
     #[test]
+    fn bat_color_map_reconstructs_both_sides_and_skips_paired_lines() {
+        let input = "\
+diff --git a/old.rs b/new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1,4 +1,7 @@
+ fn main() {
+-old_name();
++new_name();
++let alpha = 1;
++let beta = 2;
++let gamma = 3;
+ keep();
+ }
+";
+        let diff = parse_unified_diff(input);
+        let analysis = analyze_diff(&diff);
+        let mut calls = Vec::new();
+        let map = build_bat_line_color_map_with_filter(
+            &diff,
+            &analysis,
+            true,
+            |path, source, options| {
+                assert!(options.use_color);
+                calls.push((path.to_string(), source.to_string()));
+                Ok(source
+                    .lines()
+                    .map(|line| format!("\x1b[35m{path}:{line}\x1b[0m"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n")
+            },
+        );
+
+        assert!(calls.iter().any(|(path, source)| {
+            path == "old.rs" && source == "fn main() {\nold_name();\nkeep();\n}\n"
+        }));
+        assert!(calls.iter().any(|(path, source)| {
+            path == "new.rs"
+                && source
+                    == "fn main() {\nnew_name();\nlet alpha = 1;\nlet beta = 2;\nlet gamma = 3;\nkeep();\n}\n"
+        }));
+        assert_eq!(map.get(0, 0, 0), Some("\x1b[35mnew.rs:fn main() {\x1b[0m"));
+        assert_eq!(map.get(0, 0, 1), None);
+        assert_eq!(map.get(0, 0, 2), None);
+        assert_eq!(
+            map.get(0, 0, 3),
+            Some("\x1b[35mnew.rs:let alpha = 1;\x1b[0m")
+        );
+        assert_eq!(
+            map.get(0, 0, 4),
+            Some("\x1b[35mnew.rs:let beta = 2;\x1b[0m")
+        );
+        assert_eq!(
+            map.get(0, 0, 5),
+            Some("\x1b[35mnew.rs:let gamma = 3;\x1b[0m")
+        );
+        assert_eq!(map.get(0, 0, 6), Some("\x1b[35mnew.rs:keep();\x1b[0m"));
+    }
+
+    #[test]
     fn git_log_commit_lines_are_not_rendered_as_hunk_context() {
         let rendered = render_diff(
             GIT_LOG_SAMPLE,
@@ -2636,6 +2840,7 @@ diff --git a/a.txt b/a.txt
         let rendered = render_diff_line(
             &diff,
             &analysis,
+            &BatLineColorMap::default(),
             LineId {
                 file: 0,
                 hunk: 1,

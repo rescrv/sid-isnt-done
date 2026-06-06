@@ -17,8 +17,8 @@ use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 
 use crate::sidiff::{
-    Diff, DiffFile, DiffLine, DiffOp, file_is_pure_addition, parse_unified_diff,
-    render_pure_addition_file_with_bat,
+    Diff, DiffFile, DiffLine, DiffOp, build_bat_line_color_map, file_is_pure_addition,
+    parse_unified_diff, render_pure_addition_file_with_bat,
 };
 
 /// Run the sidreview terminal UI for a unified diff.
@@ -121,7 +121,7 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
 
 fn render_row_line(row: ReviewRow, selected: Option<usize>) -> Line<'static> {
     let style = row_style(&row, selected);
-    if row.kind == ReviewRowKind::Bat {
+    if row.kind == ReviewRowKind::Bat || row.text.contains('\x1b') {
         ansi_styled_line(&row.text, style)
     } else {
         Line::styled(row.text, style)
@@ -652,15 +652,28 @@ impl ReviewLine {
         }
     }
 
-    fn from_diff_line(line: &DiffLine) -> Self {
+    fn from_diff_line_with_content(line: &DiffLine, content: Option<&str>) -> Self {
         let (kind, marker, content) = match line.op {
-            DiffOp::Context => (ReviewRowKind::Context, " ", line.content.as_str()),
-            DiffOp::Add => (ReviewRowKind::Add, "+", line.content.as_str()),
-            DiffOp::Remove => (ReviewRowKind::Remove, "-", line.content.as_str()),
+            DiffOp::Context => (
+                ReviewRowKind::Context,
+                " ",
+                content.unwrap_or(line.content.as_str()),
+            ),
+            DiffOp::Add => (
+                ReviewRowKind::Add,
+                "+",
+                content.unwrap_or(line.content.as_str()),
+            ),
+            DiffOp::Remove => (
+                ReviewRowKind::Remove,
+                "-",
+                content.unwrap_or(line.content.as_str()),
+            ),
             DiffOp::Note => (
                 ReviewRowKind::Note,
                 "\\",
-                line.content.strip_prefix("\\ ").unwrap_or(&line.content),
+                content
+                    .unwrap_or_else(|| line.content.strip_prefix("\\ ").unwrap_or(&line.content)),
             ),
         };
         Self {
@@ -714,6 +727,7 @@ fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
 }
 
 fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
+    let bat_lines = build_bat_line_color_map(diff, use_color);
     let mut blocks = Vec::new();
     if !diff.preamble.is_empty() {
         blocks.push(ReviewBlock::new(
@@ -722,7 +736,7 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
         ));
     }
 
-    for file in &diff.files {
+    for (file_idx, file) in diff.files.iter().enumerate() {
         if file_is_pure_addition(file)
             && let Ok(rendered) = render_pure_addition_file_with_bat(file, use_color)
         {
@@ -750,7 +764,12 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
                 lines.extend(file.header.iter().map(ReviewLine::header));
             }
             lines.push(ReviewLine::header(&hunk.header));
-            lines.extend(hunk.lines.iter().map(ReviewLine::from_diff_line));
+            lines.extend(hunk.lines.iter().enumerate().map(|(line_idx, line)| {
+                ReviewLine::from_diff_line_with_content(
+                    line,
+                    bat_lines.get(file_idx, hunk_idx, line_idx),
+                )
+            }));
             blocks.push(ReviewBlock::new(
                 format!("{} {}", display_path(file), hunk.header),
                 lines,
@@ -877,6 +896,23 @@ index 0000000..1111111
         assert_eq!(line.spans[1].style.bg, base.bg);
         assert_eq!(line.spans[2].content, " base");
         assert_eq!(line.spans[2].style, base);
+    }
+
+    #[test]
+    fn diff_rows_parse_embedded_ansi_colors() {
+        let line = render_row_line(
+            ReviewRow {
+                block: Some(0),
+                kind: ReviewRowKind::Add,
+                text: "       1 + \x1b[38;2;1;2;3mfn main\x1b[0m".to_string(),
+            },
+            None,
+        );
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "       1 + ");
+        assert_eq!(line.spans[1].content, "fn main");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(1, 2, 3)));
     }
 
     #[test]
