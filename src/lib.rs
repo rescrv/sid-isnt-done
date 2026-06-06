@@ -16,6 +16,8 @@
 pub mod builtin_tools;
 /// Workspace configuration loading and types.
 pub mod config;
+/// Container runtime abstraction and `sid-container` launcher helpers.
+pub mod containers;
 mod filesystem;
 /// Socket listener transport for `sid --listen`.
 pub mod raw_listen;
