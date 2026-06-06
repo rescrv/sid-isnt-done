@@ -35,7 +35,8 @@ use sid_isnt_done::raw_protocol::{
 };
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, append_resumed_bash_reset_marker, compacted_transcript,
-    extract_last_assistant_text, seatbelt, session, session::SidSession,
+    extract_last_assistant_text, sanitize_transcript_messages, seatbelt, session,
+    session::SidSession,
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = concat!(
@@ -757,6 +758,7 @@ impl SidRuntimeSession {
         self.chat
             .load_transcript_from(path)
             .map_err(|err| transcript_error("transcript_load_failed", path, &err.to_string()))?;
+        self.sanitize_transcript();
         self.persist_transcript()
     }
 
@@ -777,6 +779,7 @@ impl SidRuntimeSession {
                     .with_string_field("path", transcript_path.to_string_lossy().as_ref())
                     .with_string_field("cause", &err.to_string())
                 })?;
+            self.sanitize_transcript();
         }
         let mut messages = self.chat.clone_messages();
         append_resumed_bash_reset_marker(&mut messages);
@@ -1025,6 +1028,12 @@ impl SidRuntimeSession {
         self.chat
             .save_transcript_to(path)
             .map_err(|err| transcript_error_path("transcript_save_failed", path, &err.to_string()))
+    }
+
+    fn sanitize_transcript(&mut self) {
+        let mut messages = self.chat.clone_messages();
+        sanitize_transcript_messages(&mut messages);
+        self.chat.replace_messages(messages);
     }
 
     fn last_assistant_text(&self) -> Option<String> {

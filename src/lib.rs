@@ -1096,11 +1096,13 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        sanitize_transcript_messages(messages);
         top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
             top_up_cancelled_tool_results(messages);
+            sanitize_transcript_messages(messages);
             return Ok(TurnOutcome {
                 stop_reason,
                 usage: Usage::new(0, 0),
@@ -1117,6 +1119,7 @@ impl Agent for SidAgent {
                 .map(|thinking| thinking.num_tokens())
                 .unwrap_or(0)
         {
+            sanitize_transcript_messages(messages);
             let retry_policy = retry::ApiRetryPolicy::default();
             let retry_backoff = retry_policy.backoff();
             let mut retry_count = 0usize;
@@ -1144,6 +1147,7 @@ impl Agent for SidAgent {
                         .swap(false, Ordering::Relaxed)
                     {
                         top_up_cancelled_tool_results(messages);
+                        sanitize_transcript_messages(messages);
                         return Ok(TurnOutcome {
                             stop_reason: StopReason::EndTurn,
                             usage: usage_total,
@@ -1158,11 +1162,13 @@ impl Agent for SidAgent {
                             outcome.request_count =
                                 outcome.request_count.saturating_add(request_count);
                             top_up_cancelled_tool_results(messages);
+                            sanitize_transcript_messages(messages);
                             Ok(outcome)
                         }
                         Err(err) => {
                             eprintln!("API error (conversation preserved): {err}");
                             top_up_cancelled_tool_results(messages);
+                            sanitize_transcript_messages(messages);
                             Ok(TurnOutcome {
                                 stop_reason: StopReason::EndTurn,
                                 usage: usage_total,
@@ -1176,6 +1182,7 @@ impl Agent for SidAgent {
 
         let stop_reason = self.handle_max_tokens().await?;
         top_up_cancelled_tool_results(messages);
+        sanitize_transcript_messages(messages);
         Ok(TurnOutcome {
             stop_reason,
             usage: usage_total,
@@ -1193,12 +1200,14 @@ impl Agent for SidAgent {
     ) -> Result<TurnOutcome, Error> {
         self.tool_cancellation_pending
             .store(false, Ordering::Relaxed);
+        sanitize_transcript_messages(messages);
         top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
         renderer.start_agent(&context);
         let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
             let stop_reason = self.handle_max_tokens().await?;
             top_up_cancelled_tool_results(messages);
+            sanitize_transcript_messages(messages);
             renderer.finish_agent(&context, Some(&stop_reason));
             return Ok(TurnOutcome {
                 stop_reason,
@@ -1216,6 +1225,7 @@ impl Agent for SidAgent {
                 .map(|thinking| thinking.num_tokens())
                 .unwrap_or(0)
         {
+            sanitize_transcript_messages(messages);
             let retry_policy = retry::ApiRetryPolicy::default();
             let retry_backoff = retry_policy.backoff();
             let mut retry_count = 0usize;
@@ -1259,6 +1269,7 @@ impl Agent for SidAgent {
                     {
                         let stop_reason = StopReason::EndTurn;
                         top_up_cancelled_tool_results(messages);
+                        sanitize_transcript_messages(messages);
                         renderer.finish_agent(&context, Some(&stop_reason));
                         return Ok(TurnOutcome {
                             stop_reason,
@@ -1272,6 +1283,7 @@ impl Agent for SidAgent {
                         outcome.usage = outcome.usage + usage_total;
                         outcome.request_count = outcome.request_count.saturating_add(request_count);
                         top_up_cancelled_tool_results(messages);
+                        sanitize_transcript_messages(messages);
                         renderer.finish_agent(&context, Some(&outcome.stop_reason));
                         return Ok(outcome);
                     }
@@ -1281,6 +1293,7 @@ impl Agent for SidAgent {
                             &format!("API error (conversation preserved): {err}"),
                         );
                         top_up_cancelled_tool_results(messages);
+                        sanitize_transcript_messages(messages);
                         let stop_reason = StopReason::EndTurn;
                         renderer.finish_agent(&context, Some(&stop_reason));
                         return Ok(TurnOutcome {
@@ -1295,6 +1308,7 @@ impl Agent for SidAgent {
 
         let stop_reason = self.handle_max_tokens().await?;
         top_up_cancelled_tool_results(messages);
+        sanitize_transcript_messages(messages);
         renderer.finish_agent(&context, Some(&stop_reason));
         Ok(TurnOutcome {
             stop_reason,
@@ -3057,7 +3071,30 @@ pub fn load_transcript_messages(path: &std::path::Path) -> Result<Vec<MessagePar
             .with_string_field("path", path.to_string_lossy().as_ref())
             .with_string_field("version", &snapshot.version.to_string()));
     }
-    Ok(snapshot.messages)
+    let mut messages = snapshot.messages;
+    sanitize_transcript_messages(&mut messages);
+    Ok(messages)
+}
+
+/// Remove transcript content blocks that Anthropic rejects on replay.
+///
+/// Some model responses include `thinking` blocks whose `thinking` text is
+/// empty.  Those blocks are valid enough to deserialize and persist, but the
+/// Messages API rejects them when they are sent back in a later request.
+pub fn sanitize_transcript_messages(messages: &mut Vec<MessageParam>) {
+    messages.retain_mut(|message| {
+        let MessageParamContent::Array(blocks) = &mut message.content else {
+            return true;
+        };
+        let before = blocks.len();
+        blocks.retain(|block| !is_empty_thinking_block(block));
+        let removed_empty_thinking = before != blocks.len();
+        !(message.role == MessageRole::Assistant && removed_empty_thinking && blocks.is_empty())
+    });
+}
+
+fn is_empty_thinking_block(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::Thinking(block) if block.thinking.is_empty())
 }
 
 /// Build a two-message transcript representing a compacted session.
@@ -3492,7 +3529,8 @@ mod tests {
     use std::fs;
 
     use claudius::{
-        KnownModel, MessageParamContent, ToolBash20250124, ToolTextEditor20250728, ToolUnionParam,
+        KnownModel, MessageParamContent, ThinkingBlock, ToolBash20250124, ToolTextEditor20250728,
+        ToolUnionParam,
     };
     use serde_json::json;
 
@@ -4410,6 +4448,93 @@ compact_TOOLS='bash'
             blocks[2].as_text().map(|block| block.text.as_str()),
             Some("next request")
         );
+    }
+
+    #[test]
+    fn sanitize_transcript_messages_drops_empty_thinking_blocks() {
+        let mut messages = vec![MessageParam::new(
+            MessageParamContent::Array(vec![
+                ThinkingBlock::new("", "signed-empty-thinking").into(),
+                TextBlock::new("visible answer".to_string()).into(),
+            ]),
+            MessageRole::Assistant,
+        )];
+
+        sanitize_transcript_messages(&mut messages);
+
+        let MessageParamContent::Array(blocks) = &messages[0].content else {
+            panic!("expected content blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].as_text().map(|block| block.text.as_str()),
+            Some("visible answer")
+        );
+    }
+
+    #[test]
+    fn sanitize_transcript_messages_removes_assistant_message_left_empty() {
+        let mut messages = vec![
+            MessageParam::user("before"),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ThinkingBlock::new("", "signed-empty-thinking").into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+            MessageParam::user("after"),
+        ];
+
+        sanitize_transcript_messages(&mut messages);
+
+        assert_eq!(
+            messages,
+            vec![MessageParam::user("before"), MessageParam::user("after")]
+        );
+    }
+
+    #[test]
+    fn load_transcript_messages_sanitizes_empty_thinking_blocks() {
+        let root = unique_temp_dir("transcript");
+        fs::create_dir_all(root.as_str()).unwrap();
+        let path = root.join("transcript.json");
+        fs::write(
+            path.as_str(),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "signature": "signed-empty-thinking",
+                                "thinking": ""
+                            },
+                            {
+                                "type": "text",
+                                "text": "visible answer"
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let messages = load_transcript_messages(std::path::Path::new(path.as_str())).unwrap();
+
+        let MessageParamContent::Array(blocks) = &messages[0].content else {
+            panic!("expected content blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].as_text().map(|block| block.text.as_str()),
+            Some("visible answer")
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]
