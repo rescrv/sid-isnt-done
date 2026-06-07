@@ -972,17 +972,17 @@ fn analyze_paired_line(old: &str, new: &str, side: Side) -> LineAnalysis {
 
     let old_tokens = tokenize(old);
     let new_tokens = tokenize(new);
-    let (old_marks, new_marks) = diff_token_marks(&old_tokens, &new_tokens);
-    let marks = match side {
-        Side::Pre => old_marks,
-        Side::Post => new_marks,
+    let (old_ranges, new_ranges) = diff_token_ranges(&old_tokens, &new_tokens);
+    let ranges = match side {
+        Side::Pre => old_ranges,
+        Side::Post => new_ranges,
     };
-    let tokens = match side {
-        Side::Pre => old_tokens,
-        Side::Post => new_tokens,
-    };
-    let has_muted = marks.contains(&NoveltyWeight::Muted);
-    let has_full = marks.contains(&NoveltyWeight::Full);
+    let has_muted = ranges
+        .iter()
+        .any(|range| range.weight == NoveltyWeight::Muted);
+    let has_full = ranges
+        .iter()
+        .any(|range| range.weight == NoveltyWeight::Full);
     let novelty = if has_muted && has_full {
         LineNovelty::Mixed
     } else if has_full {
@@ -992,15 +992,7 @@ fn analyze_paired_line(old: &str, new: &str, side: Side) -> LineAnalysis {
     };
     LineAnalysis {
         novelty,
-        ranges: tokens
-            .iter()
-            .zip(marks)
-            .map(|(token, weight)| NoveltyRange {
-                start: token.start,
-                end: token.end,
-                weight,
-            })
-            .collect(),
+        ranges,
         ..LineAnalysis::default()
     }
 }
@@ -1076,49 +1068,49 @@ fn tokenize(input: &str) -> Vec<Token> {
     tokens
 }
 
-fn diff_token_marks(old: &[Token], new: &[Token]) -> (Vec<NoveltyWeight>, Vec<NoveltyWeight>) {
+fn diff_token_ranges(old: &[Token], new: &[Token]) -> (Vec<NoveltyRange>, Vec<NoveltyRange>) {
     let pairs = lcs_pairs_by(old, new, |left, right| {
         left.kind == right.kind && left.text == right.text
     });
-    let mut old_marks = vec![NoveltyWeight::Full; old.len()];
-    let mut new_marks = vec![NoveltyWeight::Full; new.len()];
+    let mut old_ranges = vec![];
+    let mut new_ranges = vec![];
     let mut old_cursor = 0usize;
     let mut new_cursor = 0usize;
     for (old_match, new_match) in pairs {
-        mark_changed_segment(
+        push_changed_segment_ranges(
             old,
             new,
-            &mut old_marks,
-            &mut new_marks,
+            &mut old_ranges,
+            &mut new_ranges,
             old_cursor,
             old_match,
             new_cursor,
             new_match,
         );
-        old_marks[old_match] = NoveltyWeight::Unchanged;
-        new_marks[new_match] = NoveltyWeight::Unchanged;
+        push_token_range(&mut old_ranges, &old[old_match], NoveltyWeight::Unchanged);
+        push_token_range(&mut new_ranges, &new[new_match], NoveltyWeight::Unchanged);
         old_cursor = old_match + 1;
         new_cursor = new_match + 1;
     }
-    mark_changed_segment(
+    push_changed_segment_ranges(
         old,
         new,
-        &mut old_marks,
-        &mut new_marks,
+        &mut old_ranges,
+        &mut new_ranges,
         old_cursor,
         old.len(),
         new_cursor,
         new.len(),
     );
-    (old_marks, new_marks)
+    (old_ranges, new_ranges)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mark_changed_segment(
+fn push_changed_segment_ranges(
     old: &[Token],
     new: &[Token],
-    old_marks: &mut [NoveltyWeight],
-    new_marks: &mut [NoveltyWeight],
+    old_ranges: &mut Vec<NoveltyRange>,
+    new_ranges: &mut Vec<NoveltyRange>,
     old_start: usize,
     old_end: usize,
     new_start: usize,
@@ -1128,19 +1120,126 @@ fn mark_changed_segment(
         .iter()
         .chain(new[new_start..new_end].iter())
         .all(|token| token.kind == TokenKind::Whitespace);
-    for idx in old_start..old_end {
-        old_marks[idx] = if all_whitespace || old[idx].kind == TokenKind::Whitespace {
-            NoveltyWeight::Muted
-        } else {
-            NoveltyWeight::Full
-        };
+
+    let paired_len = min(
+        old_end.saturating_sub(old_start),
+        new_end.saturating_sub(new_start),
+    );
+    for offset in 0..paired_len {
+        let old_token = &old[old_start + offset];
+        let new_token = &new[new_start + offset];
+        if !all_whitespace
+            && let Some((old_token_ranges, new_token_ranges)) =
+                subtoken_insertion_ranges(old_token, new_token)
+        {
+            old_ranges.extend(old_token_ranges);
+            new_ranges.extend(new_token_ranges);
+            continue;
+        }
+        push_changed_token_range(old_ranges, old_token, all_whitespace);
+        push_changed_token_range(new_ranges, new_token, all_whitespace);
     }
-    for idx in new_start..new_end {
-        new_marks[idx] = if all_whitespace || new[idx].kind == TokenKind::Whitespace {
-            NoveltyWeight::Muted
-        } else {
-            NoveltyWeight::Full
-        };
+    for token in &old[old_start + paired_len..old_end] {
+        push_changed_token_range(old_ranges, token, all_whitespace);
+    }
+    for token in &new[new_start + paired_len..new_end] {
+        push_changed_token_range(new_ranges, token, all_whitespace);
+    }
+}
+
+fn push_changed_token_range(ranges: &mut Vec<NoveltyRange>, token: &Token, all_whitespace: bool) {
+    let weight = if all_whitespace || token.kind == TokenKind::Whitespace {
+        NoveltyWeight::Muted
+    } else {
+        NoveltyWeight::Full
+    };
+    push_token_range(ranges, token, weight);
+}
+
+fn push_token_range(ranges: &mut Vec<NoveltyRange>, token: &Token, weight: NoveltyWeight) {
+    ranges.push(NoveltyRange {
+        start: token.start,
+        end: token.end,
+        weight,
+    });
+}
+
+fn subtoken_insertion_ranges(
+    old: &Token,
+    new: &Token,
+) -> Option<(Vec<NoveltyRange>, Vec<NoveltyRange>)> {
+    if old.kind != new.kind || old.kind == TokenKind::Whitespace {
+        return None;
+    }
+    if old.text.is_empty() || new.text.is_empty() {
+        return None;
+    }
+    if let Some(offset) = new.text.find(&old.text) {
+        return Some((
+            vec![token_relative_range(
+                old,
+                0,
+                old.text.len(),
+                NoveltyWeight::Unchanged,
+            )],
+            split_around_matching_subtoken(new, offset, old.text.len()),
+        ));
+    }
+    if let Some(offset) = old.text.find(&new.text) {
+        return Some((
+            split_around_matching_subtoken(old, offset, new.text.len()),
+            vec![token_relative_range(
+                new,
+                0,
+                new.text.len(),
+                NoveltyWeight::Unchanged,
+            )],
+        ));
+    }
+    None
+}
+
+fn split_around_matching_subtoken(
+    token: &Token,
+    match_start: usize,
+    match_len: usize,
+) -> Vec<NoveltyRange> {
+    let mut ranges = vec![];
+    if match_start > 0 {
+        ranges.push(token_relative_range(
+            token,
+            0,
+            match_start,
+            NoveltyWeight::Full,
+        ));
+    }
+    ranges.push(token_relative_range(
+        token,
+        match_start,
+        match_start + match_len,
+        NoveltyWeight::Unchanged,
+    ));
+    if match_start + match_len < token.text.len() {
+        ranges.push(token_relative_range(
+            token,
+            match_start + match_len,
+            token.text.len(),
+            NoveltyWeight::Full,
+        ));
+    }
+    ranges
+}
+
+fn token_relative_range(
+    token: &Token,
+    start: usize,
+    end: usize,
+    weight: NoveltyWeight,
+) -> NoveltyRange {
+    NoveltyRange {
+        start: token.start + start,
+        end: token.start + end,
+        weight,
     }
 }
 
@@ -2788,6 +2887,32 @@ diff --git a/old.rs b/new.rs
             .map(|token| token.text.as_str())
             .collect();
         assert_eq!(changed, vec!["new_name"]);
+    }
+
+    #[test]
+    fn word_delta_highlights_inserted_subtoken_prefix() {
+        let new = "fn from_str(s: &str) -> Result<StringResolver, rpc_pb::SError> {";
+        let meta = analyze_paired_line(
+            "fn from_str(s: &str) -> Result<StringResolver, rpc_pb::Error> {",
+            new,
+            Side::Post,
+        );
+        assert_eq!(meta.novelty, LineNovelty::Content);
+
+        let full: Vec<&str> = meta
+            .ranges
+            .iter()
+            .filter(|range| range.weight == NoveltyWeight::Full)
+            .map(|range| &new[range.start..range.end])
+            .collect();
+        assert_eq!(full, vec!["S"]);
+
+        let serror = new.find("SError").unwrap();
+        assert!(meta.ranges.iter().any(|range| {
+            range.start == serror + 1
+                && range.end == serror + "SError".len()
+                && range.weight == NoveltyWeight::Unchanged
+        }));
     }
 
     #[test]
