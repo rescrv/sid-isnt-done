@@ -302,11 +302,19 @@ impl ReviewApp {
                 self.should_quit = true;
                 ReviewAction::Quit
             }
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_down_line();
+                ReviewAction::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_up_line();
+                ReviewAction::None
+            }
+            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.select_next();
                 ReviewAction::None
             }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+            KeyCode::Char('K') | KeyCode::PageUp => {
                 self.select_previous();
                 ReviewAction::None
             }
@@ -350,6 +358,15 @@ impl ReviewApp {
         } else {
             self.scroll_top = 0;
         }
+    }
+
+    fn scroll_down_line(&mut self) {
+        self.scroll_top = self.scroll_top.saturating_add(1);
+        self.clamp_scroll();
+    }
+
+    fn scroll_up_line(&mut self) {
+        self.scroll_top = self.scroll_top.saturating_sub(1);
     }
 
     fn select_first(&mut self) {
@@ -479,7 +496,7 @@ impl ReviewApp {
     fn status_text(&self) -> String {
         match self.selected {
             Some(selected) => format!(
-                "{}/{}  {}  j/k chunks  f fold  G end  q quit",
+                "{}/{}  {}  j/k scroll  J/K folds  f fold  G end  q quit",
                 selected + 1,
                 self.blocks.len(),
                 self.blocks[selected].title
@@ -1157,6 +1174,70 @@ diff --git a/a.txt b/a.txt
                 "  27   27   keep_nine".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn lowercase_j_and_k_scroll_one_visible_line() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+
+        assert_eq!(app.handle_key(KeyCode::Char('j')), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 1);
+        assert_eq!(
+            app.visible_text(),
+            vec![
+                "     diff --git a/a.rs b/a.rs".to_string(),
+                "     --- a/a.rs".to_string(),
+                "     +++ b/a.rs".to_string(),
+                "     @@ -1,2 +1,2 @@".to_string(),
+            ]
+        );
+
+        assert_eq!(app.handle_key(KeyCode::Char('k')), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 0);
+    }
+
+    #[test]
+    fn uppercase_j_and_k_move_one_fold_at_a_time() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+
+        assert_eq!(app.handle_key(KeyCode::Char('J')), ReviewAction::None);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_top, 8);
+
+        assert_eq!(app.handle_key(KeyCode::Char('K')), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 0);
+    }
+
+    #[test]
+    fn line_scroll_clamps_at_document_edges() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('j'));
+        }
+        assert_eq!(app.scroll_top, app.max_scroll());
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.visible_text(),
+            vec![
+                "  24   24   keep_six".to_string(),
+                "  25   25   keep_seven".to_string(),
+                "  26   26   keep_eight".to_string(),
+                "  27   27   keep_nine".to_string(),
+            ]
+        );
+
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('k'));
+        }
+        assert_eq!(app.scroll_top, 0);
+        assert_eq!(app.selected, Some(0));
     }
 
     #[test]
