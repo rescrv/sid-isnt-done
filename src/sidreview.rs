@@ -389,8 +389,13 @@ impl ReviewApp {
         let Some(selected) = self.selected else {
             return ReviewAction::None;
         };
-        self.blocks[selected].folded = !self.blocks[selected].folded;
-        self.select_next();
+        let was_folded = self.blocks[selected].folded;
+        self.blocks[selected].folded = !was_folded;
+        if was_folded {
+            self.scroll_selected_to_start();
+        } else {
+            self.select_next();
+        }
         ReviewAction::FoldStateChanged
     }
 
@@ -1235,6 +1240,23 @@ diff --git a/a.txt b/a.txt
         assert!(!app.blocks[2].folded);
         assert_eq!(app.selected, Some(2));
         assert_eq!(app.scroll_top, 2);
+    }
+
+    #[test]
+    fn unfolding_selected_block_does_not_advance() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+        app.blocks[1].folded = true;
+        app.selected = Some(1);
+        app.scroll_selected_to_start();
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('f')),
+            ReviewAction::FoldStateChanged
+        );
+        assert!(!app.blocks[1].folded);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_top, 8);
     }
 
     #[test]
