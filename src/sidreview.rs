@@ -390,7 +390,7 @@ impl ReviewApp {
             return ReviewAction::None;
         };
         self.blocks[selected].folded = !self.blocks[selected].folded;
-        self.ensure_selected_visible();
+        self.select_next();
         ReviewAction::FoldStateChanged
     }
 
@@ -1214,6 +1214,30 @@ diff --git a/a.txt b/a.txt
     }
 
     #[test]
+    fn folding_selected_block_advances_to_next_block() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('f')),
+            ReviewAction::FoldStateChanged
+        );
+        assert!(app.blocks[0].folded);
+        assert!(!app.blocks[1].folded);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_top, 1);
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('f')),
+            ReviewAction::FoldStateChanged
+        );
+        assert!(app.blocks[1].folded);
+        assert!(!app.blocks[2].folded);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.scroll_top, 2);
+    }
+
+    #[test]
     fn line_scroll_clamps_at_document_edges() {
         let mut app = ReviewApp::from_input(THREE_HUNKS);
         app.set_viewport_height(4);
@@ -1313,6 +1337,7 @@ diff --git a/a.txt b/a.txt
 
         let mut app = ReviewApp::from_input(TWO_HUNKS);
         app.toggle_selected_fold();
+        app.select_first();
         app.toggle_selected_fold();
         store.save(&app.fold_state()).unwrap();
 
