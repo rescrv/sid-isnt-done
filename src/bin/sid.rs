@@ -748,6 +748,11 @@ impl SidRuntimeSession {
         self.persist_transcript()
     }
 
+    fn insert_system_message(&mut self, message: String) -> Result<(), SError> {
+        self.chat.insert_system_message(message);
+        self.persist_transcript()
+    }
+
     fn save_transcript_to(&self, path: &str) -> Result<(), SError> {
         self.chat
             .save_transcript_to(path)
@@ -1432,13 +1437,12 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                                 .print_info(&context, &format!("Model changed to: {model_name}"));
                         }
                         ChatCommand::System(prompt) => {
-                            session.set_system_prompt(prompt.clone());
-                            match prompt {
-                                Some(prompt) => terminal.print_info(
+                            match session.insert_system_message(prompt.clone()) {
+                                Ok(()) => terminal.print_info(
                                     &context,
-                                    &format!("System prompt set to: {prompt}"),
+                                    &format!("System message inserted: {prompt}"),
                                 ),
-                                None => terminal.print_info(&context, "System prompt cleared."),
+                                Err(err) => terminal.print_error(&context, &err.to_string()),
                             }
                         }
                         ChatCommand::MaxTokens(value) => {
@@ -1905,19 +1909,14 @@ impl RawTerminalClient {
                 if self
                     .send_request_data(
                         "system",
-                        RawRequest::SetSystemPrompt {
-                            prompt: prompt.clone(),
+                        RawRequest::InsertSystemMessage {
+                            text: prompt.clone(),
                         },
                         terminal,
                     )?
                     .is_some()
                 {
-                    match prompt {
-                        Some(prompt) => {
-                            terminal.print_info(&(), &format!("System prompt set to: {prompt}"))
-                        }
-                        None => terminal.print_info(&(), "System prompt cleared."),
-                    }
+                    terminal.print_info(&(), &format!("System message inserted: {prompt}"));
                 }
             }
             ChatCommand::MaxTokens(value) => {
@@ -2775,6 +2774,12 @@ where
                 .await
                 .map_err(|err| cli_error("send_message_failed", &err.to_string()))?;
             maybe_auto_compact(session, server, &()).await;
+            Ok(RequestDisposition::Continue(Some(session_identity_json(
+                session,
+            ))))
+        }
+        RawRequest::InsertSystemMessage { text } => {
+            session.insert_system_message(text)?;
             Ok(RequestDisposition::Continue(Some(session_identity_json(
                 session,
             ))))

@@ -181,9 +181,9 @@ warning.
   for `VMADDR_CID_ANY`, or `unix:///path/to/socket` on Unix platforms.  When a
   new client connects, sid disconnects the previous socket, replays all prior
   server messages to the new socket, and then continues streaming live output.
-  Accepted `user_turn` requests are replayed as `request` messages before their
-  related events/results so frontends can rebuild the transcript from the raw
-  stream alone.  Prompts that were already answered are replayed as
+  Accepted transcript-affecting requests are replayed as `request` messages
+  before their related events/results so frontends can rebuild the transcript
+  from the raw stream alone.  Prompts that were already answered are replayed as
   `prompt_ack` messages with the accepted response; unanswered prompts are
   replayed as normal `prompt` messages.  A `replay_complete` message marks the
   end of the replayed history.

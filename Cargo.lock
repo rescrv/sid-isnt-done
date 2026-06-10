@@ -149,9 +149,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "claudius"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02a6dbde7a93c935e17dbc93b0af31f8475aecdba1bc961dc7b40a585e6cfe2"
+checksum = "8e7dd1a2cef3c7ed79d089ffee4d6ef03c95945ca05a01403e9f1a757b7a5865"
 dependencies = [
  "arrrg",
  "arrrg_derive",

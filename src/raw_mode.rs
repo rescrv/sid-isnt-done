@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_succeeds_for_valid_request() {
-        let line = r#"{"protocol_version":2,"request_id":"r-1","op":"stats"}"#;
+        let line = r#"{"protocol_version":3,"request_id":"r-1","op":"stats"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(envelope.request_id, "r-1");
         assert_eq!(envelope.request, RawRequest::Stats);
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn parse_request_line_succeeds_for_user_turn() {
         let line =
-            r#"{"protocol_version":2,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
+            r#"{"protocol_version":3,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(
             envelope.request,
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_succeeds_for_interrupt() {
-        let line = r#"{"protocol_version":2,"request_id":"r-int","op":"interrupt"}"#;
+        let line = r#"{"protocol_version":3,"request_id":"r-int","op":"interrupt"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(envelope.request_id, "r-int");
         assert_eq!(envelope.request, RawRequest::Interrupt);
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_missing_request_id_gives_empty_string() {
-        let err = parse_request_line(r#"{"protocol_version":2}"#).unwrap_err();
+        let err = parse_request_line(r#"{"protocol_version":3}"#).unwrap_err();
         assert_eq!(err.request_id, "");
     }
 
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn read_request_skips_blank_lines() {
         let input = BufReader::new(
-            b"\n\n{\"protocol_version\":2,\"request_id\":\"r-1\",\"op\":\"stats\"}\n".as_slice(),
+            b"\n\n{\"protocol_version\":3,\"request_id\":\"r-1\",\"op\":\"stats\"}\n".as_slice(),
         );
         let output = Vec::new();
         let mut server = RawServer::new(input, output);
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn read_request_reports_malformed_json_and_continues() {
         let input = BufReader::new(
-            b"not json\n{\"protocol_version\":2,\"request_id\":\"r-1\",\"op\":\"stats\"}\n"
+            b"not json\n{\"protocol_version\":3,\"request_id\":\"r-1\",\"op\":\"stats\"}\n"
                 .as_slice(),
         );
         let output = Vec::new();
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn read_request_reports_valid_json_with_missing_op_and_continues() {
         let input = BufReader::new(
-            b"{\"request_id\":\"bad\",\"protocol_version\":2}\n{\"protocol_version\":2,\"request_id\":\"good\",\"op\":\"shutdown\"}\n"
+            b"{\"request_id\":\"bad\",\"protocol_version\":3}\n{\"protocol_version\":3,\"request_id\":\"good\",\"op\":\"shutdown\"}\n"
                 .as_slice(),
         );
         let output = Vec::new();
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn should_interrupt_polls_interrupt_request() {
         let input = PollInput::new(&[
-            r#"{"protocol_version":2,"request_id":"interrupt-1","op":"interrupt"}"#,
+            r#"{"protocol_version":3,"request_id":"interrupt-1","op":"interrupt"}"#,
         ]);
         let output = Vec::new();
         let mut server = RawServer::new(input, output);
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn should_interrupt_rejects_non_interrupt_request_as_busy() {
         let input =
-            PollInput::new(&[r#"{"protocol_version":2,"request_id":"stats-1","op":"stats"}"#]);
+            PollInput::new(&[r#"{"protocol_version":3,"request_id":"stats-1","op":"stats"}"#]);
         let output = Vec::new();
         let server = RawServer::new(input, output);
 
@@ -970,8 +970,8 @@ mod tests {
     #[test]
     fn prompt_wait_rejects_non_prompt_requests() {
         let input = BufReader::new(
-            br#"{"protocol_version":2,"request_id":"bad","op":"stats"}
-{"protocol_version":2,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+            br#"{"protocol_version":3,"request_id":"bad","op":"stats"}
+{"protocol_version":3,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
 "#
             .as_slice(),
         );
@@ -995,8 +995,8 @@ mod tests {
     #[test]
     fn prompt_wait_rejects_stale_prompt_id() {
         let input = BufReader::new(
-            br#"{"protocol_version":2,"request_id":"stale","op":"prompt_response","prompt_id":"prompt-999","response":"yes"}
-{"protocol_version":2,"request_id":"correct","op":"prompt_response","prompt_id":"prompt-1","response":"no"}
+            br#"{"protocol_version":3,"request_id":"stale","op":"prompt_response","prompt_id":"prompt-999","response":"yes"}
+{"protocol_version":3,"request_id":"correct","op":"prompt_response","prompt_id":"prompt-1","response":"no"}
 "#
             .as_slice(),
         );
@@ -1029,8 +1029,8 @@ mod tests {
     fn prompt_ids_increment_across_calls() {
         // First prompt uses prompt-1, second uses prompt-2.
         let input = BufReader::new(
-            br#"{"protocol_version":2,"request_id":"a","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
-{"protocol_version":2,"request_id":"b","op":"prompt_response","prompt_id":"prompt-2","response":"no"}
+            br#"{"protocol_version":3,"request_id":"a","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+{"protocol_version":3,"request_id":"b","op":"prompt_response","prompt_id":"prompt-2","response":"no"}
 "#
             .as_slice(),
         );
@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     fn prompt_uses_fallback_request_id_when_none_set() {
         let input = BufReader::new(
-            br#"{"protocol_version":2,"request_id":"resp","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+            br#"{"protocol_version":3,"request_id":"resp","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
 "#
             .as_slice(),
         );

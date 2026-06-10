@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current `sid --raw` protocol version.
-pub const RAW_PROTOCOL_VERSION: u32 = 2;
+pub const RAW_PROTOCOL_VERSION: u32 = 3;
 
 /// A client request envelope sent to `sid --raw`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -34,6 +34,11 @@ pub enum RawRequest {
     /// Send a normal user turn to the agent.
     UserTurn {
         /// User-visible message text.
+        text: String,
+    },
+    /// Insert a system message into the conversation transcript.
+    InsertSystemMessage {
+        /// System message text.
         text: String,
     },
     /// Reply to an outstanding server prompt.
@@ -220,7 +225,8 @@ pub struct RawHello {
 /// The listener retains this message in history before request-scoped events so
 /// reconnecting frontends can reconstruct the user-visible transcript without
 /// reading a filesystem-local saved transcript.  The server currently emits
-/// this marker for accepted `user_turn` requests.
+/// this marker for accepted requests that affect transcript history without
+/// being recoverable from streamed assistant output.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RawAcceptedRequest {
     /// Protocol version emitted by the server.
@@ -243,7 +249,7 @@ impl RawAcceptedRequest {
     /// reconstruction.
     pub fn from_envelope(envelope: &RawRequestEnvelope) -> Option<Self> {
         match &envelope.request {
-            RawRequest::UserTurn { .. } => Some(Self {
+            RawRequest::UserTurn { .. } | RawRequest::InsertSystemMessage { .. } => Some(Self {
                 protocol_version: RAW_PROTOCOL_VERSION,
                 sequence: 0,
                 request_id: envelope.request_id.clone(),
@@ -1203,6 +1209,25 @@ mod tests {
             request.request,
             RawRequest::UserTurn {
                 text: "what did I ask?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepted_request_from_envelope_keeps_inserted_system_message_text() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "system-1".to_string(),
+            request: RawRequest::InsertSystemMessage {
+                text: "pin this instruction".to_string(),
+            },
+        };
+        let request = RawAcceptedRequest::from_envelope(&envelope).unwrap();
+        assert_eq!(request.request_id, "system-1");
+        assert_eq!(
+            request.request,
+            RawRequest::InsertSystemMessage {
+                text: "pin this instruction".to_string(),
             }
         );
     }

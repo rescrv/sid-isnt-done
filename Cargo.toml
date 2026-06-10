@@ -29,7 +29,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 
 arrrg = "^0.10"
 arrrg_derive = "^0.10"
-claudius = { version = "^0.32" }
+claudius = { version = "^0.33" }
 handled = { version = "^0.7" }
 rc_conf = { version = "^0.18", default-features = false }
 setsum = "^0.9"
