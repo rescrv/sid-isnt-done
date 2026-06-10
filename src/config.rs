@@ -1162,7 +1162,7 @@ fn parse_thinking_budget(
         "on" | "true" | "yes" | "enable" | "enabled" => {
             Ok(Some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET)))
         }
-        "adaptive" => Ok(Some(ThinkingConfig::adaptive())),
+        "adaptive" => Ok(Some(ThinkingConfig::adaptive_summarized())),
         _ => parse_u32_field(scope, field, value).map(|v| Some(ThinkingConfig::enabled(v))),
     }
 }
