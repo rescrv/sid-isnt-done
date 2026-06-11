@@ -896,10 +896,13 @@ fn prepared_rc_tool_command(
     subcommand: &str,
     writable_roots: &WritableRoots,
 ) -> tokio::process::Command {
-    let read_roots = seatbelt::service_read_roots(
+    let mut read_roots = seatbelt::service_read_roots(
         StdPath::new(prepared.config_root.as_str()),
         StdPath::new(prepared.executable_path.as_str()),
     );
+    if let Some(session_dir) = prepared.session_dir.as_ref() {
+        read_roots.push(session_dir.to_string_lossy().into_owned());
+    }
     let mut cmd = seatbelt::sandboxed_command_with_read_roots(
         prepared.executable_path.as_str(),
         &[subcommand],

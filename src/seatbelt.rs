@@ -722,10 +722,21 @@ fn build_policy_with_home_and_read_roots(
 /// The returned vec is `[sandbox-exec, -p, <policy>, -D, DARWIN_USER_CACHE_DIR=..., -D,
 /// DARWIN_USER_TEMP_DIR=..., --]`.
 pub fn shell_wrapper(writable_roots: &WritableRoots) -> Option<Vec<String>> {
+    shell_wrapper_with_read_roots(writable_roots, &[])
+}
+
+/// Build a [`claudius::BashPtyConfig`] shell wrapper with additional read roots.
+///
+/// This is used when sid-owned runtime directories live under `$HOME`: they
+/// must remain readable without making arbitrary home writable roots readable.
+pub(crate) fn shell_wrapper_with_read_roots(
+    writable_roots: &WritableRoots,
+    extra_read_roots: &[String],
+) -> Option<Vec<String>> {
     if !sandbox_available() {
         return None;
     }
-    let policy = build_policy(writable_roots);
+    let policy = build_policy_with_read_roots(writable_roots, extra_read_roots);
     let cache_dir = darwin_user_cache_dir();
     let temp_dir = darwin_user_temp_dir();
     Some(vec![
@@ -943,6 +954,27 @@ mod tests {
         assert!(policy.contains(
             "(allow file-read* file-test-existence (subpath \"/Users/tester/.sid/agents/skill-inject\"))"
         ));
+    }
+
+    #[test]
+    fn build_policy_can_read_explicit_session_root_under_home() {
+        let session_root = "/Users/tester/.sid/sessions/2026-06-06T17-12-50.024868-0700";
+        let policy = build_policy_with_home_and_read_roots(
+            &roots(&[session_root]),
+            &[session_root.to_string()],
+            Some(Path::new("/Users/tester")),
+        );
+
+        assert!(policy.contains(&format!(
+            "(allow file-read* file-test-existence (subpath \"{session_root}\"))"
+        )));
+        assert!(policy.contains(&format!("(allow file-write* (subpath \"{session_root}\"))")));
+        assert!(
+            !policy.contains(
+                "(allow file-read* file-test-existence (subpath \"/Users/tester/.sid\"))"
+            ),
+            "only the current session root should become readable"
+        );
     }
 
     #[test]

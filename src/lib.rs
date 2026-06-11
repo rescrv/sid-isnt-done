@@ -723,6 +723,7 @@ impl SidAgent {
 
     fn bash_pty_config(&self) -> BashPtyConfig {
         let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        let mut read_roots = Vec::new();
         env.insert(
             "SID_WORKSPACE_ROOT".to_string(),
             self.workspace_root.as_str().to_string(),
@@ -744,14 +745,17 @@ impl SidAgent {
                 "TMPDIR".to_string(),
                 session.bash_tmp_dir().to_string_lossy().into_owned(),
             );
+            read_roots.push(session.root().to_string_lossy().into_owned());
         }
         env.insert("PAGER".to_string(), "cat".to_string());
         env.insert("HISTFILE".to_string(), "/dev/null".to_string());
         env.insert("INPUTRC".to_string(), "/dev/null".to_string());
+        let shell_wrapper =
+            seatbelt::shell_wrapper_with_read_roots(&self.writable_roots, &read_roots);
         BashPtyConfig {
             cwd: PathBuf::from(self.workspace_root.as_str()),
             env,
-            shell_wrapper: seatbelt::shell_wrapper(&self.writable_roots),
+            shell_wrapper,
             ..BashPtyConfig::default()
         }
     }
