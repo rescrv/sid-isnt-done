@@ -1141,7 +1141,7 @@ mod tests {
         let observer = RawUsageReportObserver::new(output.clone(), "r-usage");
 
         observer.on_usage_report(&UsageReportEvent {
-            token_line: "[tokens: input=1 cached_input=2 output=3]".to_string(),
+            token_line: "[tokens: input=1 cache_creation=2 cached_input=3 output=4]".to_string(),
             usage_line: "[usage: test]".to_string(),
         });
 
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(values[0]["request_id"], "r-usage");
         assert_eq!(
             values[0]["message"],
-            "[tokens: input=1 cached_input=2 output=3]"
+            "[tokens: input=1 cache_creation=2 cached_input=3 output=4]"
         );
         assert_eq!(values[1]["type"], "event");
         assert_eq!(values[1]["event"], "info");

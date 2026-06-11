@@ -1408,8 +1408,8 @@ impl Agent for SidAgent {
         };
         let report = UsageReportEvent {
             token_line: format!(
-                "[tokens: input={} cached_input={} output={}{}]",
-                totals.input, totals.cached_input, totals.output, cost_suffix
+                "[tokens: input={} cache_creation={} cached_input={} output={}{}]",
+                totals.input, totals.cache_creation, totals.cached_input, totals.output, cost_suffix
             ),
             usage_line: format!("[usage: {:?}]", resp.usage),
         };
@@ -1815,6 +1815,7 @@ fn render_tool_result_content(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TokenUsageTotals {
     input: u64,
+    cache_creation: u64,
     cached_input: u64,
     output: u64,
     cost_micro_cents: u64,
@@ -1823,6 +1824,9 @@ struct TokenUsageTotals {
 impl TokenUsageTotals {
     fn add(&mut self, usage: Usage, rates: Option<TokenRates>) {
         self.input = self.input.saturating_add(tokens_to_u64(usage.input_tokens));
+        self.cache_creation = self
+            .cache_creation
+            .saturating_add(optional_tokens_to_u64(usage.cache_creation_input_tokens));
         self.cached_input = self
             .cached_input
             .saturating_add(optional_tokens_to_u64(usage.cache_read_input_tokens));
@@ -4544,13 +4548,24 @@ compact_TOOLS='bash'
     #[test]
     fn token_usage_totals_accumulate_input_cached_input_and_output() {
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(10, 4).with_cache_read_input_tokens(6), None);
-        totals.add(Usage::new(20, 8).with_cache_read_input_tokens(7), None);
+        totals.add(
+            Usage::new(10, 4)
+                .with_cache_creation_input_tokens(3)
+                .with_cache_read_input_tokens(6),
+            None,
+        );
+        totals.add(
+            Usage::new(20, 8)
+                .with_cache_creation_input_tokens(5)
+                .with_cache_read_input_tokens(7),
+            None,
+        );
 
         assert_eq!(
             totals,
             TokenUsageTotals {
                 input: 30,
+                cache_creation: 8,
                 cached_input: 13,
                 output: 12,
                 cost_micro_cents: 0,
@@ -4561,7 +4576,12 @@ compact_TOOLS='bash'
     #[test]
     fn token_usage_totals_treat_negative_counts_as_zero() {
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(-10, -4).with_cache_read_input_tokens(-6), None);
+        totals.add(
+            Usage::new(-10, -4)
+                .with_cache_creation_input_tokens(-3)
+                .with_cache_read_input_tokens(-6),
+            None,
+        );
 
         assert_eq!(totals, TokenUsageTotals::default());
     }
@@ -4575,10 +4595,18 @@ compact_TOOLS='bash'
             cache_read: 30,
         };
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(100, 50), Some(rates));
+        totals.add(
+            Usage::new(100, 50)
+                .with_cache_creation_input_tokens(20)
+                .with_cache_read_input_tokens(10),
+            Some(rates),
+        );
 
-        // 100 input * 300 + 50 output * 1500 = 30_000 + 75_000 = 105_000
-        assert_eq!(totals.cost_micro_cents, 105_000);
+        // 100 input * 300 + 50 output * 1500 + 20 cache_creation * 375
+        //     + 10 cache_read * 30
+        // = 30_000 + 75_000 + 7_500 + 300 = 112_800
+        assert_eq!(totals.cost_micro_cents, 112_800);
+        assert_eq!(totals.cache_creation, 20);
     }
 
     #[test]
