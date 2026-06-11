@@ -74,15 +74,25 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Home-directory read roots kept available inside the sandbox.
 ///
 /// These cover the user's source tree, the standard Rust toolchain and package
-/// cache locations used by `cargo`, and common Git configuration locations.
-const HOME_READ_SUBPATHS: &[&str] = &[".cache", ".cargo", ".config/git", ".rustup", "src"];
+/// cache locations used by `cargo`, common Git configuration locations, and the
+/// `uv` Python toolchain/data directory (`~/.local/share/uv`).
+const HOME_READ_SUBPATHS: &[&str] = &[
+    ".cache",
+    ".cargo",
+    ".config/git",
+    ".local/share/uv",
+    ".rustup",
+    "src",
+];
 
 /// Home-directory subpaths that a sandboxed process may both read and write.
 ///
 /// The XDG cache directory (`~/.cache`) is used by a wide range of tools to
 /// persist regenerable artifacts; permitting writes here keeps those tools
-/// working without exposing the rest of the home directory.
-const HOME_WRITE_SUBPATHS: &[&str] = &[".cache"];
+/// working without exposing the rest of the home directory.  The `uv` data
+/// directory (`~/.local/share/uv`) is writable so `uv` can manage its installed
+/// Python interpreters and tools.
+const HOME_WRITE_SUBPATHS: &[&str] = &[".cache", ".local/share/uv"];
 
 /// Individual home-directory files kept readable inside the sandbox.
 const HOME_READ_FILES: &[&str] = &[
@@ -885,6 +895,7 @@ mod tests {
         assert!(policy.contains("(subpath \"/Users/tester/.cargo\")"));
         assert!(policy.contains("(subpath \"/Users/tester/.config/git\")"));
         assert!(policy.contains("(subpath \"/Users/tester/.gitconfig\")"));
+        assert!(policy.contains("(subpath \"/Users/tester/.local/share/uv\")"));
         assert!(policy.contains("(subpath \"/Users/tester/.rustup\")"));
         assert!(policy.contains("(subpath \"/Users/tester/src\")"));
     }
@@ -902,6 +913,22 @@ mod tests {
         assert!(
             policy.contains("(allow file-write* (subpath \"/Users/tester/.cache\"))"),
             "home cache must be writable"
+        );
+    }
+
+    #[test]
+    fn build_policy_allows_reading_and_writing_uv_data_dir() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(
+            policy.contains(
+                "(allow file-read* file-test-existence (subpath \"/Users/tester/.local/share/uv\"))"
+            ),
+            "uv data dir must be readable"
+        );
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/Users/tester/.local/share/uv\"))"),
+            "uv data dir must be writable"
         );
     }
 
