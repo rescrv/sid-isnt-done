@@ -404,7 +404,7 @@ impl ReviewApp {
         for block in &mut self.blocks {
             block.folded = folded.contains(&block.title);
         }
-        self.ensure_selected_visible();
+        self.clamp_scroll();
     }
 
     fn fold_state(&self) -> FoldState {
@@ -429,21 +429,6 @@ impl ReviewApp {
         self.scroll_top = self.max_scroll();
     }
 
-    fn ensure_selected_visible(&mut self) {
-        let Some(selected) = self.selected else {
-            self.clamp_scroll();
-            return;
-        };
-        let start = self.block_start(selected);
-        let end = self.block_end(selected);
-        if start < self.scroll_top {
-            self.scroll_top = start;
-        } else if end > self.scroll_top + self.viewport_height {
-            self.scroll_top = end.saturating_sub(self.viewport_height);
-        }
-        self.clamp_scroll();
-    }
-
     fn clamp_scroll(&mut self) {
         self.scroll_top = min(self.scroll_top, self.max_scroll());
     }
@@ -458,10 +443,6 @@ impl ReviewApp {
             .take(target)
             .map(ReviewBlock::height)
             .sum()
-    }
-
-    fn block_end(&self, target: usize) -> usize {
-        self.block_start(target) + self.blocks[target].height()
     }
 
     fn rows(&self) -> Vec<ReviewRow> {
@@ -1348,6 +1329,24 @@ diff --git a/a.txt b/a.txt
         restored.apply_fold_state(&store.load().unwrap().unwrap());
         assert!(!restored.blocks[0].folded);
         assert!(restored.blocks[1].folded);
+    }
+
+    #[test]
+    fn applying_fold_state_before_first_draw_keeps_first_block_at_top() {
+        let mut app = ReviewApp::from_input(TWO_HUNKS);
+        app.apply_fold_state(&FoldState::default());
+        app.set_viewport_height(4);
+
+        assert_eq!(app.scroll_top, 0);
+        assert_eq!(
+            app.visible_text(),
+            vec![
+                "v a.rs @@ -1,2 +1,2 @@".to_string(),
+                "     diff --git a/a.rs b/a.rs".to_string(),
+                "     --- a/a.rs".to_string(),
+                "     +++ b/a.rs".to_string(),
+            ]
+        );
     }
 
     #[test]
