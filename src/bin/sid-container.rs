@@ -5,7 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrrg::{CommandLine, NoExitCommandLine};
 use arrrg_derive::CommandLine;
 use serde_json::json;
-use sid_isnt_done::containers::container_command_output;
+use sid_isnt_done::containers::{
+    ContainerInstance, ContainerRuntime, ContainerStatus, OsContainerRuntime,
+    container_command_output,
+};
 
 const DEFAULT_CONTAINER_BIN: &str = "container";
 const DEFAULT_CONTAINER_SOCKET_DIR: &str = "/run/sid";
@@ -50,13 +53,25 @@ USAGE: sid-container <command> [options]
 
 Commands:
   build    Compose prebuilt scratch overlays onto a base image
-  run      Start one sid container and print its raw listener endpoint";
+  run      Start one sid container and print its raw listener endpoint
+  list     List sid-managed containers
+  stop     Stop sid-managed containers by name
+  rm       Delete sid-managed containers by name";
 
 const BUILD_USAGE: &str = "\
 USAGE: sid-container build [options] <name> <base-image> [overlay...]";
 
 const RUN_USAGE: &str = "\
 USAGE: sid-container run [options] <image> [sid-arg...]";
+
+const LIST_USAGE: &str = "\
+USAGE: sid-container list [options]";
+
+const STOP_USAGE: &str = "\
+USAGE: sid-container stop [options] <name> [name...]";
+
+const RM_USAGE: &str = "\
+USAGE: sid-container rm [options] <name> [name...]";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, CommandLine)]
 struct BuildOptions {
@@ -93,7 +108,7 @@ struct RunOptions {
     #[arrrg(optional, "Container address for sid TCP listeners", "HOST")]
     container_address: String,
     #[arrrg(optional, "Container TCP port for sid TCP listeners", "PORT")]
-    container_port: u16,
+    container_port: Option<u16>,
     #[arrrg(optional, "Host directory for the Unix socket", "PATH")]
     socket_dir: Option<String>,
     #[arrrg(optional, "Socket file name", "NAME")]
@@ -102,14 +117,20 @@ struct RunOptions {
     container_socket_dir: String,
     #[arrrg(
         optional,
-        "Milliseconds to wait for Unix socket creation with --transport unix",
+        "Milliseconds to wait for the listener to come up; 0 disables waiting",
         "MS"
     )]
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
     #[arrrg(optional, "Pass a CPU limit through to container run", "COUNT")]
     cpus: Option<String>,
     #[arrrg(optional, "Pass a memory limit through to container run", "SIZE")]
     memory: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CommandLine)]
+struct RuntimeOptions {
+    #[arrrg(optional, "Path to the macOS container CLI", "PATH")]
+    container_bin: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +202,8 @@ enum WaitTarget {
 enum CommandResult {
     BuiltImage(String),
     Endpoint(String),
+    Listing(Vec<String>),
+    Quiet,
 }
 
 impl CommandResult {
@@ -188,6 +211,12 @@ impl CommandResult {
         match self {
             Self::BuiltImage(image) => println!("{image}"),
             Self::Endpoint(endpoint) => println!("{endpoint}"),
+            Self::Listing(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Self::Quiet => {}
         }
     }
 }
@@ -206,6 +235,18 @@ fn main() {
         print_arrrg_usage::<RunOptions>(RUN_USAGE);
         return;
     }
+    if is_subcommand_help(&args, "list") {
+        print_arrrg_usage::<RuntimeOptions>(LIST_USAGE);
+        return;
+    }
+    if is_subcommand_help(&args, "stop") {
+        print_arrrg_usage::<RuntimeOptions>(STOP_USAGE);
+        return;
+    }
+    if is_subcommand_help(&args, "rm") {
+        print_arrrg_usage::<RuntimeOptions>(RM_USAGE);
+        return;
+    }
 
     match dispatch(args) {
         Ok(result) => result.print(),
@@ -217,12 +258,39 @@ fn main() {
 }
 
 fn dispatch(args: Vec<String>) -> Result<CommandResult, String> {
-    let (command, rest) = split_subcommand(args, &["build", "run"])?;
+    let (command, rest) = split_subcommand(args, &["build", "run", "list", "stop", "rm"])?;
     match command.as_str() {
         "build" => build(parse_build_request(&rest)?).map(CommandResult::BuiltImage),
-        "run" => run(parse_run_request(&rest)?).map(CommandResult::Endpoint),
+        "run" => {
+            run(parse_run_request(&rest, &captured_process_env()?)?).map(CommandResult::Endpoint)
+        }
+        "list" => {
+            let mut runtime = parse_runtime(LIST_USAGE, &rest, 0)?.0;
+            list_managed(&mut runtime).map(CommandResult::Listing)
+        }
+        "stop" => {
+            let (mut runtime, names) = parse_runtime(STOP_USAGE, &rest, 1)?;
+            stop_managed(&mut runtime, &names).map(|()| CommandResult::Quiet)
+        }
+        "rm" => {
+            let (mut runtime, names) = parse_runtime(RM_USAGE, &rest, 1)?;
+            delete_managed(&mut runtime, &names).map(|()| CommandResult::Quiet)
+        }
         _ => unreachable!("split_subcommand returned an unknown command"),
     }
+}
+
+fn parse_runtime(
+    usage: &str,
+    args: &[String],
+    min_free: usize,
+) -> Result<(OsContainerRuntime, Vec<String>), String> {
+    let (options, free) = parse_arrrg::<RuntimeOptions>(usage, args)?;
+    if free.len() < min_free {
+        return Err(format!("missing container name\n{usage}"));
+    }
+    let container_bin = default_string(options.container_bin, DEFAULT_CONTAINER_BIN);
+    Ok((OsContainerRuntime::new(container_bin), free))
 }
 
 fn split_subcommand(args: Vec<String>, commands: &[&str]) -> Result<(String, Vec<String>), String> {
@@ -277,7 +345,7 @@ fn parse_build_request(args: &[String]) -> Result<BuildRequest, String> {
     })
 }
 
-fn parse_run_request(args: &[String]) -> Result<RunRequest, String> {
+fn parse_run_request(args: &[String], env: &[(String, String)]) -> Result<RunRequest, String> {
     let (options, free) = parse_arrrg::<RunOptions>(RUN_USAGE, args)?;
     if free.is_empty() {
         return Err(format!("run requires <image>\n{RUN_USAGE}"));
@@ -299,7 +367,7 @@ fn parse_run_request(args: &[String]) -> Result<RunRequest, String> {
     let container_address =
         default_string(options.container_address, DEFAULT_CONTAINER_TCP_ADDRESS);
     validate_tcp_host(&container_address, "--container-address")?;
-    let container_port = default_u16(options.container_port, DEFAULT_CONTAINER_TCP_PORT);
+    let container_port = options.container_port.unwrap_or(DEFAULT_CONTAINER_TCP_PORT);
     validate_tcp_port(container_port, "--container-port")?;
     let socket_name = default_string(options.socket_name, DEFAULT_SOCKET_NAME);
     validate_socket_name(&socket_name)?;
@@ -320,7 +388,7 @@ fn parse_run_request(args: &[String]) -> Result<RunRequest, String> {
         image,
         container_bin: default_string(options.container_bin, DEFAULT_CONTAINER_BIN),
         sid_bin: default_string(options.sid_bin, DEFAULT_SID_BIN),
-        inherited_env: default_inherited_env()?,
+        inherited_env: inherited_env_from(env)?,
         transport,
         host_address,
         host_port,
@@ -329,7 +397,7 @@ fn parse_run_request(args: &[String]) -> Result<RunRequest, String> {
         socket_dir: options.socket_dir.map(PathBuf::from),
         socket_name,
         container_socket_dir,
-        timeout: Duration::from_millis(default_u64(options.timeout_ms, DEFAULT_TIMEOUT_MS)),
+        timeout: Duration::from_millis(options.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
         cpus: options.cpus,
         memory: options.memory,
         sid_args,
@@ -479,12 +547,26 @@ fn build_container_args(
 fn run(request: RunRequest) -> Result<String, String> {
     let paths = launch_paths(&request)?;
     prepare_listen_target(&paths)?;
-    let _staged_secrets = stage_secret_files(&request, &paths)?;
-    run_container_and_wait(&request, &paths)
+    let staged_secrets = stage_secret_files(&request, &paths)?;
+    run_container_and_wait(&request, &paths, staged_secrets)
 }
 
-fn run_container_and_wait(request: &RunRequest, paths: &LaunchPaths) -> Result<String, String> {
-    let container_id = run_container(request, paths)?;
+fn run_container_and_wait(
+    request: &RunRequest,
+    paths: &LaunchPaths,
+    staged_secrets: bool,
+) -> Result<String, String> {
+    // A wait failure below leaves the container (and its mounted secrets)
+    // in place for debugging; a failure to start cleans up after itself.
+    let container_id = match run_container(request, paths) {
+        Ok(container_id) => container_id,
+        Err(err) => {
+            return Err(match cleanup_secret_files(paths, staged_secrets) {
+                Ok(()) => err,
+                Err(cleanup_err) => format!("{err}; additionally {cleanup_err}"),
+            });
+        }
+    };
     wait_for_listen_target(&paths.wait_target, request.timeout).map_err(|err| {
         let diagnostics = container_startup_diagnostics(request, &container_id);
         listen_wait_failed_message(
@@ -605,6 +687,7 @@ fn stage_secret_files(request: &RunRequest, paths: &LaunchPaths) -> Result<bool,
             paths.host_secret_dir.display()
         )
     })?;
+    restrict_secret_dir_permissions(&paths.host_secret_dir)?;
 
     for env in secret_envs {
         let source = env
@@ -642,7 +725,23 @@ fn restrict_secret_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(unix)]
+fn restrict_secret_dir_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
+        format!(
+            "failed to restrict secret directory permissions {}: {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_dir_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn cleanup_secret_files(paths: &LaunchPaths, staged: bool) -> Result<(), String> {
     if !staged || !paths.host_secret_dir.exists() {
         return Ok(());
@@ -717,17 +816,34 @@ fn run_container_args(request: &RunRequest, paths: &LaunchPaths) -> Vec<String> 
     args
 }
 
-fn default_inherited_env() -> Result<Vec<InheritedEnv>, String> {
+/// Capture the process environment variables that `run` may inherit.
+///
+/// Parsing never touches `std::env` directly; this is the only place the
+/// ambient environment enters, so tests can pass an explicit slice instead.
+fn captured_process_env() -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for name in DEFAULT_INHERITED_ENV {
         match std::env::var(name) {
-            Ok(value) if value.is_empty() => {}
-            Ok(value) => out.push(resolve_inherited_env(name, &value)?),
+            Ok(value) => out.push((name.to_string(), value)),
             Err(std::env::VarError::NotPresent) => {}
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(format!("{name} must be valid Unicode to pass to container"));
             }
         }
+    }
+    Ok(out)
+}
+
+fn inherited_env_from(env: &[(String, String)]) -> Result<Vec<InheritedEnv>, String> {
+    let mut out = Vec::new();
+    for name in DEFAULT_INHERITED_ENV {
+        let Some((_, value)) = env.iter().find(|(key, _)| key == name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        out.push(resolve_inherited_env(name, value)?);
     }
     Ok(out)
 }
@@ -799,16 +915,112 @@ fn run_labels(request: &RunRequest, paths: &LaunchPaths) -> Vec<(&'static str, S
     ]
 }
 
+fn list_managed(runtime: &mut dyn ContainerRuntime) -> Result<Vec<String>, String> {
+    let instances = runtime.list().map_err(|err| err.to_string())?;
+    Ok(managed_containers(instances)
+        .iter()
+        .map(format_container_line)
+        .collect())
+}
+
+fn stop_managed(runtime: &mut dyn ContainerRuntime, names: &[String]) -> Result<(), String> {
+    let instances = runtime.list().map_err(|err| err.to_string())?;
+    for id in select_managed(&instances, names)? {
+        runtime.stop(&id).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn delete_managed(runtime: &mut dyn ContainerRuntime, names: &[String]) -> Result<(), String> {
+    let instances = runtime.list().map_err(|err| err.to_string())?;
+    for id in select_managed(&instances, names)? {
+        runtime.delete(&id).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn managed_containers(instances: Vec<ContainerInstance>) -> Vec<ContainerInstance> {
+    instances
+        .into_iter()
+        .filter(container_is_managed)
+        .collect()
+}
+
+fn container_is_managed(instance: &ContainerInstance) -> bool {
+    instance.labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
+}
+
+fn format_container_line(instance: &ContainerInstance) -> String {
+    let endpoint = instance
+        .labels
+        .get(SOCKET_LABEL)
+        .map(String::as_str)
+        .unwrap_or("-");
+    format!(
+        "{}\t{}\t{}\t{}",
+        instance.id,
+        container_status_str(&instance.status),
+        instance.image_reference,
+        endpoint
+    )
+}
+
+fn container_status_str(status: &ContainerStatus) -> &str {
+    match status {
+        ContainerStatus::Created => "created",
+        ContainerStatus::Running => "running",
+        ContainerStatus::Stopped => "stopped",
+        ContainerStatus::Other(other) => other,
+    }
+}
+
+fn select_managed(instances: &[ContainerInstance], names: &[String]) -> Result<Vec<String>, String> {
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(instance) = instances.iter().find(|instance| &instance.id == name) else {
+            return Err(format!("no container named {name:?}"));
+        };
+        if !container_is_managed(instance) {
+            return Err(format!(
+                "container {name:?} is not sid-managed; refusing to touch it"
+            ));
+        }
+        ids.push(instance.id.clone());
+    }
+    Ok(ids)
+}
+
 fn wait_for_listen_target(target: &WaitTarget, timeout: Duration) -> Result<(), String> {
     match target {
-        WaitTarget::Tcp { .. } => Ok(()),
+        WaitTarget::Tcp { host, port } => wait_for_tcp(host, *port, timeout),
         WaitTarget::Unix {
             host_socket_path, ..
         } => wait_for_socket(host_socket_path, timeout),
     }
 }
 
+fn wait_for_tcp(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
+    if timeout.is_zero() {
+        return Ok(());
+    }
+    let start = Instant::now();
+    loop {
+        if std::net::TcpStream::connect((host, port)).is_ok() {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timed out waiting for TCP listener {host}:{port} to accept connections"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), String> {
+    if timeout.is_zero() {
+        return Ok(());
+    }
     let start = Instant::now();
     loop {
         if path.exists() {
@@ -934,14 +1146,6 @@ fn default_string(value: String, default: &str) -> String {
     } else {
         value
     }
-}
-
-fn default_u64(value: u64, default: u64) -> u64 {
-    if value == 0 { default } else { value }
-}
-
-fn default_u16(value: u16, default: u16) -> u16 {
-    if value == 0 { default } else { value }
 }
 
 fn parse_transport(value: &str) -> Result<ListenTransport, String> {
@@ -1262,15 +1466,18 @@ mod tests {
 
     #[test]
     fn parse_run_treats_remaining_free_args_as_sid_args() {
-        let request = parse_run_request(&strings(&[
-            "--name",
-            "sid-a",
-            "--timeout-ms",
-            "2500",
-            "sid-dev",
-            "--config",
-            "/etc/sid/config.toml",
-        ]))
+        let request = parse_run_request(
+            &strings(&[
+                "--name",
+                "sid-a",
+                "--timeout-ms",
+                "2500",
+                "sid-dev",
+                "--config",
+                "/etc/sid/config.toml",
+            ]),
+            &[],
+        )
         .unwrap();
         assert_eq!(request.name, "sid-a");
         assert_eq!(request.image, "sid-dev");
@@ -1282,9 +1489,45 @@ mod tests {
 
     #[test]
     fn parse_run_generates_name_when_omitted() {
-        let request = parse_run_request(&strings(&["ghcr.io/rescrv/sid-dev:latest"])).unwrap();
+        let request =
+            parse_run_request(&strings(&["ghcr.io/rescrv/sid-dev:latest"]), &[]).unwrap();
         assert!(request.name.starts_with("sid-ghcr.io_rescrv_sid-dev"));
         validate_container_name(&request.name).unwrap();
+    }
+
+    #[test]
+    fn parse_run_resolves_inherited_env_from_supplied_pairs_only() {
+        let request = parse_run_request(
+            &strings(&["sid-dev"]),
+            &[
+                ("CLAUDIUS_API_KEY".to_string(), "sk-test".to_string()),
+                ("ANTHROPIC_API_KEY".to_string(), String::new()),
+                ("UNRELATED".to_string(), "ignored".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            request.inherited_env,
+            vec![InheritedEnv {
+                name: "CLAUDIUS_API_KEY".to_string(),
+                spec: "CLAUDIUS_API_KEY".to_string(),
+                file_source: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_run_rejects_explicit_zero_container_port() {
+        let err =
+            parse_run_request(&strings(&["--container-port", "0", "sid-dev"]), &[]).unwrap_err();
+        assert!(err.contains("--container-port"));
+    }
+
+    #[test]
+    fn parse_run_accepts_explicit_zero_timeout_as_no_wait() {
+        let request =
+            parse_run_request(&strings(&["--timeout-ms", "0", "sid-dev"]), &[]).unwrap();
+        assert_eq!(request.timeout, Duration::ZERO);
     }
 
     #[test]
@@ -1398,15 +1641,46 @@ mod tests {
     }
 
     #[test]
-    fn tcp_listen_target_wait_does_not_probe_listener() {
+    fn tcp_listen_target_wait_skips_probe_when_timeout_is_zero() {
         wait_for_listen_target(
             &WaitTarget::Tcp {
                 host: "127.0.0.1".to_string(),
                 port: 1,
             },
-            Duration::from_millis(0),
+            Duration::ZERO,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn tcp_listen_target_wait_succeeds_against_live_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        wait_for_listen_target(
+            &WaitTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            Duration::from_millis(1000),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn tcp_listen_target_wait_times_out_without_listener() {
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let err = wait_for_listen_target(
+            &WaitTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out waiting for TCP listener"));
     }
 
     #[test]
@@ -1606,5 +1880,164 @@ mod tests {
         assert!(args.contains(&"sid.socket=tcp://127.0.0.1:45450".to_string()));
         assert_eq!(args[args.len() - 2], "--listen");
         assert_eq!(args[args.len() - 1], "tcp://0.0.0.0:8890");
+    }
+
+    use std::collections::BTreeMap;
+
+    use sid_isnt_done::containers::{ContainerRuntimeError, RunContainerRequest};
+
+    #[derive(Default)]
+    struct FakeRuntime {
+        instances: Vec<ContainerInstance>,
+        stopped: Vec<String>,
+        deleted: Vec<String>,
+    }
+
+    impl ContainerRuntime for FakeRuntime {
+        fn list(&mut self) -> Result<Vec<ContainerInstance>, ContainerRuntimeError> {
+            Ok(self.instances.clone())
+        }
+
+        fn run(&mut self, _request: &RunContainerRequest) -> Result<(), ContainerRuntimeError> {
+            Ok(())
+        }
+
+        fn stop(&mut self, id: &str) -> Result<(), ContainerRuntimeError> {
+            self.stopped.push(id.to_string());
+            Ok(())
+        }
+
+        fn delete(&mut self, id: &str) -> Result<(), ContainerRuntimeError> {
+            self.deleted.push(id.to_string());
+            Ok(())
+        }
+    }
+
+    fn instance(id: &str, managed: bool, status: ContainerStatus) -> ContainerInstance {
+        let mut labels = BTreeMap::new();
+        if managed {
+            labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
+            labels.insert(SOCKET_LABEL.to_string(), "tcp://127.0.0.1:45450".to_string());
+        }
+        ContainerInstance {
+            id: id.to_string(),
+            status,
+            image_reference: "sid-dev".to_string(),
+            labels,
+            cpus: 0,
+            memory_mib: 0,
+        }
+    }
+
+    #[test]
+    fn list_managed_filters_and_formats_managed_containers() {
+        let mut runtime = FakeRuntime {
+            instances: vec![
+                instance("sid-a", true, ContainerStatus::Running),
+                instance("other", false, ContainerStatus::Running),
+                instance("sid-b", true, ContainerStatus::Stopped),
+            ],
+            ..FakeRuntime::default()
+        };
+        assert_eq!(
+            list_managed(&mut runtime).unwrap(),
+            vec![
+                "sid-a\trunning\tsid-dev\ttcp://127.0.0.1:45450",
+                "sid-b\tstopped\tsid-dev\ttcp://127.0.0.1:45450",
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_managed_refuses_unmanaged_containers() {
+        let mut runtime = FakeRuntime {
+            instances: vec![instance("other", false, ContainerStatus::Running)],
+            ..FakeRuntime::default()
+        };
+        let err = stop_managed(&mut runtime, &strings(&["other"])).unwrap_err();
+        assert!(err.contains("not sid-managed"));
+        assert!(runtime.stopped.is_empty());
+    }
+
+    #[test]
+    fn stop_managed_reports_unknown_names() {
+        let mut runtime = FakeRuntime::default();
+        let err = stop_managed(&mut runtime, &strings(&["missing"])).unwrap_err();
+        assert!(err.contains("no container named"));
+    }
+
+    #[test]
+    fn stop_and_delete_managed_operate_on_managed_names() {
+        let mut runtime = FakeRuntime {
+            instances: vec![
+                instance("sid-a", true, ContainerStatus::Running),
+                instance("sid-b", true, ContainerStatus::Stopped),
+            ],
+            ..FakeRuntime::default()
+        };
+        stop_managed(&mut runtime, &strings(&["sid-a"])).unwrap();
+        assert_eq!(runtime.stopped, vec!["sid-a"]);
+        delete_managed(&mut runtime, &strings(&["sid-b"])).unwrap();
+        assert_eq!(runtime.deleted, vec!["sid-b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_secret_files_restricts_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sid-container-test-perms-{}-{}",
+            std::process::id(),
+            current_time_millis().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("anthropic-key");
+        fs::write(&key_path, "sk-test\n").unwrap();
+
+        let request = RunRequest {
+            name: "sid-a".to_string(),
+            image: "sid-dev".to_string(),
+            container_bin: DEFAULT_CONTAINER_BIN.to_string(),
+            sid_bin: DEFAULT_SID_BIN.to_string(),
+            inherited_env: vec![
+                resolve_inherited_env(
+                    "CLAUDIUS_API_KEY",
+                    &format!("file://{}", key_path.display()),
+                )
+                .unwrap(),
+            ],
+            transport: ListenTransport::Tcp,
+            host_address: DEFAULT_HOST_TCP_ADDRESS.to_string(),
+            host_port: 45450,
+            container_address: DEFAULT_CONTAINER_TCP_ADDRESS.to_string(),
+            container_port: DEFAULT_CONTAINER_TCP_PORT,
+            socket_dir: None,
+            socket_name: DEFAULT_SOCKET_NAME.to_string(),
+            container_socket_dir: PathBuf::from(DEFAULT_CONTAINER_SOCKET_DIR),
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            cpus: None,
+            memory: None,
+            sid_args: Vec::new(),
+        };
+        let paths = LaunchPaths {
+            host_endpoint: "tcp://127.0.0.1:45450".to_string(),
+            host_secret_dir: dir.join("secrets"),
+            container_endpoint: "tcp://0.0.0.0:8890".to_string(),
+            wait_target: WaitTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 45450,
+            },
+        };
+
+        assert!(stage_secret_files(&request, &paths).unwrap());
+        let mode = fs::metadata(&paths.host_secret_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        cleanup_secret_files(&paths, true).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
