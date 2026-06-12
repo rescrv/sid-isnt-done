@@ -1,4 +1,10 @@
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +62,7 @@ const SESSION_SPEND_EXHAUSTED: &str = concat!(
     "Session spend limit exhausted. ",
     "Use /spend to increase or /spend clear to remove the limit."
 );
+const HISTORY_MAX_ENTRIES: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SidSpendState {
@@ -164,21 +171,34 @@ fn model_token_rates(model: &Model) -> TokenRates {
 struct SidTerminal {
     editor: DefaultEditor,
     renderer: PlainTextRenderer,
+    histfile: PathBuf,
+    pending_history: Vec<String>,
 }
 
 impl SidTerminal {
-    fn new(use_color: bool, interrupted: Arc<AtomicBool>) -> Result<Self, SError> {
+    fn new(
+        use_color: bool,
+        interrupted: Arc<AtomicBool>,
+        sid_home: PathBuf,
+    ) -> Result<Self, SError> {
         let config = Config::builder().edit_mode(EditMode::Vi).build();
-        let editor = DefaultEditor::with_config(config).map_err(|err| {
+        let mut editor = DefaultEditor::with_config(config).map_err(|err| {
             cli_error(
                 "readline_init_failed",
                 "failed to initialize the terminal editor",
             )
             .with_string_field("cause", &err.to_string())
         })?;
+        let histfile = sid_home.join("histfile");
+        if let Some(parent) = histfile.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = editor.load_history(&histfile);
         Ok(Self {
             editor,
             renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+            histfile,
+            pending_history: Vec::new(),
         })
     }
 
@@ -192,8 +212,161 @@ impl SidTerminal {
     }
 
     fn add_history_entry(&mut self, line: &str) {
-        let _ = self.editor.add_history_entry(line);
+        let Some(entry) = history_entry(line) else {
+            return;
+        };
+        if self.editor.add_history_entry(entry).unwrap_or(false) {
+            self.pending_history.push(entry.to_string());
+            self.flush_history();
+        }
     }
+
+    fn flush_history(&mut self) {
+        if self.pending_history.is_empty() {
+            return;
+        }
+        if append_history_entries(&self.histfile, &self.pending_history).is_ok() {
+            self.pending_history.clear();
+        }
+    }
+}
+
+fn history_entry(line: &str) -> Option<&str> {
+    if line.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let entry = line.trim();
+    if entry.is_empty() { None } else { Some(entry) }
+}
+
+fn append_history_entries(path: &std::path::Path, entries: &[String]) -> io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = open_history_file(path)?;
+    let _lock = lock_history_file(&file)?;
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let mut history = parse_history_file(&text);
+    history.extend(entries.iter().cloned());
+    if history.len() > HISTORY_MAX_ENTRIES {
+        history.drain(..history.len() - HISTORY_MAX_ENTRIES);
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    write_history_file(&mut file, &history)?;
+    file.flush()
+}
+
+fn open_history_file(path: &std::path::Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn parse_history_file(text: &str) -> Vec<String> {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    if first == "#V2" {
+        lines.filter_map(decode_history_line).collect()
+    } else {
+        std::iter::once(first)
+            .chain(lines)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+fn decode_history_line(line: &str) -> Option<String> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let mut decoded = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => decoded.push('\n'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    Some(decoded)
+}
+
+fn write_history_file(mut writer: impl Write, entries: &[String]) -> io::Result<()> {
+    writer.write_all(b"#V2\n")?;
+    for entry in entries {
+        if entry.is_empty() {
+            continue;
+        }
+        write_history_entry(&mut writer, entry)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_history_entry(mut writer: impl Write, entry: &str) -> io::Result<()> {
+    for ch in entry.chars() {
+        match ch {
+            '\n' => writer.write_all(br"\n")?,
+            '\\' => writer.write_all(br"\\")?,
+            _ => write!(writer, "{ch}")?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct HistoryFileLock {
+    fd: RawFd,
+}
+
+#[cfg(unix)]
+fn lock_history_file(file: &fs::File) -> io::Result<HistoryFileLock> {
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+        Ok(HistoryFileLock { fd })
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HistoryFileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+struct HistoryFileLock;
+
+#[cfg(not(unix))]
+fn lock_history_file(_file: &fs::File) -> io::Result<HistoryFileLock> {
+    Ok(HistoryFileLock)
 }
 
 impl Renderer for SidTerminal {
@@ -1277,7 +1450,11 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
     }
 
     let interrupted = Arc::new(AtomicBool::new(false));
-    let mut terminal = SidTerminal::new(use_color, interrupted.clone())?;
+    let mut terminal = SidTerminal::new(
+        use_color,
+        interrupted.clone(),
+        PathBuf::from(config_root.as_str()),
+    )?;
     let context = ();
 
     if startup_confirmation_required && !confirm_manual_agent(&mut terminal, &agent_id)? {
@@ -1326,19 +1503,20 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         interrupted.store(false, Ordering::Relaxed);
 
         match terminal.read_line("You: ") {
-            Ok(OperatorLine::Line(line)) => {
-                let line = line.trim();
+            Ok(OperatorLine::Line(input)) => {
+                let line = input.trim();
                 if line.is_empty() {
                     continue;
                 }
 
-                terminal.add_history_entry(line);
+                terminal.add_history_entry(&input);
 
                 if line == "/edit" {
                     match invoke_external_editor() {
                         Ok(Some(content)) => {
-                            let content = content.trim();
-                            terminal.add_history_entry(content);
+                            let input = content;
+                            let content = input.trim();
+                            terminal.add_history_entry(&input);
                             let message = claudius::MessageParam::user(content);
                             if let Err(err) = session.send_message(message, &mut terminal).await {
                                 terminal.print_error(&context, &err.to_string());
@@ -1598,12 +1776,17 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         }
     }
 
+    terminal.flush_history();
     Ok(())
 }
 
 fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
     let interrupted = Arc::new(AtomicBool::new(false));
-    let mut terminal = SidTerminal::new(setup.use_color, interrupted.clone())?;
+    let mut terminal = SidTerminal::new(
+        setup.use_color,
+        interrupted.clone(),
+        PathBuf::from(resolve_sid_home()?.as_str()),
+    )?;
     install_ctrlc_handler(interrupted.clone())?;
 
     let mut client = RawTerminalClient::connect(&setup.spec, interrupted.clone())?;
@@ -1634,19 +1817,20 @@ fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
         interrupted.store(false, Ordering::Relaxed);
 
         match terminal.read_line("You: ") {
-            Ok(OperatorLine::Line(line)) => {
-                let line = line.trim();
+            Ok(OperatorLine::Line(input)) => {
+                let line = input.trim();
                 if line.is_empty() {
                     continue;
                 }
 
-                terminal.add_history_entry(line);
+                terminal.add_history_entry(&input);
 
                 if line == "/edit" {
                     match invoke_external_editor() {
                         Ok(Some(content)) => {
-                            let content = content.trim();
-                            terminal.add_history_entry(content);
+                            let input = content;
+                            let content = input.trim();
+                            terminal.add_history_entry(&input);
                             client.send_user_turn(content, &mut terminal)?;
                         }
                         Ok(None) => {
@@ -1689,6 +1873,7 @@ fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
         }
     }
 
+    terminal.flush_history();
     Ok(())
 }
 
@@ -3613,10 +3798,11 @@ fn invoke_external_editor() -> io::Result<Option<String>> {
 mod tests {
     use super::{
         AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer,
-        SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SpendTurnClamp,
-        SwitchPosition, build_anthropic_client, dollars_to_micro_cents, handle_raw_request,
-        parse_confirmation, parse_sid_command, resolve_sid_home_from_env, validate_connect_mode,
-        validate_no_free_args, validate_runtime_mode,
+        SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SidTerminal,
+        SpendTurnClamp, SwitchPosition, build_anthropic_client, dollars_to_micro_cents,
+        handle_raw_request, history_entry, parse_confirmation, parse_history_file,
+        parse_sid_command, resolve_sid_home_from_env, validate_connect_mode, validate_no_free_args,
+        validate_runtime_mode, write_history_file,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::Anthropic;
@@ -3631,6 +3817,7 @@ mod tests {
     use std::io::{BufReader, Cursor};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
     use utf8path::Path;
 
@@ -3711,6 +3898,69 @@ mod tests {
             err.contains("SID_HOME must be set and non-empty"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn history_entry_trims_without_saving_leading_whitespace() {
+        assert_eq!(history_entry("hello  "), Some("hello"));
+        assert_eq!(history_entry("  secret"), None);
+        assert_eq!(history_entry("\tsecret"), None);
+        assert_eq!(history_entry(""), None);
+    }
+
+    #[test]
+    fn history_file_round_trips_escaped_entries() {
+        let entries = vec!["line one\\two\nline three".to_string()];
+        let mut buffer = Vec::new();
+
+        write_history_file(&mut buffer, &entries).unwrap();
+
+        assert_eq!(
+            parse_history_file(std::str::from_utf8(&buffer).unwrap()),
+            entries
+        );
+    }
+
+    #[test]
+    fn terminal_history_appends_entries_immediately() {
+        let root = unique_workspace_root("history-immediate");
+        let mut terminal = SidTerminal::new(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            PathBuf::from(root.as_str()),
+        )
+        .unwrap();
+
+        terminal.add_history_entry("hello");
+
+        assert_eq!(read_history_entries(&root), vec!["hello".to_string()]);
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn terminal_history_merges_concurrent_sessions() {
+        let root = unique_workspace_root("history-concurrent");
+        let mut first = SidTerminal::new(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            PathBuf::from(root.as_str()),
+        )
+        .unwrap();
+        let mut second = SidTerminal::new(
+            false,
+            Arc::new(AtomicBool::new(false)),
+            PathBuf::from(root.as_str()),
+        )
+        .unwrap();
+
+        first.add_history_entry("first");
+        second.add_history_entry("second");
+
+        assert_eq!(
+            read_history_entries(&root),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
     }
 
     #[test]
@@ -4164,6 +4414,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sid-isnt-done-{prefix}-{nanos}"));
         fs::create_dir_all(&root).unwrap();
         Path::try_from(root).unwrap().into_owned()
+    }
+
+    fn read_history_entries(root: &Path) -> Vec<String> {
+        parse_history_file(&fs::read_to_string(root.join("histfile").as_str()).unwrap())
     }
 
     fn test_chat_config(transcript_path: PathBuf) -> ChatConfig {
