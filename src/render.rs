@@ -3,7 +3,7 @@
 //! This module provides a [`PlainTextRenderer`] that formats tool calls in a
 //! human-readable way instead of dumping raw JSON.
 
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stderr, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,13 +47,48 @@ const ANSI_FIELD_LABEL: &str = "\x1b[38;5;109m";
 
 const MAX_REPLACEMENT_DIFF_CELLS: usize = 250_000;
 
+enum RenderOutput {
+    Stdout(Stdout),
+    Stderr(Stderr),
+}
+
+impl RenderOutput {
+    fn stdout() -> Self {
+        Self::Stdout(io::stdout())
+    }
+
+    fn stderr() -> Self {
+        Self::Stderr(io::stderr())
+    }
+
+    fn is_stdout(&self) -> bool {
+        matches!(self, Self::Stdout(_))
+    }
+}
+
+impl Write for RenderOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(stdout) => stdout.write(buf),
+            Self::Stderr(stderr) => stderr.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(stdout) => stdout.flush(),
+            Self::Stderr(stderr) => stderr.flush(),
+        }
+    }
+}
+
 /// Plain text renderer with optional ANSI styling.
 ///
-/// This renderer outputs text directly to stdout with optional ANSI escape codes for styling
+/// This renderer outputs text directly with optional ANSI escape codes for styling
 /// thinking blocks and tool use.  Tool inputs are accumulated and rendered in a human-readable
 /// format instead of raw JSON.
 pub struct PlainTextRenderer {
-    stdout: Stdout,
+    output: RenderOutput,
     use_color: bool,
     in_thinking: bool,
     in_tool_result: bool,
@@ -70,9 +105,13 @@ pub struct PlainTextRenderer {
 impl PlainTextRenderer {
     /// Creates a new PlainTextRenderer with ANSI colors enabled.
     pub fn new() -> Self {
+        Self::with_output(RenderOutput::stdout(), true)
+    }
+
+    fn with_output(output: RenderOutput, use_color: bool) -> Self {
         Self {
-            stdout: io::stdout(),
-            use_color: true,
+            output,
+            use_color,
             in_thinking: false,
             in_tool_result: false,
             line_start: true,
@@ -85,17 +124,12 @@ impl PlainTextRenderer {
 
     /// Creates a new PlainTextRenderer with specified color setting.
     pub fn with_color(use_color: bool) -> Self {
-        Self {
-            stdout: io::stdout(),
-            use_color,
-            in_thinking: false,
-            in_tool_result: false,
-            line_start: true,
-            interrupted: None,
-            current_tool_name: None,
-            tool_input_buf: String::new(),
-            tool_input_preview: None,
-        }
+        Self::with_output(RenderOutput::stdout(), use_color)
+    }
+
+    /// Creates a new PlainTextRenderer that writes to stderr.
+    pub fn stderr_with_color(use_color: bool) -> Self {
+        Self::with_output(RenderOutput::stderr(), use_color)
     }
 
     /// Attaches an interrupt flag to the renderer.
@@ -109,18 +143,27 @@ impl PlainTextRenderer {
         Self::with_color(use_color).with_interrupt(interrupted)
     }
 
-    /// Flushes stdout to ensure immediate display of streamed content.
+    /// Creates a new stderr PlainTextRenderer with specified color and interrupt flag.
+    pub fn stderr_with_color_and_interrupt(use_color: bool, interrupted: Arc<AtomicBool>) -> Self {
+        Self::stderr_with_color(use_color).with_interrupt(interrupted)
+    }
+
+    /// Flushes output to ensure immediate display of streamed content.
     fn flush(&mut self) {
-        let _ = self.stdout.flush();
+        let _ = self.output.flush();
+    }
+
+    fn write_raw(&mut self, text: &str) {
+        let _ = self.output.write_all(text.as_bytes());
     }
 
     fn reset_thinking(&mut self) {
         if self.in_thinking {
             if self.use_color {
-                print!("{ANSI_RESET}");
+                self.write_raw(ANSI_RESET);
             }
             // Add newline separator when transitioning from thinking to other content.
-            println!();
+            self.write_raw("\n");
             self.line_start = true;
             self.in_thinking = false;
         }
@@ -129,7 +172,7 @@ impl PlainTextRenderer {
     fn reset_tool_result(&mut self) {
         if self.in_tool_result {
             if self.use_color {
-                print!("{ANSI_RESET}");
+                self.write_raw(ANSI_RESET);
             }
             self.in_tool_result = false;
         }
@@ -147,9 +190,9 @@ impl PlainTextRenderer {
         let prefix = "  ".repeat(context.depth());
         for line in text.split_inclusive('\n') {
             if self.line_start {
-                print!("{prefix}");
+                self.write_raw(&prefix);
             }
-            print!("{line}");
+            self.write_raw(line);
             self.line_start = line.ends_with('\n');
         }
         self.flush();
@@ -773,10 +816,19 @@ impl Renderer for PlainTextRenderer {
     fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
         self.reset_styles();
         if context.depth() == 0 && context.label().is_none() {
-            if self.use_color {
-                eprintln!("\n{ANSI_ERROR}{error}{ANSI_RESET}");
+            let message = if self.use_color {
+                format!("\n{ANSI_ERROR}{error}{ANSI_RESET}\n")
             } else {
-                eprintln!("\n{error}");
+                format!("\n{error}\n")
+            };
+            if self.output.is_stdout() {
+                let mut stderr = io::stderr().lock();
+                let _ = stderr.write_all(message.as_bytes());
+                let _ = stderr.flush();
+            } else {
+                self.write_raw(&message);
+                self.line_start = true;
+                self.flush();
             }
         } else {
             if self.use_color {
@@ -790,7 +842,8 @@ impl Renderer for PlainTextRenderer {
     fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
         self.reset_styles();
         if context.depth() == 0 && context.label().is_none() {
-            println!("{info}");
+            self.write_raw(info);
+            self.write_raw("\n");
             self.line_start = true;
             self.flush();
         } else {

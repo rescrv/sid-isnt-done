@@ -2857,6 +2857,7 @@ where
     fn renderer(
         &self,
         label: &str,
+        _use_color: bool,
         interrupted: Arc<AtomicBool>,
     ) -> Box<dyn Renderer + Send + 'static> {
         Box::new(RawEventRenderer::new(

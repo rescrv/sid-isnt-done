@@ -668,8 +668,8 @@ where
     }
 
     fn read_operator_line(&mut self, _prompt: &str) -> io::Result<Option<OperatorLine>> {
-        // Ralph's local stderr renderer does not support child-session
-        // prompts either; the raw request owner handles top-level prompts.
+        // Ralph child-session renderers do not own operator input; the raw
+        // request owner handles top-level prompts.
         Ok(None)
     }
 }

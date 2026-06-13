@@ -11,16 +11,16 @@
 //! transport-class error, never conflated with a verdict.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use claudius::chat::{ChatConfig, ChatSession};
-use claudius::{Anthropic, MessageParam, OperatorLine, Renderer, StreamContext, ToolChoice};
+use claudius::{Anthropic, MessageParam, Renderer, ToolChoice};
 use utf8path::Path;
 
 use crate::config::Config;
+use crate::render::PlainTextRenderer;
 use crate::session::SidSession;
 use crate::{
     COMPACTION_REQUEST_PROMPT, SidAgent, compacted_transcript, extract_last_assistant_text,
@@ -86,109 +86,30 @@ pub fn validate_judge_config(config: &Config, service: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// A minimal streaming renderer that writes to stderr, so the operator can
-/// watch the child sessions go while the rendered verdict stays on stdout.
-pub struct StderrRenderer {
-    interrupted: Option<Arc<AtomicBool>>,
-    label: String,
-}
-
-impl StderrRenderer {
-    /// A renderer labeled with the child service name.
-    pub fn new(label: &str, interrupted: Option<Arc<AtomicBool>>) -> StderrRenderer {
-        StderrRenderer {
-            interrupted,
-            label: label.to_string(),
-        }
-    }
-
-    fn write(&self, text: &str) {
-        let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(text.as_bytes());
-        let _ = stderr.flush();
-    }
-}
-
-impl Renderer for StderrRenderer {
-    fn print_text(&mut self, _: &dyn StreamContext, text: &str) {
-        self.write(text);
-    }
-
-    fn print_thinking(&mut self, _: &dyn StreamContext, text: &str) {
-        self.write(text);
-    }
-
-    fn print_error(&mut self, _: &dyn StreamContext, error: &str) {
-        self.write(&format!("[{}: error] {error}\n", self.label));
-    }
-
-    fn print_info(&mut self, _: &dyn StreamContext, info: &str) {
-        self.write(&format!("[{}] {info}\n", self.label));
-    }
-
-    fn start_tool_use(&mut self, _: &dyn StreamContext, name: &str, _id: &str) {
-        self.write(&format!("\n[{}: tool {name}] ", self.label));
-    }
-
-    fn print_tool_input(&mut self, _: &dyn StreamContext, partial_json: &str) {
-        self.write(partial_json);
-    }
-
-    fn finish_tool_use(&mut self, _: &dyn StreamContext) {
-        self.write("\n");
-    }
-
-    fn start_tool_result(&mut self, _: &dyn StreamContext, _tool_use_id: &str, is_error: bool) {
-        if is_error {
-            self.write(&format!("[{}: tool result (error)] ", self.label));
-        } else {
-            self.write(&format!("[{}: tool result] ", self.label));
-        }
-    }
-
-    fn print_tool_result_text(&mut self, _: &dyn StreamContext, text: &str) {
-        self.write(text);
-    }
-
-    fn finish_tool_result(&mut self, _: &dyn StreamContext) {
-        self.write("\n");
-    }
-
-    fn finish_response(&mut self, _: &dyn StreamContext) {
-        self.write("\n");
-    }
-
-    fn should_interrupt(&self) -> bool {
-        self.interrupted
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-    }
-
-    fn read_operator_line(&mut self, _prompt: &str) -> std::io::Result<Option<OperatorLine>> {
-        // Manual-tool confirmations fall back to the process's stdin.
-        Ok(None)
-    }
-}
-
 /// Factory for renderers used by ralph child sessions.
 pub trait RalphRendererFactory: Send + Sync {
     /// Build a renderer for a child stream labeled with `label`.
     fn renderer(
         &self,
         label: &str,
+        use_color: bool,
         interrupted: Arc<AtomicBool>,
     ) -> Box<dyn Renderer + Send + 'static>;
 }
 
-struct StderrRendererFactory;
+struct PlainTextRalphRendererFactory;
 
-impl RalphRendererFactory for StderrRendererFactory {
+impl RalphRendererFactory for PlainTextRalphRendererFactory {
     fn renderer(
         &self,
-        label: &str,
+        _label: &str,
+        use_color: bool,
         interrupted: Arc<AtomicBool>,
     ) -> Box<dyn Renderer + Send + 'static> {
-        Box::new(StderrRenderer::new(label, Some(interrupted)))
+        Box::new(PlainTextRenderer::stderr_with_color_and_interrupt(
+            use_color,
+            interrupted,
+        ))
     }
 }
 
@@ -238,7 +159,7 @@ impl SidRalphHost {
             parent_session_id,
             handle,
             interrupted,
-            renderer_factory: Arc::new(StderrRendererFactory),
+            renderer_factory: Arc::new(PlainTextRalphRendererFactory),
             judge: None,
             seed_cap_bytes: SEED_FULL_CAP_BYTES,
         }
@@ -346,9 +267,11 @@ impl SidRalphHost {
         let mut messages = self.seed_messages.clone();
         sanitize_transcript_messages(&mut messages);
         chat.replace_messages(messages);
-        let mut renderer = self
-            .renderer_factory
-            .renderer("seed-compact", Arc::clone(&self.interrupted));
+        let mut renderer = self.renderer_factory.renderer(
+            "seed-compact",
+            chat.config().use_color,
+            Arc::clone(&self.interrupted),
+        );
         self.handle
             .block_on(chat.send_message(MessageParam::user(prompt), renderer.as_mut()))
             .map_err(|err| format!("seed compaction failed: {err}"))?;
@@ -465,9 +388,11 @@ impl RalphHost for SidRalphHost {
         }
 
         let stats_before = chat.stats();
-        let mut renderer = self
-            .renderer_factory
-            .renderer(&invocation.service, Arc::clone(&self.interrupted));
+        let mut renderer = self.renderer_factory.renderer(
+            &invocation.service,
+            chat.config().use_color,
+            Arc::clone(&self.interrupted),
+        );
         let result = self
             .handle
             .block_on(chat.send_message(MessageParam::user(text), renderer.as_mut()));
@@ -540,7 +465,11 @@ impl RalphHost for SidRalphHost {
                 });
                 force = false;
             }
-            let mut renderer = renderer_factory.renderer(&label, Arc::clone(&interrupted));
+            let mut renderer = renderer_factory.renderer(
+                &label,
+                judge.chat.config().use_color,
+                Arc::clone(&interrupted),
+            );
             let result = handle.block_on(judge.chat.send_message(next_message, renderer.as_mut()));
             if let Err(err) = result {
                 break JudgeOutcome::Transport(format!("API failure: {err}"));
