@@ -50,6 +50,8 @@ const MAX_REPLACEMENT_DIFF_CELLS: usize = 250_000;
 enum RenderOutput {
     Stdout(Stdout),
     Stderr(Stderr),
+    #[cfg(test)]
+    Buffer(Arc<std::sync::Mutex<Vec<u8>>>),
 }
 
 impl RenderOutput {
@@ -64,6 +66,11 @@ impl RenderOutput {
     fn is_stdout(&self) -> bool {
         matches!(self, Self::Stdout(_))
     }
+
+    #[cfg(test)]
+    fn buffer(buffer: Arc<std::sync::Mutex<Vec<u8>>>) -> Self {
+        Self::Buffer(buffer)
+    }
 }
 
 impl Write for RenderOutput {
@@ -71,6 +78,13 @@ impl Write for RenderOutput {
         match self {
             Self::Stdout(stdout) => stdout.write(buf),
             Self::Stderr(stderr) => stderr.write(buf),
+            #[cfg(test)]
+            Self::Buffer(buffer) => {
+                let mut buffer = buffer
+                    .lock()
+                    .map_err(|_| io::Error::other("renderer buffer lock poisoned"))?;
+                buffer.write(buf)
+            }
         }
     }
 
@@ -78,6 +92,13 @@ impl Write for RenderOutput {
         match self {
             Self::Stdout(stdout) => stdout.flush(),
             Self::Stderr(stderr) => stderr.flush(),
+            #[cfg(test)]
+            Self::Buffer(buffer) => {
+                let mut buffer = buffer
+                    .lock()
+                    .map_err(|_| io::Error::other("renderer buffer lock poisoned"))?;
+                buffer.flush()
+            }
         }
     }
 }
@@ -196,6 +217,14 @@ impl PlainTextRenderer {
             self.line_start = line.ends_with('\n');
         }
         self.flush();
+    }
+
+    fn write_agent_label_before_block(&mut self, context: &dyn StreamContext) {
+        let Some(label) = context.label() else {
+            return;
+        };
+        self.write_with_indent(context, "\n");
+        self.write_with_indent(context, &format!("[agent: {label}]\n"));
     }
 
     /// Returns the prefix that introduces a thinking block.
@@ -797,6 +826,7 @@ impl Renderer for PlainTextRenderer {
     fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
         if self.use_color {
             if !self.in_thinking {
+                self.write_agent_label_before_block(context);
                 self.write_with_indent(context, ANSI_THINKING);
                 self.write_with_indent(context, ANSI_DIM);
                 self.write_with_indent(context, ANSI_ITALIC);
@@ -806,6 +836,7 @@ impl Renderer for PlainTextRenderer {
             self.write_with_indent(context, text);
         } else {
             if !self.in_thinking {
+                self.write_agent_label_before_block(context);
                 self.write_with_indent(context, Self::thinking_prefix(context));
                 self.in_thinking = true;
             }
@@ -853,16 +884,18 @@ impl Renderer for PlainTextRenderer {
 
     fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
         self.reset_styles();
+        self.write_agent_label_before_block(context);
+        let leading = if context.label().is_some() { "" } else { "\n" };
 
         if self.use_color {
             self.write_with_indent(
                 context,
                 &format!(
-                    "\n{ANSI_TOOL_LABEL}[tool: {name}]{ANSI_RESET} {ANSI_METADATA}{ANSI_DIM}({id}){ANSI_RESET}\n"
+                    "{leading}{ANSI_TOOL_LABEL}[tool: {name}]{ANSI_RESET} {ANSI_METADATA}{ANSI_DIM}({id}){ANSI_RESET}\n"
                 ),
             );
         } else {
-            self.write_with_indent(context, &format!("\n[tool: {name}] ({id})\n"));
+            self.write_with_indent(context, &format!("{leading}[tool: {name}] ({id})\n"));
         }
 
         // Start accumulating tool input.
@@ -945,6 +978,20 @@ impl Renderer for PlainTextRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claudius::AgentStreamContext;
+    use std::sync::{Arc, Mutex};
+
+    fn buffered_renderer(use_color: bool) -> (PlainTextRenderer, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let renderer =
+            PlainTextRenderer::with_output(RenderOutput::buffer(Arc::clone(&buffer)), use_color);
+        (renderer, buffer)
+    }
+
+    fn buffer_text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        let bytes = buffer.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
 
     #[test]
     fn renderer_default_has_color() {
@@ -962,6 +1009,33 @@ mod tests {
     fn renderer_without_input_returns_none() {
         let mut renderer = PlainTextRenderer::new();
         assert_eq!(renderer.read_operator_line("> ").unwrap(), None);
+    }
+
+    #[test]
+    fn labeled_thinking_block_prints_agent_first() {
+        let (mut renderer, buffer) = buffered_renderer(false);
+        let context = AgentStreamContext::root("judge");
+
+        renderer.print_thinking(&context, "checking");
+        renderer.print_thinking(&context, " more");
+
+        assert_eq!(
+            buffer_text(&buffer),
+            "\n[agent: judge]\n[thinking] checking more"
+        );
+    }
+
+    #[test]
+    fn labeled_tool_block_prints_agent_first() {
+        let (mut renderer, buffer) = buffered_renderer(false);
+        let context = AgentStreamContext::root("fix");
+
+        renderer.start_tool_use(&context, "bash", "toolu_1");
+
+        assert_eq!(
+            buffer_text(&buffer),
+            "\n[agent: fix]\n[tool: bash] (toolu_1)\n"
+        );
     }
 
     #[test]
