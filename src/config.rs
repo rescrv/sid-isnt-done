@@ -350,12 +350,12 @@ impl AgentConfig {
     }
 }
 
-/// Default tool execution timeout: 2 minutes.
+/// Default tool execution timeout: 4 minutes 30 seconds.
 ///
 /// Applied to all tools that do not specify an explicit `TIMEOUT` in
 /// `tools.conf`.  A per-tool `TIMEOUT` of `"0"` disables the timeout for
 /// that tool.
-pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(270);
 
 /// Configuration for a single tool declared in `tools.conf`.
 ///
@@ -545,7 +545,7 @@ fn resolve_tool_confirm_preview(rc_conf: &RcConf, tool: &str) -> Result<bool, SE
 ///
 /// 1. `<tool>_TIMEOUT` — per-tool override.
 /// 2. `TIMEOUT` — top-level default in `tools.conf`.
-/// 3. [`DEFAULT_TOOL_TIMEOUT`] — compiled-in 2-minute default.
+/// 3. [`DEFAULT_TOOL_TIMEOUT`] — compiled-in 4-minute 30-second default.
 ///
 /// A value of `"0"` at any level disables the timeout (`None`).
 fn resolve_tool_timeout(rc_conf: &RcConf, tool: &str) -> Result<Option<Duration>, SError> {
