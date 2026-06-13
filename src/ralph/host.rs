@@ -170,6 +170,28 @@ impl Renderer for StderrRenderer {
     }
 }
 
+/// Factory for renderers used by ralph child sessions.
+pub trait RalphRendererFactory: Send + Sync {
+    /// Build a renderer for a child stream labeled with `label`.
+    fn renderer(
+        &self,
+        label: &str,
+        interrupted: Arc<AtomicBool>,
+    ) -> Box<dyn Renderer + Send + 'static>;
+}
+
+struct StderrRendererFactory;
+
+impl RalphRendererFactory for StderrRendererFactory {
+    fn renderer(
+        &self,
+        label: &str,
+        interrupted: Arc<AtomicBool>,
+    ) -> Box<dyn Renderer + Send + 'static> {
+        Box::new(StderrRenderer::new(label, Some(interrupted)))
+    }
+}
+
 struct PinnedJudge {
     service: String,
     chat: ChatSession<SidAgent>,
@@ -187,6 +209,7 @@ pub struct SidRalphHost {
     parent_session_id: String,
     handle: tokio::runtime::Handle,
     interrupted: Arc<AtomicBool>,
+    renderer_factory: Arc<dyn RalphRendererFactory>,
     judge: Option<PinnedJudge>,
     seed_cap_bytes: usize,
 }
@@ -215,9 +238,19 @@ impl SidRalphHost {
             parent_session_id,
             handle,
             interrupted,
+            renderer_factory: Arc::new(StderrRendererFactory),
             judge: None,
             seed_cap_bytes: SEED_FULL_CAP_BYTES,
         }
+    }
+
+    /// Replace the renderer factory used for child sessions.
+    pub fn with_renderer_factory(
+        mut self,
+        renderer_factory: Arc<dyn RalphRendererFactory>,
+    ) -> Self {
+        self.renderer_factory = renderer_factory;
+        self
     }
 
     fn interrupted(&self) -> bool {
@@ -313,9 +346,11 @@ impl SidRalphHost {
         let mut messages = self.seed_messages.clone();
         sanitize_transcript_messages(&mut messages);
         chat.replace_messages(messages);
-        let mut renderer = StderrRenderer::new("seed-compact", Some(Arc::clone(&self.interrupted)));
+        let mut renderer = self
+            .renderer_factory
+            .renderer("seed-compact", Arc::clone(&self.interrupted));
         self.handle
-            .block_on(chat.send_message(MessageParam::user(prompt), &mut renderer))
+            .block_on(chat.send_message(MessageParam::user(prompt), renderer.as_mut()))
             .map_err(|err| format!("seed compaction failed: {err}"))?;
         extract_last_assistant_text(&chat.clone_messages())
             .ok_or_else(|| "seed compaction produced no summary".to_string())
@@ -430,11 +465,12 @@ impl RalphHost for SidRalphHost {
         }
 
         let stats_before = chat.stats();
-        let mut renderer =
-            StderrRenderer::new(&invocation.service, Some(Arc::clone(&self.interrupted)));
+        let mut renderer = self
+            .renderer_factory
+            .renderer(&invocation.service, Arc::clone(&self.interrupted));
         let result = self
             .handle
-            .block_on(chat.send_message(MessageParam::user(text), &mut renderer));
+            .block_on(chat.send_message(MessageParam::user(text), renderer.as_mut()));
         let _ = chat.save_transcript_to(&transcript_path);
         let tokens = Self::tokens_delta(&stats_before, &chat.stats());
 
@@ -482,6 +518,7 @@ impl RalphHost for SidRalphHost {
         let interrupted = Arc::clone(&self.interrupted);
         let label = invocation.service.clone();
         let handle = self.handle.clone();
+        let renderer_factory = Arc::clone(&self.renderer_factory);
         let judge = self.judge.as_mut().expect("judge was just ensured");
         let stats_before = judge.chat.stats();
 
@@ -503,8 +540,8 @@ impl RalphHost for SidRalphHost {
                 });
                 force = false;
             }
-            let mut renderer = StderrRenderer::new(&label, Some(Arc::clone(&interrupted)));
-            let result = handle.block_on(judge.chat.send_message(next_message, &mut renderer));
+            let mut renderer = renderer_factory.renderer(&label, Arc::clone(&interrupted));
+            let result = handle.block_on(judge.chat.send_message(next_message, renderer.as_mut()));
             if let Err(err) = result {
                 break JudgeOutcome::Transport(format!("API failure: {err}"));
             }

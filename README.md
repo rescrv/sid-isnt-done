@@ -51,8 +51,8 @@ Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
 mode the process owns session state and emits accepted request markers, typed
 events, prompts, and terminal results instead of the human-oriented terminal UI.
 Requests are semantic operations such as user turns, agent switches,
-compaction, and config updates.  Raw mode is intended for alternative frontends
-and local automation.
+compaction, ralph runs, and config updates.  Raw mode is intended for
+alternative frontends and local automation.
 Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
 of stdin/stdout.  `SPEC` is `tcp://HOST:PORT`, `vsock://CID:PORT` on Linux,
 or `unix:///path/to/socket` on Unix platforms.  New connections replace older
@@ -192,6 +192,9 @@ warning.
 : Connect the normal terminal UI to a reconnectable JSONL protocol server.
   `SPEC` accepts the same URL forms as `--listen`; for `vsock://PORT`,
   `vsock://any:PORT`, and `vsock://-1:PORT`, connect mode targets the host CID.
+  `/run SCRIPT.sid` and `! SCRIPT` execute in the listening server's session,
+  resolving scripts against the server workspace/config roots and streaming
+  ralph output back over the raw event stream.
   `--connect` is mutually exclusive with `--raw`, `--listen`, `--prompt`,
   `--resume`, and `--bash-debug`.
 
@@ -1041,7 +1044,10 @@ codes carry the protocol: 0 done, 1 keep working, 3 a human is wanted,
 `--jury N` demands N independent ones.  Suggestions that don't block accrue
 in a per-run ledger and are triaged once at the end.  Everything streams to
 your terminal as if you were prompting by hand, and everything is journaled
-so `--resume` picks up where SIGINT left off.
+so `--resume` picks up where SIGINT left off.  When used through
+`sid --connect`, the run happens in the listening server process and streams
+through the reconnectable raw protocol, so reconnecting clients replay the
+accepted `/run` request and subsequent ralph events.
 
 ## EXAMPLES
 

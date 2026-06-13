@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,6 +153,12 @@ pub trait RalphHost: Send {
     /// Run one sample against the pinned judge session, creating and seeding
     /// it on first use.
     fn judge_sample(&mut self, invocation: &JudgeInvocation) -> JudgeCallResult;
+}
+
+/// Observer for stdout/stderr emitted by the embedded mxsh script itself.
+pub trait ScriptOutputSink: Send + Sync {
+    /// Forward one chunk from `stream`, either `"stdout"` or `"stderr"`.
+    fn on_script_output(&self, stream: &str, data: &[u8]);
 }
 
 /// Options governing a run.
@@ -837,6 +844,17 @@ pub fn run_script(
     script_text: &str,
     extra_env: &[(String, String)],
 ) -> Result<ScriptOutcome, String> {
+    run_script_with_output(core, script_text, extra_env, None)
+}
+
+/// Run `script_text` under embedded mxsh, optionally forwarding script
+/// stdout/stderr through `output_sink`.
+pub fn run_script_with_output(
+    core: Arc<Mutex<RunnerCore>>,
+    script_text: &str,
+    extra_env: &[(String, String)],
+    output_sink: Option<Arc<dyn ScriptOutputSink>>,
+) -> Result<ScriptOutcome, String> {
     let (run_dir, run_id, workspace_root) = {
         let core = core.lock().expect("runner core poisoned");
         (
@@ -863,13 +881,7 @@ pub fn run_script(
     let _ = fs::remove_dir_all(&control_dir);
     fs::create_dir_all(&control_dir)
         .map_err(|err| format!("failed to create control dir: {err}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let server = {
-        let core = Arc::clone(&core);
-        let stop = Arc::clone(&stop);
-        let control_dir = control_dir.clone();
-        std::thread::spawn(move || serve_control_dir(&control_dir, core, stop))
-    };
+    let control_server = ControlServerGuard::start(control_dir.clone(), Arc::clone(&core));
 
     let path = format!(
         "{}:{}",
@@ -880,6 +892,7 @@ pub fn run_script(
         fs::File::open("/dev/null").map_err(|err| format!("failed to open /dev/null: {err}"))?;
 
     use std::os::fd::AsRawFd as _;
+    let mut output_handles = ScriptOutputHandles::new(output_sink.as_ref().map(Arc::clone))?;
     let mut builder = mxsh::ShellBuilder::new()
         .shell_name("mxsh")
         .env(
@@ -896,7 +909,8 @@ pub fn run_script(
         .env("PATH", path, mxsh::embed::VariableAttributes::EXPORT)
         .stdio(mxsh::embed::StdioConfig {
             stdin: mxsh::runtime::fd::FileDescriptor::new(devnull.as_raw_fd()),
-            ..mxsh::embed::StdioConfig::default()
+            stdout: output_handles.stdout_fd(),
+            stderr: output_handles.stderr_fd(),
         });
     for (key, value) in extra_env {
         builder = builder.env(key, value, mxsh::embed::VariableAttributes::EXPORT);
@@ -912,12 +926,146 @@ pub fn run_script(
     let outcome = shell.run(script_text);
     drop(shell);
     drop(devnull);
+    output_handles.close();
 
-    stop.store(true, Ordering::Relaxed);
-    let _ = server.join();
+    control_server.stop();
 
     let status = outcome.exit_code.unwrap_or(outcome.status);
     Ok(ScriptOutcome { status })
+}
+
+struct ControlServerGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ControlServerGuard {
+    fn start(control_dir: PathBuf, core: Arc<Mutex<RunnerCore>>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || serve_control_dir(&control_dir, core, stop))
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ControlServerGuard {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+struct ScriptOutputHandles {
+    stdout_fd: mxsh::runtime::fd::FileDescriptor,
+    stderr_fd: mxsh::runtime::fd::FileDescriptor,
+    forwarders: Vec<std::thread::JoinHandle<()>>,
+    enabled: bool,
+}
+
+impl ScriptOutputHandles {
+    fn new(sink: Option<Arc<dyn ScriptOutputSink>>) -> Result<Self, String> {
+        let Some(sink) = sink else {
+            return Ok(Self {
+                stdout_fd: mxsh::runtime::fd::FileDescriptor::STDOUT,
+                stderr_fd: mxsh::runtime::fd::FileDescriptor::STDERR,
+                forwarders: Vec::new(),
+                enabled: false,
+            });
+        };
+
+        let stdout_pipe = mxsh::runtime::fd::OsPipe::new()
+            .map_err(|err| format!("failed to create ralph stdout pipe: {err}"))?;
+        let stderr_pipe = match mxsh::runtime::fd::OsPipe::new() {
+            Ok(pipe) => pipe,
+            Err(err) => {
+                stdout_pipe.read_fd.close();
+                stdout_pipe.write_fd.close();
+                return Err(format!("failed to create ralph stderr pipe: {err}"));
+            }
+        };
+        let forwarders = vec![
+            spawn_script_output_forwarder(stdout_pipe.read_fd, "stdout", Arc::clone(&sink)),
+            spawn_script_output_forwarder(stderr_pipe.read_fd, "stderr", sink),
+        ];
+        Ok(Self {
+            stdout_fd: stdout_pipe.write_fd,
+            stderr_fd: stderr_pipe.write_fd,
+            forwarders,
+            enabled: true,
+        })
+    }
+
+    fn stdout_fd(&self) -> mxsh::runtime::fd::FileDescriptor {
+        self.stdout_fd
+    }
+
+    fn stderr_fd(&self) -> mxsh::runtime::fd::FileDescriptor {
+        self.stderr_fd
+    }
+
+    fn close(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.enabled = false;
+        self.stdout_fd.close();
+        self.stderr_fd.close();
+        for forwarder in self.forwarders.drain(..) {
+            let _ = forwarder.join();
+        }
+    }
+}
+
+impl Drop for ScriptOutputHandles {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn spawn_script_output_forwarder(
+    fd: mxsh::runtime::fd::FileDescriptor,
+    stream: &'static str,
+    sink: Arc<dyn ScriptOutputSink>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    fd.into_raw_fd(),
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    chunk.len(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            sink.on_script_output(stream, &chunk[..n as usize]);
+        }
+        fd.close();
+    })
 }
 
 /// Drive a full run: journal start, run the script, assemble the report.
@@ -928,13 +1076,25 @@ pub fn run_ralph(
     extra_env: &[(String, String)],
     interrupted: Arc<AtomicBool>,
 ) -> Result<RunReport, String> {
+    run_ralph_with_output(host, options, script_text, extra_env, interrupted, None)
+}
+
+/// Drive a full run and optionally forward mxsh stdout/stderr.
+pub fn run_ralph_with_output(
+    host: Box<dyn RalphHost>,
+    options: RunnerOptions,
+    script_text: &str,
+    extra_env: &[(String, String)],
+    interrupted: Arc<AtomicBool>,
+    output_sink: Option<Arc<dyn ScriptOutputSink>>,
+) -> Result<RunReport, String> {
     let core = RunnerCore::new(host, options, interrupted)?;
     let core = Arc::new(Mutex::new(core));
     {
         let mut core = core.lock().expect("runner core poisoned");
         core.record_run_start(script_text)?;
     }
-    let outcome = run_script(Arc::clone(&core), script_text, extra_env)?;
+    let outcome = run_script_with_output(Arc::clone(&core), script_text, extra_env, output_sink)?;
     let core = core.lock().expect("runner core poisoned");
     Ok(core.report(outcome.status))
 }
@@ -1045,6 +1205,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingScriptOutputSink {
+        chunks: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl RecordingScriptOutputSink {
+        fn text(&self, stream: &str) -> String {
+            let chunks = self.chunks.lock().unwrap();
+            String::from_utf8_lossy(
+                &chunks
+                    .iter()
+                    .filter(|(candidate, _)| candidate == stream)
+                    .flat_map(|(_, data)| data.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .into_owned()
+        }
+    }
+
+    impl ScriptOutputSink for RecordingScriptOutputSink {
+        fn on_script_output(&self, stream: &str, data: &[u8]) {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((stream.to_string(), data.to_vec()));
+        }
+    }
+
     fn request(name: &str, args: &[&str], context: &str) -> ShimRequest {
         ShimRequest {
             name: name.to_string(),
@@ -1055,6 +1243,50 @@ mod tests {
 
     fn core_with(host: StubHost, options: RunnerOptions) -> RunnerCore {
         RunnerCore::new(Box::new(host), options, Arc::new(AtomicBool::new(false))).unwrap()
+    }
+
+    #[test]
+    fn run_ralph_with_output_captures_script_stdout_and_stderr() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = temp_dir("script-output");
+        let shim = dir.join("sid-ralph-shim");
+        fs::write(&shim, "#!/bin/sh\nexit 99\n").unwrap();
+        let previous_shim = std::env::var_os(SHIM_PATH_ENV);
+        // SAFETY: this test serializes all mutations of this process-global
+        // environment variable with ENV_LOCK and restores it before releasing.
+        unsafe {
+            std::env::set_var(SHIM_PATH_ENV, &shim);
+        }
+
+        let sink = Arc::new(RecordingScriptOutputSink::default());
+        let output_sink: Arc<dyn ScriptOutputSink> = sink.clone();
+        let report = run_ralph_with_output(
+            Box::new(StubHost::default()),
+            options(&dir),
+            "echo stdout-line; echo stderr-line >&2; /bin/sh -c 'printf external-out; printf external-err >&2'",
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            Some(output_sink),
+        )
+        .unwrap();
+
+        assert_eq!(report.exit, EXIT_OK);
+        assert!(sink.text("stdout").contains("stdout-line"));
+        assert!(sink.text("stderr").contains("stderr-line"));
+        assert!(sink.text("stdout").contains("external-out"));
+        assert!(sink.text("stderr").contains("external-err"));
+
+        match previous_shim {
+            Some(value) => unsafe {
+                std::env::set_var(SHIM_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(SHIM_PATH_ENV);
+            },
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

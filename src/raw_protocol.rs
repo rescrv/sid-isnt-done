@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current `sid --raw` protocol version.
-pub const RAW_PROTOCOL_VERSION: u32 = 3;
+pub const RAW_PROTOCOL_VERSION: u32 = 4;
 
 /// A client request envelope sent to `sid --raw`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -61,6 +61,23 @@ pub enum RawRequest {
     },
     /// Compact the current session into a child session.
     Compact,
+    /// Run a ralph script file in the server-side session.
+    RunRalphFile {
+        /// Script path as entered after `/run`; resolved by the server against
+        /// its workspace and configuration roots.
+        script: String,
+        /// Optional cap on agent invocations.
+        max_iters: Option<u64>,
+        /// Optional total token budget across child sessions.
+        budget: Option<u64>,
+        /// Optional run id to resume.
+        resume: Option<String>,
+    },
+    /// Run inline mxsh with ralph builtins bound in the server-side session.
+    RunRalphInline {
+        /// Inline mxsh script text.
+        script: String,
+    },
     /// Clear the conversation transcript.
     Clear,
     /// Change the active model.
@@ -249,7 +266,10 @@ impl RawAcceptedRequest {
     /// reconstruction.
     pub fn from_envelope(envelope: &RawRequestEnvelope) -> Option<Self> {
         match &envelope.request {
-            RawRequest::UserTurn { .. } | RawRequest::InsertSystemMessage { .. } => Some(Self {
+            RawRequest::UserTurn { .. }
+            | RawRequest::InsertSystemMessage { .. }
+            | RawRequest::RunRalphFile { .. }
+            | RawRequest::RunRalphInline { .. } => Some(Self {
                 protocol_version: RAW_PROTOCOL_VERSION,
                 sequence: 0,
                 request_id: envelope.request_id.clone(),
@@ -745,6 +765,45 @@ mod tests {
     }
 
     #[test]
+    fn request_run_ralph_file_roundtrip() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "ralph-file".to_string(),
+            request: RawRequest::RunRalphFile {
+                script: "ralph.sid".to_string(),
+                max_iters: Some(25),
+                budget: Some(1000),
+                resume: Some("run-1".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            json.contains(r#""op":"run_ralph_file""#),
+            "json was: {json}"
+        );
+        let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn request_run_ralph_inline_roundtrip() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "ralph-inline".to_string(),
+            request: RawRequest::RunRalphInline {
+                script: "echo done".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            json.contains(r#""op":"run_ralph_inline""#),
+            "json was: {json}"
+        );
+        let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
     fn request_set_spend_roundtrip() {
         let envelope = RawRequestEnvelope {
             protocol_version: RAW_PROTOCOL_VERSION,
@@ -1230,6 +1289,23 @@ mod tests {
                 text: "pin this instruction".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn accepted_request_from_envelope_keeps_ralph_file_request() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "ralph-1".to_string(),
+            request: RawRequest::RunRalphFile {
+                script: "ralph.sid".to_string(),
+                max_iters: Some(3),
+                budget: None,
+                resume: None,
+            },
+        };
+        let request = RawAcceptedRequest::from_envelope(&envelope).unwrap();
+        assert_eq!(request.request_id, "ralph-1");
+        assert_eq!(request.request, envelope.request);
     }
 
     #[test]

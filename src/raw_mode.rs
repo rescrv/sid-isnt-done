@@ -7,8 +7,11 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
+use crate::ralph::runner::ScriptOutputSink;
 use crate::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawAcceptedRequest, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck,
     RawRequest, RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage,
@@ -247,7 +250,12 @@ where
         }))
     }
 
-    fn try_read_request(
+    /// Try to read one complete request without blocking.
+    ///
+    /// Active long-running requests use this to accept interrupts while
+    /// rejecting unrelated requests as busy.  Plain stdio raw mode usually
+    /// returns `Ok(None)` because its input cannot be polled portably.
+    pub fn try_read_request(
         &self,
     ) -> io::Result<Option<Result<RawRequestEnvelope, ParsedRequestError>>> {
         loop {
@@ -484,6 +492,188 @@ where
     }
 }
 
+/// A renderer that writes model stream events to a raw JSONL output sink.
+///
+/// Unlike [`RawServer`], this renderer does not own request input.  It is used
+/// by work running on helper threads, where a separate owner polls the raw
+/// input and flips the shared interrupt flag.
+pub struct RawEventRenderer<W>
+where
+    W: Write + Send + 'static,
+{
+    output: SharedOutput<W>,
+    request_id: String,
+    label: String,
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<W> RawEventRenderer<W>
+where
+    W: Write + Send + 'static,
+{
+    /// Create a renderer for events associated with `request_id`.
+    pub fn new(
+        output: SharedOutput<W>,
+        request_id: impl Into<String>,
+        label: impl Into<String>,
+        interrupted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            output,
+            request_id: request_id.into(),
+            label: label.into(),
+            interrupted,
+        }
+    }
+
+    fn emit_event(&self, event: RawEvent) {
+        let _ = self
+            .output
+            .write_message(&RawServerMessage::Event(RawEventEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
+                request_id: self.request_id.clone(),
+                event,
+            }));
+    }
+
+    fn label(&self, context: &dyn StreamContext) -> Option<String> {
+        context
+            .label()
+            .map(str::to_string)
+            .or_else(|| Some(self.label.clone()))
+    }
+}
+
+impl<W> Renderer for RawEventRenderer<W>
+where
+    W: Write + Send + 'static,
+{
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.emit_event(RawEvent::AgentStart {
+            label: self.label(context),
+            depth: context.depth(),
+        });
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.emit_event(RawEvent::AgentFinish {
+            label: self.label(context),
+            depth: context.depth(),
+            stop_reason: stop_reason.map(|reason| format!("{reason:?}")),
+        });
+    }
+
+    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.emit_event(RawEvent::AssistantTextDelta {
+            label: self.label(context),
+            depth: context.depth(),
+            text: text.to_string(),
+        });
+    }
+
+    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
+        self.emit_event(RawEvent::ThinkingDelta {
+            label: self.label(context),
+            depth: context.depth(),
+            text: text.to_string(),
+        });
+    }
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.emit_event(RawEvent::Error {
+            label: self.label(context),
+            depth: context.depth(),
+            message: error.to_string(),
+        });
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.emit_event(RawEvent::Info {
+            label: self.label(context),
+            depth: context.depth(),
+            message: info.to_string(),
+        });
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.emit_event(RawEvent::ToolUseStart {
+            label: self.label(context),
+            depth: context.depth(),
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+        });
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.emit_event(RawEvent::ToolInputDelta {
+            label: self.label(context),
+            depth: context.depth(),
+            partial_json: partial_json.to_string(),
+        });
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.emit_event(RawEvent::ToolUseEnd {
+            label: self.label(context),
+            depth: context.depth(),
+        });
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.emit_event(RawEvent::ToolResultStart {
+            label: self.label(context),
+            depth: context.depth(),
+            tool_use_id: tool_use_id.to_string(),
+            is_error,
+        });
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.emit_event(RawEvent::ToolResultTextDelta {
+            label: self.label(context),
+            depth: context.depth(),
+            text: text.to_string(),
+        });
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.emit_event(RawEvent::ToolResultEnd {
+            label: self.label(context),
+            depth: context.depth(),
+        });
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.emit_event(RawEvent::ResponseFinish {
+            label: self.label(context),
+            depth: context.depth(),
+        });
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.emit_event(RawEvent::Interrupted {
+            label: self.label(context),
+            depth: context.depth(),
+        });
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.interrupted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn read_operator_line(&mut self, _prompt: &str) -> io::Result<Option<OperatorLine>> {
+        // Ralph's local stderr renderer does not support child-session
+        // prompts either; the raw request owner handles top-level prompts.
+        Ok(None)
+    }
+}
+
 /// Tool-output observer that forwards chunks onto the raw JSONL stream.
 pub struct RawToolOutputObserver<W>
 where
@@ -519,6 +709,54 @@ where
                     stream: event.stream.clone(),
                     text: event.text.clone(),
                     data_b64: event.data_b64.clone(),
+                },
+            }));
+    }
+}
+
+/// Sink that forwards ralph shell stdout/stderr onto the raw JSONL stream.
+pub struct RawScriptOutputSink<W>
+where
+    W: Write + Send + 'static,
+{
+    output: SharedOutput<W>,
+    request_id: String,
+}
+
+impl<W> RawScriptOutputSink<W>
+where
+    W: Write + Send + 'static,
+{
+    /// Create a script-output sink associated with `request_id`.
+    pub fn new(output: SharedOutput<W>, request_id: impl Into<String>) -> Self {
+        Self {
+            output,
+            request_id: request_id.into(),
+        }
+    }
+}
+
+impl<W> ScriptOutputSink for RawScriptOutputSink<W>
+where
+    W: Write + Send + 'static,
+{
+    fn on_script_output(&self, stream: &str, data: &[u8]) {
+        let (text, data_b64) = match std::str::from_utf8(data) {
+            Ok(text) => (Some(text.to_string()), None),
+            Err(_) => (None, Some(BASE64_STANDARD.encode(data))),
+        };
+        let _ = self
+            .output
+            .write_message(&RawServerMessage::Event(RawEventEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                sequence: 0,
+                request_id: self.request_id.clone(),
+                event: RawEvent::ToolOutput {
+                    tool_name: "ralph".to_string(),
+                    tool_use_id: "ralph-script".to_string(),
+                    stream: stream.to_string(),
+                    text,
+                    data_b64,
                 },
             }));
     }
@@ -643,7 +881,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_succeeds_for_valid_request() {
-        let line = r#"{"protocol_version":3,"request_id":"r-1","op":"stats"}"#;
+        let line = r#"{"protocol_version":4,"request_id":"r-1","op":"stats"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(envelope.request_id, "r-1");
         assert_eq!(envelope.request, RawRequest::Stats);
@@ -652,7 +890,7 @@ mod tests {
     #[test]
     fn parse_request_line_succeeds_for_user_turn() {
         let line =
-            r#"{"protocol_version":3,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
+            r#"{"protocol_version":4,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(
             envelope.request,
@@ -664,7 +902,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_succeeds_for_interrupt() {
-        let line = r#"{"protocol_version":3,"request_id":"r-int","op":"interrupt"}"#;
+        let line = r#"{"protocol_version":4,"request_id":"r-int","op":"interrupt"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(envelope.request_id, "r-int");
         assert_eq!(envelope.request, RawRequest::Interrupt);
@@ -672,7 +910,7 @@ mod tests {
 
     #[test]
     fn parse_request_line_missing_request_id_gives_empty_string() {
-        let err = parse_request_line(r#"{"protocol_version":3}"#).unwrap_err();
+        let err = parse_request_line(r#"{"protocol_version":4}"#).unwrap_err();
         assert_eq!(err.request_id, "");
     }
 
@@ -723,6 +961,31 @@ mod tests {
         assert_eq!(value["request_id"], "turn-1");
         assert_eq!(value["op"], "user_turn");
         assert_eq!(value["text"], "hello replay");
+    }
+
+    #[test]
+    fn write_accepted_request_emits_ralph_marker() {
+        let input = BufReader::new([].as_slice());
+        let output = Vec::new();
+        let server = RawServer::new(input, output);
+        server
+            .write_accepted_request(&RawRequestEnvelope {
+                protocol_version: RAW_PROTOCOL_VERSION,
+                request_id: "ralph-1".to_string(),
+                request: RawRequest::RunRalphInline {
+                    script: "echo done".to_string(),
+                },
+            })
+            .unwrap();
+
+        let text = server
+            .output
+            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "request");
+        assert_eq!(value["request_id"], "ralph-1");
+        assert_eq!(value["op"], "run_ralph_inline");
+        assert_eq!(value["script"], "echo done");
     }
 
     #[test]
@@ -815,7 +1078,7 @@ mod tests {
     #[test]
     fn read_request_skips_blank_lines() {
         let input = BufReader::new(
-            b"\n\n{\"protocol_version\":3,\"request_id\":\"r-1\",\"op\":\"stats\"}\n".as_slice(),
+            b"\n\n{\"protocol_version\":4,\"request_id\":\"r-1\",\"op\":\"stats\"}\n".as_slice(),
         );
         let output = Vec::new();
         let mut server = RawServer::new(input, output);
@@ -826,7 +1089,7 @@ mod tests {
     #[test]
     fn read_request_reports_malformed_json_and_continues() {
         let input = BufReader::new(
-            b"not json\n{\"protocol_version\":3,\"request_id\":\"r-1\",\"op\":\"stats\"}\n"
+            b"not json\n{\"protocol_version\":4,\"request_id\":\"r-1\",\"op\":\"stats\"}\n"
                 .as_slice(),
         );
         let output = Vec::new();
@@ -846,7 +1109,7 @@ mod tests {
     #[test]
     fn read_request_reports_valid_json_with_missing_op_and_continues() {
         let input = BufReader::new(
-            b"{\"request_id\":\"bad\",\"protocol_version\":3}\n{\"protocol_version\":3,\"request_id\":\"good\",\"op\":\"shutdown\"}\n"
+            b"{\"request_id\":\"bad\",\"protocol_version\":4}\n{\"protocol_version\":4,\"request_id\":\"good\",\"op\":\"shutdown\"}\n"
                 .as_slice(),
         );
         let output = Vec::new();
@@ -932,7 +1195,7 @@ mod tests {
     #[test]
     fn should_interrupt_polls_interrupt_request() {
         let input = PollInput::new(&[
-            r#"{"protocol_version":3,"request_id":"interrupt-1","op":"interrupt"}"#,
+            r#"{"protocol_version":4,"request_id":"interrupt-1","op":"interrupt"}"#,
         ]);
         let output = Vec::new();
         let mut server = RawServer::new(input, output);
@@ -952,7 +1215,7 @@ mod tests {
     #[test]
     fn should_interrupt_rejects_non_interrupt_request_as_busy() {
         let input =
-            PollInput::new(&[r#"{"protocol_version":3,"request_id":"stats-1","op":"stats"}"#]);
+            PollInput::new(&[r#"{"protocol_version":4,"request_id":"stats-1","op":"stats"}"#]);
         let output = Vec::new();
         let server = RawServer::new(input, output);
 
@@ -970,8 +1233,8 @@ mod tests {
     #[test]
     fn prompt_wait_rejects_non_prompt_requests() {
         let input = BufReader::new(
-            br#"{"protocol_version":3,"request_id":"bad","op":"stats"}
-{"protocol_version":3,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+            br#"{"protocol_version":4,"request_id":"bad","op":"stats"}
+{"protocol_version":4,"request_id":"good","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
 "#
             .as_slice(),
         );
@@ -995,8 +1258,8 @@ mod tests {
     #[test]
     fn prompt_wait_rejects_stale_prompt_id() {
         let input = BufReader::new(
-            br#"{"protocol_version":3,"request_id":"stale","op":"prompt_response","prompt_id":"prompt-999","response":"yes"}
-{"protocol_version":3,"request_id":"correct","op":"prompt_response","prompt_id":"prompt-1","response":"no"}
+            br#"{"protocol_version":4,"request_id":"stale","op":"prompt_response","prompt_id":"prompt-999","response":"yes"}
+{"protocol_version":4,"request_id":"correct","op":"prompt_response","prompt_id":"prompt-1","response":"no"}
 "#
             .as_slice(),
         );
@@ -1029,8 +1292,8 @@ mod tests {
     fn prompt_ids_increment_across_calls() {
         // First prompt uses prompt-1, second uses prompt-2.
         let input = BufReader::new(
-            br#"{"protocol_version":3,"request_id":"a","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
-{"protocol_version":3,"request_id":"b","op":"prompt_response","prompt_id":"prompt-2","response":"no"}
+            br#"{"protocol_version":4,"request_id":"a","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+{"protocol_version":4,"request_id":"b","op":"prompt_response","prompt_id":"prompt-2","response":"no"}
 "#
             .as_slice(),
         );
@@ -1048,7 +1311,7 @@ mod tests {
     #[test]
     fn prompt_uses_fallback_request_id_when_none_set() {
         let input = BufReader::new(
-            br#"{"protocol_version":3,"request_id":"resp","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
+            br#"{"protocol_version":4,"request_id":"resp","op":"prompt_response","prompt_id":"prompt-1","response":"yes"}
 "#
             .as_slice(),
         );
@@ -1133,6 +1396,41 @@ mod tests {
         assert_eq!(value["tool_use_id"], "tu-1");
         assert_eq!(value["stream"], "stdout");
         assert_eq!(value["text"], "hello\n");
+    }
+
+    #[test]
+    fn raw_script_output_sink_emits_tool_output_event() {
+        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
+        let sink = RawScriptOutputSink::new(output.clone(), "ralph-1");
+
+        ScriptOutputSink::on_script_output(&sink, "stderr", b"ralph says hi\n");
+
+        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "event");
+        assert_eq!(value["event"], "tool_output");
+        assert_eq!(value["request_id"], "ralph-1");
+        assert_eq!(value["tool_name"], "ralph");
+        assert_eq!(value["tool_use_id"], "ralph-script");
+        assert_eq!(value["stream"], "stderr");
+        assert_eq!(value["text"], "ralph says hi\n");
+    }
+
+    #[test]
+    fn raw_event_renderer_emits_labeled_text_event() {
+        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = RawEventRenderer::new(output.clone(), "ralph-2", "fix", interrupted);
+
+        renderer.print_text(&(), "working");
+
+        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["type"], "event");
+        assert_eq!(value["event"], "assistant_text_delta");
+        assert_eq!(value["request_id"], "ralph-2");
+        assert_eq!(value["label"], "fix");
+        assert_eq!(value["text"], "working");
     }
 
     #[test]
