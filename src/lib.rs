@@ -19,6 +19,8 @@ pub mod config;
 /// Container runtime abstraction and `sid-container` launcher helpers.
 pub mod containers;
 mod filesystem;
+/// ralph: verified fixpoint loops over embedded mxsh.
+pub mod ralph;
 /// Socket listener transport for `sid --listen`.
 pub mod raw_listen;
 /// JSONL transport utilities for `sid --raw`.
@@ -152,6 +154,7 @@ pub struct SidAgent {
     bash_session: Mutex<Option<BashPtySession>>,
     tool_cancellation_pending: AtomicBool,
     token_usage_totals: StdMutex<TokenUsageTotals>,
+    one_shot_tool_choice: Arc<StdMutex<Option<ToolChoice>>>,
 }
 
 impl SidAgent {
@@ -502,7 +505,20 @@ impl SidAgent {
             bash_session: Mutex::new(None),
             tool_cancellation_pending: AtomicBool::new(false),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
+            one_shot_tool_choice: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Share the one-shot tool-choice cell for this agent.
+    ///
+    /// Setting the cell to `Some(choice)` forces that tool choice for exactly
+    /// one API request, after which the agent reverts to its configured tool
+    /// choice.  This implements the judge harness's mandated re-send: when a
+    /// judge ends its turn without calling `verdict`, the conversation is
+    /// re-sent with `tool_choice: {"type": "tool", "name": "verdict"}` for a
+    /// single request so the turn can still end normally afterwards.
+    pub fn one_shot_tool_choice_cell(&self) -> Arc<StdMutex<Option<ToolChoice>>> {
+        Arc::clone(&self.one_shot_tool_choice)
     }
 
     /// Attach a session to this agent, making the session root writable.
@@ -1360,6 +1376,11 @@ impl Agent for SidAgent {
     }
 
     async fn tool_choice(&self) -> Option<ToolChoice> {
+        if let Ok(mut one_shot) = self.one_shot_tool_choice.lock()
+            && let Some(choice) = one_shot.take()
+        {
+            return Some(choice);
+        }
         self.config.template.tool_choice.clone()
     }
 
@@ -1409,7 +1430,11 @@ impl Agent for SidAgent {
         let report = UsageReportEvent {
             token_line: format!(
                 "[tokens: input={} cache_creation={} cached_input={} output={}{}]",
-                totals.input, totals.cache_creation, totals.cached_input, totals.output, cost_suffix
+                totals.input,
+                totals.cache_creation,
+                totals.cached_input,
+                totals.output,
+                cost_suffix
             ),
             usage_line: format!("[usage: {:?}]", resp.usage),
         };

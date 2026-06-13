@@ -1454,10 +1454,7 @@ format_ALIASES="fmt"
         assert_eq!(
             build.anthropic,
             AnthropicConfig {
-                api_key: Some(format!(
-                    "file://{}/secrets/build.key",
-                    root.as_str()
-                )),
+                api_key: Some(format!("file://{}/secrets/build.key", root.as_str())),
                 base_url: Some("https://build.example.test/anthropic".to_string()),
             }
         );
@@ -1483,10 +1480,7 @@ format_ALIASES="fmt"
         assert_eq!(
             plan.anthropic,
             AnthropicConfig {
-                api_key: Some(format!(
-                    "file://{}/secrets/default.key",
-                    root.as_str()
-                )),
+                api_key: Some(format!("file://{}/secrets/default.key", root.as_str())),
                 base_url: Some("https://default.example.test/anthropic".to_string()),
             }
         );

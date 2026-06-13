@@ -31,9 +31,39 @@ const INIT_FILES: &[InitFile] = &[
         executable: false,
     },
     InitFile {
+        path: "agents/fix.md",
+        contents: include_str!("../../init/agents/fix.md"),
+        executable: false,
+    },
+    InitFile {
+        path: "agents/judge.md",
+        contents: include_str!("../../init/agents/judge.md"),
+        executable: false,
+    },
+    InitFile {
+        path: "agents/task.md",
+        contents: include_str!("../../init/agents/task.md"),
+        executable: false,
+    },
+    InitFile {
         path: "agents/skill-inject",
         contents: include_str!("../../init/agents/skill-inject"),
         executable: true,
+    },
+    InitFile {
+        path: "ralph.sid",
+        contents: include_str!("../../init/ralph.sid"),
+        executable: false,
+    },
+    InitFile {
+        path: "tools/escalate",
+        contents: include_str!("../../init/tools/escalate"),
+        executable: true,
+    },
+    InitFile {
+        path: "tools/escalate.json",
+        contents: include_str!("../../init/tools/escalate.json"),
+        executable: false,
     },
     InitFile {
         path: "tools/edit",
@@ -88,6 +118,16 @@ const INIT_FILES: &[InitFile] = &[
     InitFile {
         path: "tools/search.json",
         contents: include_str!("../../init/tools/search.json"),
+        executable: false,
+    },
+    InitFile {
+        path: "tools/verdict",
+        contents: include_str!("../../init/tools/verdict"),
+        executable: true,
+    },
+    InitFile {
+        path: "tools/verdict.json",
+        contents: include_str!("../../init/tools/verdict.json"),
         executable: false,
     },
 ];

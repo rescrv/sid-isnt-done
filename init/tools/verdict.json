@@ -1,0 +1,33 @@
+{
+  "protocol_version": 1,
+  "description": "Render your verdict. The next agent has NO context except what you write here. Write a work order, not a judgment.",
+  "input_schema": {
+    "type": "object",
+    "required": ["sufficient", "summary", "findings"],
+    "properties": {
+      "sufficient": {"type": "boolean"},
+      "summary": {
+        "type": "string",
+        "description": "One paragraph. The next agent has no other context about your reasoning."
+      },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["severity", "where", "what", "why"],
+          "properties": {
+            "severity": {"enum": ["blocker", "required", "suggestion"]},
+            "where": {"type": "string", "description": "file:line or component"},
+            "what": {"type": "string", "description": "Imperative. 'Add X', not 'X is missing'."},
+            "why": {"type": "string", "description": "Tie to the plan or the design thread."}
+          }
+        }
+      },
+      "acceptance": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "What you will verify on the next pass. Specific enough that passing is checkable."
+      }
+    }
+  }
+}

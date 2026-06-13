@@ -1017,10 +1017,44 @@ preserving `format` as the model-visible tool name.
 
 ## SEE ALSO
 
+[RALPH(1)](#ralph1),
 [SID-EDITOR-TOOL(1)](#sid-editor-tool1),
 [SID-SEATBELT(1)](#sid-seatbelt1),
 [RCINVOKE(1)](#rcinvoke1),
 [SANDBOX-EXEC(1)](#sandbox-exec1)
+
+# RALPH(1)
+
+## NAME
+
+ralph - verified fixpoint loops
+
+## DESCRIPTION
+
+`ralph.sid` runs a plan to completion: a shell loop runs `./ci`, hands
+failures to a fresh `fix` agent, and when CI passes asks a persistent
+`judge` — seeded with the conversation that launched it — whether the plan
+is done.  The judge must answer through a mandated `verdict` tool; its
+structured findings become the work order for a fresh `task` agent.  Exit
+codes carry the protocol: 0 done, 1 keep working, 3 a human is wanted,
+≥4 the machinery broke.  `--soak N` demands N consecutive passing verdicts;
+`--jury N` demands N independent ones.  Suggestions that don't block accrue
+in a per-run ledger and are triaged once at the end.  Everything streams to
+your terminal as if you were prompting by hand, and everything is journaled
+so `--resume` picks up where SIGINT left off.
+
+## EXAMPLES
+
+```console
+$ sid
+> Grill me about this feature, then stop before implementation.
+...design conversation...
+> /run ralph.sid --max-iters 25
+```
+
+## SEE ALSO
+
+[SID(1)](#sid1)
 
 # SID-EDITOR-TOOL(1)
 

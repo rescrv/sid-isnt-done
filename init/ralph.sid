@@ -1,0 +1,33 @@
+#!/usr/bin/env mxsh
+# ralph.sid — verified fixpoint: ./ci is the verifier, the judge is the examiner.
+# Invoke:  /run ralph.sid [--max-iters N]
+# Vars:    PLAN (default PLAN.md), SOAK (default 3)
+
+PLAN=${PLAN:-PLAN.md}
+SOAK=${SOAK:-3}
+
+while :; do
+  if ! out=$(./ci 2>&1); then
+    printf '%s' "$out" | agent fix "CI is failing. Make ./ci pass. Do not expand scope."
+    case $? in
+      0) continue ;;
+      3) echo "ralph: fix agent escalated" >&2; exit 3 ;;
+      *) echo "ralph: fix agent transport failure" >&2; exit 4 ;;
+    esac
+  fi
+
+  findings=$(judge judge --soak "$SOAK" \
+    "CI passes. Is $PLAN complete given the current tree? You are mid-soak; vary your scrutiny.")
+  case $? in
+    0) break ;;
+    1) printf '%s' "$findings" | agent task "Execute this work order against $PLAN." || exit $? ;;
+    3) echo "ralph: judge escalated" >&2; exit 3 ;;
+    *) echo "ralph: judge malfunction" >&2; exit 4 ;;
+  esac
+done
+
+# Sweep the per-run suggestions ledger once, after the fixpoint converges.
+test -s "$RUN_DIR/suggestions.md" &&
+  agent task "Plan is complete. Triage these non-blocking suggestions; act only on the worthwhile ones:" < "$RUN_DIR/suggestions.md"
+
+exit 0

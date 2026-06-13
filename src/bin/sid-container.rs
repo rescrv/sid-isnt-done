@@ -940,10 +940,7 @@ fn delete_managed(runtime: &mut dyn ContainerRuntime, names: &[String]) -> Resul
 }
 
 fn managed_containers(instances: Vec<ContainerInstance>) -> Vec<ContainerInstance> {
-    instances
-        .into_iter()
-        .filter(container_is_managed)
-        .collect()
+    instances.into_iter().filter(container_is_managed).collect()
 }
 
 fn container_is_managed(instance: &ContainerInstance) -> bool {
@@ -974,7 +971,10 @@ fn container_status_str(status: &ContainerStatus) -> &str {
     }
 }
 
-fn select_managed(instances: &[ContainerInstance], names: &[String]) -> Result<Vec<String>, String> {
+fn select_managed(
+    instances: &[ContainerInstance],
+    names: &[String],
+) -> Result<Vec<String>, String> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         let Some(instance) = instances.iter().find(|instance| &instance.id == name) else {
@@ -1489,8 +1489,7 @@ mod tests {
 
     #[test]
     fn parse_run_generates_name_when_omitted() {
-        let request =
-            parse_run_request(&strings(&["ghcr.io/rescrv/sid-dev:latest"]), &[]).unwrap();
+        let request = parse_run_request(&strings(&["ghcr.io/rescrv/sid-dev:latest"]), &[]).unwrap();
         assert!(request.name.starts_with("sid-ghcr.io_rescrv_sid-dev"));
         validate_container_name(&request.name).unwrap();
     }
@@ -1525,8 +1524,7 @@ mod tests {
 
     #[test]
     fn parse_run_accepts_explicit_zero_timeout_as_no_wait() {
-        let request =
-            parse_run_request(&strings(&["--timeout-ms", "0", "sid-dev"]), &[]).unwrap();
+        let request = parse_run_request(&strings(&["--timeout-ms", "0", "sid-dev"]), &[]).unwrap();
         assert_eq!(request.timeout, Duration::ZERO);
     }
 
@@ -1917,7 +1915,10 @@ mod tests {
         let mut labels = BTreeMap::new();
         if managed {
             labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
-            labels.insert(SOCKET_LABEL.to_string(), "tcp://127.0.0.1:45450".to_string());
+            labels.insert(
+                SOCKET_LABEL.to_string(),
+                "tcp://127.0.0.1:45450".to_string(),
+            );
         }
         ContainerInstance {
             id: id.to_string(),

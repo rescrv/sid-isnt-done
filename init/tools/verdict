@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+# verdict — the judge's mandated structured verdict.
+#
+# The ralph harness reads the verdict out of the transcript (the tool_use
+# input), so this wrapper only validates lightly and acknowledges.  The
+# boolean lands in the judge builtin's exit code; the rendered work order
+# lands on the loop's stdout; nothing here decides anything.
+
+lookup() {
+    printenv "$1"
+}
+
+PREFIX=${RCVAR_ARGV0:?missing RCVAR_ARGV0}
+
+case "${1:-}" in
+rcvar)
+    printf '%s\n' \
+        "${PREFIX}_REQUEST_FILE" \
+        "${PREFIX}_RESULT_FILE" \
+        "${PREFIX}_SCRATCH_DIR" \
+        "${PREFIX}_TEMP_DIR" \
+        "${PREFIX}_TMPDIR" \
+        "${PREFIX}_WORKSPACE_ROOT" \
+        "${PREFIX}_SESSION_ID" \
+        "${PREFIX}_SESSION_DIR" \
+        "${PREFIX}_AGENT_ID" \
+        "${PREFIX}_TOOL_ID" \
+        "${PREFIX}_TOOL_NAME" \
+        "${PREFIX}_TOOL_PROTOCOL" \
+        "${PREFIX}_RC_CONF_PATH" \
+        "${PREFIX}_RC_D_PATH"
+    ;;
+confirm)
+    printf 'render verdict\n'
+    ;;
+run)
+    REQUEST_FILE="$(lookup "${PREFIX}_REQUEST_FILE")"
+    RESULT_FILE="$(lookup "${PREFIX}_RESULT_FILE")"
+
+    request_id=$(jq -r '.request_id' "$REQUEST_FILE")
+
+    write_success() {
+        text="$1"
+        jq -n --arg rid "$request_id" --arg txt "$text" \
+            '{"protocol_version":1,"request_id":$rid,"ok":true,"output":{"kind":"text","text":$txt},"error":null}' \
+            > "$RESULT_FILE"
+    }
+
+    write_error() {
+        code="$1"; msg="$2"
+        jq -n --arg rid "$request_id" --arg c "$code" --arg m "$msg" \
+            '{"protocol_version":1,"request_id":$rid,"ok":false,"output":null,"error":{"code":$c,"message":$m}}' \
+            > "$RESULT_FILE"
+    }
+
+    sufficient=$(jq -r '.invocation.input.sufficient' "$REQUEST_FILE")
+    summary=$(jq -r '.invocation.input.summary // empty' "$REQUEST_FILE")
+
+    if [ "x$sufficient" != "xtrue" ] && [ "x$sufficient" != "xfalse" ]; then
+        write_error "malformed_verdict" "verdict requires a boolean 'sufficient' field"
+        exit 0
+    fi
+    if [ -z "$summary" ]; then
+        write_error "malformed_verdict" "verdict requires a 'summary' field; the next agent has no other context"
+        exit 0
+    fi
+
+    write_success "Verdict recorded (sufficient=$sufficient). End your turn."
+    ;;
+*)
+    echo "usage: $0 [rcvar|confirm|run]" >&2
+    exit 129
+    ;;
+esac

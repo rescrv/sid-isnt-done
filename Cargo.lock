@@ -1042,6 +1042,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxsh"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1672,6 +1681,7 @@ dependencies = [
  "getopts",
  "handled",
  "libc",
+ "mxsh",
  "ratatui",
  "rc_conf",
  "regex",

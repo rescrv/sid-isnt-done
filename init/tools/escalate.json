@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "description": "Ask for a human. Use this when the task is impossible, environmental, or under-specified — it is the only honest self-report. The loop will stop with exit code 3 and surface your reason to the operator.",
+  "input_schema": {
+    "type": "object",
+    "required": ["reason"],
+    "properties": {
+      "reason": {
+        "type": "string",
+        "description": "Why a human is needed. Be specific: what you tried, what is blocked, and what decision you need."
+      }
+    }
+  }
+}
