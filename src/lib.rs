@@ -1119,26 +1119,35 @@ impl Agent for SidAgent {
         sanitize_transcript_messages(messages);
         top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
-        let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
-            let stop_reason = self.handle_max_tokens().await?;
-            top_up_cancelled_tool_results(messages);
-            sanitize_transcript_messages(messages);
-            return Ok(TurnOutcome {
-                stop_reason,
-                usage: Usage::new(0, 0),
-                request_count: 0,
-            });
-        };
-
         let mut usage_total = Usage::new(0, 0);
         let mut request_count: u64 = 0;
-        while tokens_rem.remaining_tokens()
-            > self
-                .thinking()
-                .await
-                .map(|thinking| thinking.num_tokens())
-                .unwrap_or(0)
-        {
+        loop {
+            let Some(mut tokens_rem) = budget.allocate_available(self.max_tokens().await) else {
+                let stop_reason = self.handle_max_tokens().await?;
+                top_up_cancelled_tool_results(messages);
+                sanitize_transcript_messages(messages);
+                return Ok(TurnOutcome {
+                    stop_reason,
+                    usage: usage_total,
+                    request_count,
+                });
+            };
+            if tokens_rem.remaining_tokens()
+                <= self
+                    .thinking()
+                    .await
+                    .map(|thinking| thinking.num_tokens())
+                    .unwrap_or(0)
+            {
+                let stop_reason = self.handle_max_tokens().await?;
+                top_up_cancelled_tool_results(messages);
+                sanitize_transcript_messages(messages);
+                return Ok(TurnOutcome {
+                    stop_reason,
+                    usage: usage_total,
+                    request_count,
+                });
+            }
             sanitize_transcript_messages(messages);
             let retry_policy = retry::ApiRetryPolicy::default();
             let retry_backoff = retry_policy.backoff();
@@ -1199,15 +1208,6 @@ impl Agent for SidAgent {
                 }
             }
         }
-
-        let stop_reason = self.handle_max_tokens().await?;
-        top_up_cancelled_tool_results(messages);
-        sanitize_transcript_messages(messages);
-        Ok(TurnOutcome {
-            stop_reason,
-            usage: usage_total,
-            request_count,
-        })
     }
 
     async fn take_turn_streaming(
@@ -1224,27 +1224,37 @@ impl Agent for SidAgent {
         top_up_cancelled_tool_results(messages);
         self.inject_user_instructions_for_turn(messages).await?;
         renderer.start_agent(&context);
-        let Some(mut tokens_rem) = budget.allocate(self.max_tokens().await) else {
-            let stop_reason = self.handle_max_tokens().await?;
-            top_up_cancelled_tool_results(messages);
-            sanitize_transcript_messages(messages);
-            renderer.finish_agent(&context, Some(&stop_reason));
-            return Ok(TurnOutcome {
-                stop_reason,
-                usage: Usage::new(0, 0),
-                request_count: 0,
-            });
-        };
-
         let mut usage_total = Usage::new(0, 0);
         let mut request_count: u64 = 0;
-        while tokens_rem.remaining_tokens()
-            > self
-                .thinking()
-                .await
-                .map(|thinking| thinking.num_tokens())
-                .unwrap_or(0)
-        {
+        loop {
+            let Some(mut tokens_rem) = budget.allocate_available(self.max_tokens().await) else {
+                let stop_reason = self.handle_max_tokens().await?;
+                top_up_cancelled_tool_results(messages);
+                sanitize_transcript_messages(messages);
+                renderer.finish_agent(&context, Some(&stop_reason));
+                return Ok(TurnOutcome {
+                    stop_reason,
+                    usage: usage_total,
+                    request_count,
+                });
+            };
+            if tokens_rem.remaining_tokens()
+                <= self
+                    .thinking()
+                    .await
+                    .map(|thinking| thinking.num_tokens())
+                    .unwrap_or(0)
+            {
+                let stop_reason = self.handle_max_tokens().await?;
+                top_up_cancelled_tool_results(messages);
+                sanitize_transcript_messages(messages);
+                renderer.finish_agent(&context, Some(&stop_reason));
+                return Ok(TurnOutcome {
+                    stop_reason,
+                    usage: usage_total,
+                    request_count,
+                });
+            }
             sanitize_transcript_messages(messages);
             let retry_policy = retry::ApiRetryPolicy::default();
             let retry_backoff = retry_policy.backoff();
@@ -1325,16 +1335,6 @@ impl Agent for SidAgent {
                 },
             }
         }
-
-        let stop_reason = self.handle_max_tokens().await?;
-        top_up_cancelled_tool_results(messages);
-        sanitize_transcript_messages(messages);
-        renderer.finish_agent(&context, Some(&stop_reason));
-        Ok(TurnOutcome {
-            stop_reason,
-            usage: usage_total,
-            request_count,
-        })
     }
 
     async fn max_tokens(&self) -> u32 {
