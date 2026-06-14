@@ -187,8 +187,8 @@ the reference script sweeps it once after the loop.
 
 - **Journal**: `${SID_SESSION_DIR}/runs/<run-id>/` containing `steps.jsonl`
   (one record per loop step: deterministic shell op | agent child-session id |
-  judge verdict + soak counter), `suggestions.md`, `ci-NNN.log` (full CI
-  output per attempt), and the judge's pinned transcript.
+  judge verdict + soak counter), `suggestions.md`, `ci-latest.log`, capped
+  context spill files like `ci-NNN.log`, and the judge's pinned transcript.
 - **Resume**: `--resume` replays `steps.jsonl` to the last completed step:
   shell state restored, soak counter restored, judge transcript reloaded;
   in-flight step at interrupt is re-executed.
@@ -266,8 +266,16 @@ PLAN=${PLAN:-PLAN.md}
 SOAK=${SOAK:-3}
 
 while :; do
-  if ! out=$(./ci 2>&1); then
-    printf '%s' "$out" | agent fix "CI is failing. Make ./ci pass. Do not expand scope."
+  # Stream CI live while preserving combined output for the fix agent.
+  ci_log="$RUN_DIR/ci-latest.log"
+  ci_status="$RUN_DIR/ci-latest.status"
+  rm -f "$ci_log" "$ci_status"
+  { ./ci 2>&1; echo $? > "$ci_status"; } | tee "$ci_log"
+  ci_rc=$(cat "$ci_status")
+  rm -f "$ci_status"
+
+  if test "x$ci_rc" != x0; then
+    agent fix "CI is failing. Make ./ci pass. Do not expand scope." < "$ci_log"
     case $? in
       0) continue ;;
       3) echo "ralph: fix agent escalated" >&2; exit 3 ;;

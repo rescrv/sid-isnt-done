@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Once};
 use sid_isnt_done::ralph::journal::{StepRecord, StepsJournal, SuggestionsLedger};
 use sid_isnt_done::ralph::runner::{
     AgentCallResult, AgentInvocation, AgentOutcome, JudgeCallResult, JudgeInvocation, JudgeOutcome,
-    RalphHost, RunnerOptions, SHIM_PATH_ENV, run_ralph,
+    RalphHost, RunnerOptions, SHIM_PATH_ENV, ScriptOutputSink, run_ralph, run_ralph_with_output,
 };
 use sid_isnt_done::ralph::verdict::{Finding, Severity, Verdict};
 use sid_isnt_done::ralph::{EXIT_ESCALATED, EXIT_OK, EXIT_TRANSPORT};
@@ -65,6 +65,32 @@ struct StubHost {
     /// When set, the first `fix` invocation drops a `fixed` marker file here,
     /// simulating a repair that makes `./ci` pass.
     fix_touches: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct RecordingScriptOutputSink {
+    chunks: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl RecordingScriptOutputSink {
+    fn text(&self, stream: &str) -> String {
+        let chunks = self.chunks.lock().unwrap();
+        let bytes: Vec<u8> = chunks
+            .iter()
+            .filter(|(candidate, _)| candidate == stream)
+            .flat_map(|(_, chunk)| chunk.iter().copied())
+            .collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+}
+
+impl ScriptOutputSink for RecordingScriptOutputSink {
+    fn on_script_output(&self, stream: &str, data: &[u8]) {
+        self.chunks
+            .lock()
+            .unwrap()
+            .push((stream.to_string(), data.to_vec()));
+    }
 }
 
 impl RalphHost for StubHost {
@@ -316,6 +342,65 @@ fn the_reference_ralph_script_converges() {
             .read()
             .contains("Mention the soak flag")
     );
+
+    fs::remove_dir_all(&workspace).unwrap();
+    fs::remove_dir_all(&run_dir).unwrap();
+}
+
+#[test]
+fn the_reference_ralph_script_streams_ci_output() {
+    ensure_shim_env();
+    let workspace = temp_dir("ralph-stream-ws");
+    let ci = workspace.join("ci");
+    fs::write(
+        &ci,
+        "#!/bin/sh\n\
+echo 'ci stdout: start'\n\
+echo 'ci stderr: checking' >&2\n\
+if test -f fixed; then echo 'ci stdout: ok'; else echo 'ci output: not fixed'; exit 1; fi\n",
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&ci).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    perms.set_mode(0o755);
+    fs::set_permissions(&ci, perms).unwrap();
+
+    let (opts, run_dir) = options("ralph-stream", &workspace);
+    let host = StubHost {
+        fix_touches: Some(workspace.join("fixed")),
+        ..Default::default()
+    };
+    host.judge_results
+        .lock()
+        .unwrap()
+        .push_back(verdict_result(passing_verdict("The plan is complete.")));
+    let agent_log = Arc::clone(&host.agent_log);
+    let sink = Arc::new(RecordingScriptOutputSink::default());
+    let output_sink: Arc<dyn ScriptOutputSink> = sink.clone();
+
+    let script = include_str!("../init/ralph.sid");
+    let report = run_ralph_with_output(
+        Box::new(host),
+        opts,
+        script,
+        &[("SOAK".to_string(), "1".to_string())],
+        Arc::new(AtomicBool::new(false)),
+        Some(output_sink),
+    )
+    .unwrap();
+
+    assert_eq!(report.exit, EXIT_OK, "report: {report:?}");
+    let streamed = sink.text("stdout");
+    assert!(streamed.contains("ci stdout: start"));
+    assert!(streamed.contains("ci stderr: checking"));
+    assert!(streamed.contains("ci output: not fixed"));
+    assert!(streamed.contains("ci stdout: ok"));
+
+    let log = agent_log.lock().unwrap();
+    assert_eq!(log[0].service, "fix");
+    assert!(log[0].context.contains("ci stdout: start"));
+    assert!(log[0].context.contains("ci stderr: checking"));
+    assert!(log[0].context.contains("ci output: not fixed"));
 
     fs::remove_dir_all(&workspace).unwrap();
     fs::remove_dir_all(&run_dir).unwrap();
