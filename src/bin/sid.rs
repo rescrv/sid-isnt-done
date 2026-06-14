@@ -26,7 +26,10 @@ use claudius::chat::{
     ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, SessionStats, help_text,
     parse_command,
 };
-use claudius::{Anthropic, Effort, KnownModel, Model, TokenRates};
+use claudius::{
+    Anthropic, ContentBlock, Effort, KnownModel, MessageParam, MessageParamContent, MessageRole,
+    Model, TokenRates,
+};
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
 use sid_isnt_done::config::{
@@ -861,11 +864,12 @@ impl SidRuntimeSession {
 
     async fn send_message(
         &mut self,
-        message: claudius::MessageParam,
+        message: MessageParam,
         renderer: &mut dyn Renderer,
     ) -> Result<(), claudius::Error> {
         let model = self.chat.config().model();
         let before = self.chat.stats();
+        let turn_start_len = self.chat.clone_messages().len();
         let clamp = match self.spend_turn_clamp() {
             Ok(clamp) => clamp,
             Err(err) => {
@@ -879,13 +883,24 @@ impl SidRuntimeSession {
                 .set_max_tokens(clamp.clamped_max_tokens);
         }
 
-        let result = self.chat.send_message(message, renderer).await;
+        let (result, interrupted) = {
+            let mut renderer = InterruptTrackingRenderer::new(renderer);
+            let result = self.chat.send_message(message, &mut renderer).await;
+            (result, renderer.was_interrupted())
+        };
         let after = self.chat.stats();
         if let Some(clamp) = clamp {
             self.chat.config_mut().template.max_tokens = clamp.original_max_tokens;
         }
         if result.is_ok() {
             self.record_sid_spend_delta(&before, &after, &model);
+            if interrupted {
+                match self.rewind_interrupted_turn(turn_start_len) {
+                    Ok(Some(note)) => renderer.print_info(&(), &note),
+                    Ok(None) => {}
+                    Err(err) => return Err(claudius::Error::unknown(err.to_string())),
+                }
+            }
         }
         result
     }
@@ -950,6 +965,7 @@ impl SidRuntimeSession {
             .load_transcript_from(path)
             .map_err(|err| transcript_error("transcript_load_failed", path, &err.to_string()))?;
         self.sanitize_transcript();
+        self.rewind_trailing_incomplete_turn()?;
         self.persist_transcript()
     }
 
@@ -971,6 +987,7 @@ impl SidRuntimeSession {
                     .with_string_field("cause", &err.to_string())
                 })?;
             self.sanitize_transcript();
+            self.rewind_trailing_incomplete_turn()?;
         }
         let mut messages = self.chat.clone_messages();
         append_resumed_bash_reset_marker(&mut messages);
@@ -1471,6 +1488,26 @@ impl SidRuntimeSession {
         self.chat.replace_messages(messages);
     }
 
+    fn rewind_interrupted_turn(&mut self, turn_start_len: usize) -> Result<Option<String>, SError> {
+        let mut messages = self.chat.clone_messages();
+        let Some(rewind) = rewind_interrupted_messages(&mut messages, turn_start_len) else {
+            return Ok(None);
+        };
+        self.chat.replace_messages(messages);
+        self.persist_transcript()?;
+        Ok(Some(rewind.note))
+    }
+
+    fn rewind_trailing_incomplete_turn(&mut self) -> Result<Option<String>, SError> {
+        let mut messages = self.chat.clone_messages();
+        let Some(rewind) = rewind_trailing_incomplete_messages(&mut messages) else {
+            return Ok(None);
+        };
+        self.chat.replace_messages(messages);
+        self.persist_transcript()?;
+        Ok(Some(rewind.note))
+    }
+
     fn last_assistant_text(&self) -> Option<String> {
         extract_last_assistant_text(&self.chat.clone_messages())
     }
@@ -1484,6 +1521,198 @@ impl SidRuntimeSession {
     fn replace_messages(&mut self, messages: Vec<claudius::MessageParam>) -> Result<(), SError> {
         self.chat.replace_messages(messages);
         self.persist_transcript()
+    }
+}
+
+struct InterruptRewind {
+    note: String,
+}
+
+fn rewind_interrupted_messages(
+    messages: &mut Vec<MessageParam>,
+    turn_start_len: usize,
+) -> Option<InterruptRewind> {
+    if messages.len() <= turn_start_len
+        || !messages
+            .last()
+            .is_some_and(|message| message.role == MessageRole::Assistant)
+    {
+        return None;
+    }
+    let removed = messages.pop()?;
+    let note = interrupted_rewind_note(tail_line_from_message(&removed).as_deref());
+    messages.push(MessageParam::user(note.clone()));
+    Some(InterruptRewind { note })
+}
+
+fn rewind_trailing_incomplete_messages(
+    messages: &mut Vec<MessageParam>,
+) -> Option<InterruptRewind> {
+    if !messages
+        .last()
+        .is_some_and(trailing_assistant_message_is_incomplete)
+    {
+        return None;
+    }
+    let removed = messages.pop()?;
+    let note = interrupted_rewind_note(tail_line_from_message(&removed).as_deref());
+    messages.push(MessageParam::user(note.clone()));
+    Some(InterruptRewind { note })
+}
+
+fn trailing_assistant_message_is_incomplete(message: &MessageParam) -> bool {
+    if message.role != MessageRole::Assistant {
+        return false;
+    }
+    match &message.content {
+        MessageParamContent::String(text) => text.trim().is_empty(),
+        MessageParamContent::Array(blocks) => {
+            blocks.is_empty()
+                || blocks.iter().any(ContentBlock::is_tool_use)
+                || blocks.iter().all(ContentBlock::is_thinking)
+        }
+    }
+}
+
+fn interrupted_rewind_note(tail: Option<&str>) -> String {
+    let tail = tail
+        .filter(|tail| !tail.trim().is_empty())
+        .unwrap_or("[no streamed content]");
+    format!("Rewound interrupted partial assistant message.\ncontinuing from: {tail}")
+}
+
+fn tail_line_from_message(message: &MessageParam) -> Option<String> {
+    let mut text = String::new();
+    match &message.content {
+        MessageParamContent::String(content) => text.push_str(content),
+        MessageParamContent::Array(blocks) => {
+            for block in blocks {
+                append_rewind_tail_text(&mut text, block);
+            }
+        }
+    }
+    let tail = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(truncate_tail_line(tail.trim(), 240))
+}
+
+fn append_rewind_tail_text(text: &mut String, block: &ContentBlock) {
+    if let Some(block) = block.as_text() {
+        text.push_str(&block.text);
+    } else if let Some(block) = block.as_thinking() {
+        text.push_str(&block.thinking);
+    } else if let Some(block) = block.as_tool_use() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&block.name);
+        text.push_str(" input: ");
+        match block.input.as_str() {
+            Some(input) => text.push_str(input),
+            None => text.push_str(&block.input.to_string()),
+        }
+    }
+}
+
+fn truncate_tail_line(line: &str, max_chars: usize) -> String {
+    let char_count = line.chars().count();
+    if char_count <= max_chars {
+        return line.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let tail = line
+        .chars()
+        .skip(char_count.saturating_sub(keep))
+        .collect::<String>();
+    format!("...{tail}")
+}
+
+struct InterruptTrackingRenderer<'a> {
+    inner: &'a mut dyn Renderer,
+    interrupted: bool,
+}
+
+impl<'a> InterruptTrackingRenderer<'a> {
+    fn new(inner: &'a mut dyn Renderer) -> Self {
+        Self {
+            inner,
+            interrupted: false,
+        }
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.interrupted
+    }
+}
+
+impl Renderer for InterruptTrackingRenderer<'_> {
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.inner.start_agent(context);
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.inner.finish_agent(context, stop_reason);
+    }
+
+    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.inner.print_text(context, text);
+    }
+
+    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
+        self.inner.print_thinking(context, text);
+    }
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.inner.print_error(context, error);
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.inner.print_info(context, info);
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.inner.start_tool_use(context, name, id);
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.inner.print_tool_input(context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.inner.finish_tool_use(context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.inner.start_tool_result(context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.inner.print_tool_result_text(context, text);
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.inner.finish_tool_result(context);
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.inner.finish_response(context);
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.interrupted = true;
+        self.inner.print_interrupted(context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.inner.should_interrupt()
+    }
+
+    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
+        self.inner.read_operator_line(prompt)
     }
 }
 
@@ -4283,14 +4512,18 @@ mod tests {
         SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SidTerminal,
         SpendTurnClamp, SwitchPosition, build_anthropic_client, dollars_to_micro_cents,
         handle_raw_request, history_entry, parse_confirmation, parse_history_file,
-        parse_sid_command, resolve_sid_home_from_env, validate_connect_mode, validate_no_free_args,
+        parse_sid_command, resolve_sid_home_from_env, rewind_interrupted_messages,
+        rewind_trailing_incomplete_messages, validate_connect_mode, validate_no_free_args,
         validate_runtime_mode, write_history_file,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
-    use claudius::Anthropic;
-    use claudius::MessageParam;
     use claudius::chat::{ChatConfig, ChatSession};
+    use claudius::{
+        Anthropic, ContentBlock, MessageParam, MessageParamContent, MessageRole, TextBlock,
+        ToolResultBlock, ToolUseBlock,
+    };
     use serde::Deserialize;
+    use serde_json::json;
     use sid_isnt_done::config::AnthropicConfig;
     use sid_isnt_done::ralph::runner::SHIM_PATH_ENV;
     use sid_isnt_done::raw_mode::RawServer;
@@ -4514,6 +4747,103 @@ mod tests {
         assert_eq!(session.clone_messages(), expected);
 
         fs::remove_dir_all(PathBuf::from(workspace_root.as_str())).unwrap();
+    }
+
+    #[test]
+    fn interrupted_rewind_removes_partial_assistant_tool_input_and_adds_tail_note() {
+        let mut messages = vec![
+            MessageParam::user("Do the work."),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ContentBlock::Text(TextBlock::new("I will inspect it.\n".to_string())),
+                    ToolUseBlock::new(
+                        "toolu_partial",
+                        "bash",
+                        serde_json::Value::String("{\"command\":\"pw".to_string()),
+                    )
+                    .into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+        ];
+
+        let rewind = rewind_interrupted_messages(&mut messages, 0).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], MessageParam::user("Do the work."));
+        assert_eq!(messages[1].role, MessageRole::User);
+        let note = user_text(&messages[1]);
+        assert_eq!(rewind.note, note);
+        assert!(note.contains("Rewound interrupted partial assistant message."));
+        assert!(note.contains("continuing from: bash input: {\"command\":\"pw"));
+    }
+
+    #[test]
+    fn interrupted_rewind_preserves_completed_tool_exchange() {
+        let result = ToolResultBlock::new("toolu_done".to_string())
+            .with_string_content("done\n".to_string());
+        let mut messages = vec![
+            MessageParam::user("Do the work."),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ToolUseBlock::new("toolu_done", "bash", json!({"command": "pwd"})).into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+            MessageParam::new(
+                MessageParamContent::Array(vec![result.into()]),
+                MessageRole::User,
+            ),
+            MessageParam::assistant("Now I can summarize: the"),
+        ];
+
+        let rewind = rewind_interrupted_messages(&mut messages, 0).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        let MessageParamContent::Array(blocks) = &messages[1].content else {
+            panic!("expected completed assistant tool use");
+        };
+        assert_eq!(
+            blocks[0].as_tool_use().unwrap().input,
+            json!({"command": "pwd"})
+        );
+        let MessageParamContent::Array(blocks) = &messages[2].content else {
+            panic!("expected completed user tool result");
+        };
+        assert_eq!(
+            blocks[0].as_tool_result().unwrap().tool_use_id,
+            "toolu_done"
+        );
+        assert_eq!(user_text(&messages[3]), rewind.note);
+        assert!(
+            rewind
+                .note
+                .contains("continuing from: Now I can summarize: the")
+        );
+    }
+
+    #[test]
+    fn trailing_incomplete_rewind_repairs_resumed_partial_tool_use() {
+        let mut messages = vec![
+            MessageParam::user("Do the work."),
+            MessageParam::new(
+                MessageParamContent::Array(vec![
+                    ToolUseBlock::new("toolu_partial", "bash", json!({"command": "pwd"})).into(),
+                ]),
+                MessageRole::Assistant,
+            ),
+        ];
+
+        let rewind = rewind_trailing_incomplete_messages(&mut messages).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], MessageParam::user("Do the work."));
+        assert_eq!(user_text(&messages[1]), rewind.note);
+        assert!(
+            rewind
+                .note
+                .contains("continuing from: bash input: {\"command\":\"pwd\"}")
+        );
     }
 
     #[test]
@@ -5104,6 +5434,18 @@ mod tests {
 
     fn read_saved_transcript(path: &std::path::Path) -> TranscriptSnapshot {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn user_text(message: &MessageParam) -> String {
+        assert_eq!(message.role, MessageRole::User);
+        match &message.content {
+            MessageParamContent::String(text) => text.clone(),
+            MessageParamContent::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+        }
     }
 
     #[test]
