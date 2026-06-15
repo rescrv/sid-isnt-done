@@ -47,6 +47,7 @@ mod tool_runtime;
 mod user_instructions;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -658,6 +659,7 @@ impl SidAgent {
                 }
             }
         }
+        let timeout = binding.timeout;
 
         let mut session_slot = self.bash_session.lock().await;
         if restart {
@@ -691,7 +693,11 @@ impl SidAgent {
             };
             let mut streamer =
                 BashToolResultStreamer::new(renderer, stream_context, stream_tool_use_id);
-            let result = run_bash_pty_with_streamer(session, command, &mut streamer).await;
+            let result = run_bash_pty_with_optional_timeout(
+                run_bash_pty_with_streamer(session, command, &mut streamer),
+                timeout,
+            )
+            .await;
             return match result {
                 Ok(result) => match render_bash_pty_result(result) {
                     Ok(text) => {
@@ -719,7 +725,7 @@ impl SidAgent {
             let Some(session) = session_slot.as_mut() else {
                 return Err(bash_session_missing_error());
             };
-            session.run(command, false).await
+            run_bash_pty_with_optional_timeout(session.run(command, false), timeout).await
         };
         match result {
             Ok(result) => render_bash_pty_result(result).map(|text| BashCommandOutput {
@@ -1911,6 +1917,7 @@ struct BuiltinToolBindings {
 #[derive(Clone, Debug)]
 struct BuiltinBashBinding {
     enabled: SwitchPosition,
+    timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -2941,6 +2948,28 @@ async fn run_bash_pty_with_streamer(
     }
 }
 
+async fn run_bash_pty_with_optional_timeout<F>(
+    future: F,
+    timeout: Option<Duration>,
+) -> Result<BashPtyResult, std::io::Error>
+where
+    F: Future<Output = Result<BashPtyResult, std::io::Error>>,
+{
+    let Some(limit) = timeout else {
+        return future.await;
+    };
+    tokio::time::timeout(limit, future)
+        .await
+        .map_err(|_| bash_timeout_error(limit))?
+}
+
+fn bash_timeout_error(limit: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("tool 'bash' timed out after {}s", limit.as_secs()),
+    )
+}
+
 fn bash_session_missing_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::BrokenPipe,
@@ -3331,6 +3360,7 @@ fn build_tools(config: &Config, agent_config: &AgentConfig) -> Result<BuiltTools
                 BuiltinToolKind::Bash if builtin_bindings.bash.is_none() => {
                     builtin_bindings.bash = Some(BuiltinBashBinding {
                         enabled: tool_config.enabled,
+                        timeout: tool_config.timeout,
                     });
                 }
                 BuiltinToolKind::Edit if builtin_bindings.edit.is_none() => {
@@ -5387,6 +5417,36 @@ esac
     }
 
     #[test]
+    fn builtin_bash_respects_configured_timeout() {
+        let root = temp_config_root("agent");
+        write_builtin_config_with_bash_timeout(
+            &root,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            Some(1),
+        );
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), agent.bash("sleep 3", true)).await
+            })
+            .expect("bash call should return at the configured timeout");
+        let err = result.expect_err("sleeping bash command should time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "tool 'bash' timed out after 1s");
+
+        let fresh = runtime
+            .block_on(agent.bash("printf fresh", false))
+            .expect("timeout should reset bash session for the next command");
+        assert_eq!(fresh, "fresh");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn builtin_bash_tool_restart_resets_shell_state() {
         let root = temp_config_root("agent");
         write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
@@ -5472,6 +5532,39 @@ esac
                 is_error: None,
             }
         );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn builtin_bash_tool_streaming_respects_configured_timeout() {
+        let root = temp_config_root("agent");
+        write_builtin_config_with_bash_timeout(
+            &root,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            Some(1),
+        );
+
+        let config = Config::load(&root).unwrap();
+        let mut agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let client = Anthropic::new(Some("test-api-key".to_string())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut renderer = RecordingRenderer::default();
+
+        let result = invoke_bash_tool_streaming(
+            &runtime,
+            &client,
+            &mut agent,
+            "toolu_bash_timeout",
+            json!({
+                "command": "printf 'before\\n'; sleep 3; printf 'after\\n'",
+                "restart": true
+            }),
+            &mut renderer,
+        );
+        assert_eq!(unwrap_error_text(result), "tool 'bash' timed out after 1s");
+        assert_eq!(renderer.output, "before");
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
@@ -6206,6 +6299,15 @@ CRITICAL — the edit tool and bash tool use different path namespaces:
     }
 
     fn write_builtin_config(root: &Path, bash_script: &str, edit_script: &str) {
+        write_builtin_config_with_bash_timeout(root, bash_script, edit_script, None);
+    }
+
+    fn write_builtin_config_with_bash_timeout(
+        root: &Path,
+        bash_script: &str,
+        edit_script: &str,
+        bash_timeout: Option<u64>,
+    ) {
         fs::create_dir_all(root.join("agents").as_str()).unwrap();
         fs::write(
             root.join("agents.conf").as_str(),
@@ -6215,12 +6317,17 @@ build_TOOLS='bash edit'
 "#,
         )
         .unwrap();
+        let bash_timeout = bash_timeout
+            .map(|seconds| format!("bash_TIMEOUT=\"{seconds}\"\n"))
+            .unwrap_or_default();
         fs::write(
             root.join("tools.conf").as_str(),
-            r#"
+            format!(
+                r#"
 bash_ENABLED="YES"
-edit_ENABLED="YES"
+{bash_timeout}edit_ENABLED="YES"
 "#,
+            ),
         )
         .unwrap();
         fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();

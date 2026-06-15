@@ -1544,6 +1544,7 @@ format_ALIASES="fmt"
         assert_eq!(bash.enabled, SwitchPosition::Yes);
         assert!(!bash.confirm_preview);
         assert!(bash.executable_path.is_none());
+        assert_eq!(bash.timeout, Some(DEFAULT_TOOL_TIMEOUT));
     }
 
     #[test]
