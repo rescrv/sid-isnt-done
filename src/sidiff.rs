@@ -896,35 +896,65 @@ fn analyze_change_pairs(
 }
 
 fn pair_change_lines(removes: Vec<LineRef>, adds: Vec<LineRef>) -> Vec<(LineRef, LineRef)> {
-    let mut pairs = vec![];
-    let mut used_adds = HashSet::new();
+    #[derive(Clone, Copy, Debug)]
+    struct Candidate {
+        remove_idx: usize,
+        add_idx: usize,
+        score: f32,
+    }
+
+    const MIN_PAIR_SCORE: f32 = 0.18;
+
+    let mut candidates = vec![];
     for (remove_idx, remove) in removes.iter().enumerate() {
-        let mut best: Option<(usize, f32)> = None;
         for (add_idx, add) in adds.iter().enumerate() {
-            if used_adds.contains(&add_idx) {
-                continue;
-            }
             let score = line_similarity(&remove.content, &add.content);
-            if best.is_none_or(|(_, best_score)| score > best_score) {
-                best = Some((add_idx, score));
+            if score >= MIN_PAIR_SCORE {
+                candidates.push(Candidate {
+                    remove_idx,
+                    add_idx,
+                    score,
+                });
             }
-        }
-        let Some((add_idx, score)) = best else {
-            continue;
-        };
-        let positional = remove_idx < adds.len() && !used_adds.contains(&remove_idx);
-        if score >= 0.18 || positional {
-            let chosen = if positional && score < 0.18 {
-                remove_idx
-            } else {
-                add_idx
-            };
-            if !used_adds.insert(chosen) {
-                continue;
-            }
-            pairs.push((remove.clone(), adds[chosen].clone()));
         }
     }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| {
+                left.remove_idx
+                    .abs_diff(left.add_idx)
+                    .cmp(&right.remove_idx.abs_diff(right.add_idx))
+            })
+            .then_with(|| left.remove_idx.cmp(&right.remove_idx))
+            .then_with(|| left.add_idx.cmp(&right.add_idx))
+    });
+
+    let mut pairs = vec![];
+    let mut used_removes = HashSet::new();
+    let mut used_adds = HashSet::new();
+    for candidate in candidates {
+        if used_removes.contains(&candidate.remove_idx) || used_adds.contains(&candidate.add_idx) {
+            continue;
+        }
+        used_removes.insert(candidate.remove_idx);
+        used_adds.insert(candidate.add_idx);
+        pairs.push((
+            removes[candidate.remove_idx].clone(),
+            adds[candidate.add_idx].clone(),
+        ));
+    }
+
+    for (remove_idx, remove) in removes.iter().enumerate() {
+        if used_removes.contains(&remove_idx) || remove_idx >= adds.len() {
+            continue;
+        }
+        if used_adds.insert(remove_idx) {
+            pairs.push((remove.clone(), adds[remove_idx].clone()));
+        }
+    }
+    pairs.sort_by_key(|(remove, add)| (remove.id, add.id));
     pairs
 }
 
@@ -1275,7 +1305,17 @@ fn lcs_pairs_by<T>(left: &[T], right: &[T], eq: impl Fn(&T, &T) -> bool) -> Vec<
     let mut j = 0usize;
     let mut pairs = vec![];
     while i < left.len() && j < right.len() {
-        if eq(&left[i], &right[j]) {
+        if eq(&left[i], &right[j])
+            && table[i][j] == table[i + 1][j + 1] + 1
+            && table[i + 1][j] == table[i][j]
+        {
+            i += 1;
+        } else if eq(&left[i], &right[j])
+            && table[i][j] == table[i + 1][j + 1] + 1
+            && table[i][j + 1] == table[i][j]
+        {
+            j += 1;
+        } else if eq(&left[i], &right[j]) {
             pairs.push((i, j));
             i += 1;
             j += 1;
@@ -2913,6 +2953,75 @@ diff --git a/old.rs b/new.rs
                 && range.end == serror + "SError".len()
                 && range.weight == NoveltyWeight::Unchanged
         }));
+    }
+
+    #[test]
+    fn line_pairing_highlights_removed_argument_not_surrounding_call() {
+        let input = "\
+diff --git a/src/shell/builtins.rs b/src/shell/builtins.rs
+--- a/src/shell/builtins.rs
++++ b/src/shell/builtins.rs
+@@ -1,2 +1 @@
+-let numeric = format.conversion.is_numeric();
+-(apply_printf_width(rendered, format, numeric, stop)
++(apply_printf_width(rendered, format, stop)
+";
+        let diff = parse_unified_diff(input);
+        let analysis = analyze_diff(&diff);
+        let removed_binding_id = LineId {
+            file: 0,
+            hunk: 0,
+            line: 0,
+        };
+        let removed_call_id = LineId {
+            file: 0,
+            hunk: 0,
+            line: 1,
+        };
+        let added_call_id = LineId {
+            file: 0,
+            hunk: 0,
+            line: 2,
+        };
+
+        assert_eq!(
+            analysis
+                .lines
+                .get(&added_call_id)
+                .and_then(|meta| meta.paired_with),
+            Some(removed_call_id)
+        );
+        assert_eq!(
+            analysis
+                .lines
+                .get(&removed_binding_id)
+                .and_then(|meta| meta.paired_with),
+            None
+        );
+        assert!(
+            analysis.lines[&removed_binding_id]
+                .ranges
+                .iter()
+                .all(|range| range.weight == NoveltyWeight::Full)
+        );
+
+        let removed_call = &diff.files[0].hunks[0].lines[1].content;
+        let removed_changed: String = analysis.lines[&removed_call_id]
+            .ranges
+            .iter()
+            .filter(|range| range.weight != NoveltyWeight::Unchanged)
+            .map(|range| &removed_call[range.start..range.end])
+            .collect();
+        assert_eq!(removed_changed, ", numeric");
+
+        let added_call = &diff.files[0].hunks[0].lines[2].content;
+        let added_changed: String = analysis.lines[&added_call_id]
+            .ranges
+            .iter()
+            .filter(|range| range.weight != NoveltyWeight::Unchanged)
+            .map(|range| &added_call[range.start..range.end])
+            .collect();
+        assert_eq!(added_changed, "");
     }
 
     #[test]
