@@ -47,7 +47,6 @@ mod tool_runtime;
 mod user_instructions;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +92,7 @@ const ASK_AN_EXPERT_TOOL_NAME: &str = "ask_an_expert";
 const MAX_ASK_AN_EXPERT_DEPTH: usize = 8;
 const BASH_CONSOLE_RESET_MESSAGE: &str = "bash console has reset";
 const SYNTHETIC_BASH_RESUME_TOOL_USE_ID_PREFIX: &str = "toolu_resume_bash_restart_";
+const BASH_PTY_DISABLED_TOOL_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const DEFAULT_COMPACTOR_SYSTEM_PROMPT: &str = concat!(
     "You are the sid compaction agent.\n",
     "Turn the conversation history into a compact, high-signal handoff summary for a future session.\n",
@@ -682,7 +682,7 @@ impl SidAgent {
             ));
         };
         if session_slot.is_none() {
-            *session_slot = Some(self.spawn_bash_session().await?);
+            *session_slot = Some(self.spawn_bash_session(timeout).await?);
         }
 
         if let (Some(renderer), Some(stream_context), Some(stream_tool_use_id)) =
@@ -693,11 +693,7 @@ impl SidAgent {
             };
             let mut streamer =
                 BashToolResultStreamer::new(renderer, stream_context, stream_tool_use_id);
-            let result = run_bash_pty_with_optional_timeout(
-                run_bash_pty_with_streamer(session, command, &mut streamer),
-                timeout,
-            )
-            .await;
+            let result = run_bash_pty_with_streamer(session, command, &mut streamer).await;
             return match result {
                 Ok(result) => match render_bash_pty_result(result) {
                     Ok(text) => {
@@ -725,7 +721,7 @@ impl SidAgent {
             let Some(session) = session_slot.as_mut() else {
                 return Err(bash_session_missing_error());
             };
-            run_bash_pty_with_optional_timeout(session.run(command, false), timeout).await
+            session.run(command, false).await
         };
         match result {
             Ok(result) => render_bash_pty_result(result).map(|text| BashCommandOutput {
@@ -739,11 +735,14 @@ impl SidAgent {
         }
     }
 
-    async fn spawn_bash_session(&self) -> Result<BashPtySession, std::io::Error> {
-        BashPtySession::new(self.bash_pty_config()).await
+    async fn spawn_bash_session(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<BashPtySession, std::io::Error> {
+        BashPtySession::new(self.bash_pty_config(timeout)).await
     }
 
-    fn bash_pty_config(&self) -> BashPtyConfig {
+    fn bash_pty_config(&self, timeout: Option<Duration>) -> BashPtyConfig {
         let mut env: BTreeMap<String, String> = std::env::vars().collect();
         let mut read_roots = Vec::new();
         env.insert(
@@ -778,6 +777,7 @@ impl SidAgent {
             cwd: PathBuf::from(self.workspace_root.as_str()),
             env,
             shell_wrapper,
+            command_timeout: bash_pty_command_timeout(timeout),
             ..BashPtyConfig::default()
         }
     }
@@ -2948,26 +2948,11 @@ async fn run_bash_pty_with_streamer(
     }
 }
 
-async fn run_bash_pty_with_optional_timeout<F>(
-    future: F,
-    timeout: Option<Duration>,
-) -> Result<BashPtyResult, std::io::Error>
-where
-    F: Future<Output = Result<BashPtyResult, std::io::Error>>,
-{
-    let Some(limit) = timeout else {
-        return future.await;
-    };
-    tokio::time::timeout(limit, future)
-        .await
-        .map_err(|_| bash_timeout_error(limit))?
-}
-
-fn bash_timeout_error(limit: Duration) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!("tool 'bash' timed out after {}s", limit.as_secs()),
-    )
+fn bash_pty_command_timeout(timeout: Option<Duration>) -> Duration {
+    match timeout {
+        Some(limit) => limit,
+        None => BASH_PTY_DISABLED_TOOL_TIMEOUT,
+    }
 }
 
 fn bash_session_missing_error() -> std::io::Error {
@@ -3598,7 +3583,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_DIR};
+    use crate::config::{DEFAULT_TOOL_TIMEOUT, TOOL_PROTOCOL_VERSION, TOOLS_DIR};
     use crate::test_support::{
         make_executable, temp_config_root, unique_temp_dir, write_default_tool_manifest,
     };
@@ -5417,6 +5402,44 @@ esac
     }
 
     #[test]
+    fn builtin_bash_tool_timeout_configures_claudius_command_timeout() {
+        let root = temp_config_root("agent");
+        write_builtin_config(&root, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let timeout = agent.builtin_bindings.bash.as_ref().unwrap().timeout;
+        let pty_config = agent.bash_pty_config(timeout);
+
+        assert_eq!(timeout, Some(DEFAULT_TOOL_TIMEOUT));
+        assert_eq!(pty_config.command_timeout, DEFAULT_TOOL_TIMEOUT);
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn builtin_bash_pty_timeout_avoids_hidden_limit_when_tool_timeout_disabled() {
+        let root = temp_config_root("agent");
+        write_builtin_config_with_bash_timeout(
+            &root,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            Some(0),
+        );
+
+        let config = Config::load(&root).unwrap();
+        let agent = SidAgent::from_config(&config, "build", root.clone()).unwrap();
+        let timeout = agent.builtin_bindings.bash.as_ref().unwrap().timeout;
+        let pty_config = agent.bash_pty_config(timeout);
+
+        assert_eq!(timeout, None);
+        assert_eq!(pty_config.command_timeout, BASH_PTY_DISABLED_TOOL_TIMEOUT);
+        assert!(pty_config.command_timeout > Duration::from_secs(120));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn builtin_bash_respects_configured_timeout() {
         let root = temp_config_root("agent");
         write_builtin_config_with_bash_timeout(
@@ -5436,7 +5459,10 @@ esac
             .expect("bash call should return at the configured timeout");
         let err = result.expect_err("sleeping bash command should time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert_eq!(err.to_string(), "tool 'bash' timed out after 1s");
+        assert!(
+            err.to_string().starts_with("timed out waiting for prompt;"),
+            "{err}"
+        );
 
         let fresh = runtime
             .block_on(agent.bash("printf fresh", false))
@@ -5563,7 +5589,11 @@ esac
             }),
             &mut renderer,
         );
-        assert_eq!(unwrap_error_text(result), "tool 'bash' timed out after 1s");
+        let error = unwrap_error_text(result);
+        assert!(
+            error.starts_with("timed out waiting for prompt;"),
+            "{error}"
+        );
         assert_eq!(renderer.output, "before");
 
         fs::remove_dir_all(root.as_str()).unwrap();
