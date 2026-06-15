@@ -200,9 +200,10 @@ the reference script sweeps it once after the loop.
 - **stdin cap**: piped context is capped at 64 KiB head + 16 KiB tail with a
   `[truncated: full log at ${RUN_DIR}/ci-NNN.log]` marker; the agent can
   `read` deeper.
-- **Budgets**: `--max-iters` (loop iterations) and `--budget` (total tokens
-  across all child sessions, riding `_SESSION_BUDGET` machinery). Exhaustion
-  is exit 4.
+- **Budgets**: `--max-iters` (judge-started fixpoint iterations; the run starts
+  in implicit iteration 0, so pre-judge repair agents are grouped there) and
+  `--budget` (total tokens across all child sessions, riding `_SESSION_BUDGET`
+  machinery). Exhaustion is exit 4.
 - **SIGINT**: kill the in-flight child session cleanly, journal intact,
   exit 130, return to the sid prompt.
 - **Parent linkage on exit**: inject one synthetic user-style turn into the
@@ -213,7 +214,7 @@ the reference script sweeps it once after the loop.
 
 ```
 Ran /run ralph.sid (run 2026-06-10T14-22-07).
-Exit 0 after 4 iterations (2 fix, 2 task), judge passed soak 5/5.
+Exit 0 after 2 iterations (2 fix, 2 task), judge passed soak 5/5.
 Final verdict: "<summary field>"
 Journal: <session>/runs/2026-06-10T14-22-07/
 Suggestions ledger: 3 entries (triaged by task agent, see steps.jsonl).

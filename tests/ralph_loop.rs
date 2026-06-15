@@ -292,8 +292,9 @@ fn the_reference_ralph_script_converges() {
     .unwrap();
 
     assert_eq!(report.exit, EXIT_OK, "report: {report:?}");
-    // 1 fix + 1 task (work order) + 1 task (suggestions sweep).
-    assert_eq!(report.iterations, 3);
+    // The pre-judge CI fix is in implicit iteration 0; the two judge passes
+    // are the counted fixpoint iterations.
+    assert_eq!(report.iterations, 2);
     assert_eq!(
         report.agent_counts,
         vec![("fix".to_string(), 1), ("task".to_string(), 2)]
@@ -442,7 +443,7 @@ fn escalation_stops_the_reference_loop_with_exit_three() {
 }
 
 #[test]
-fn max_iters_is_a_transport_class_stop() {
+fn max_iters_does_not_charge_implicit_zero_iteration_agents() {
     ensure_shim_env();
     let workspace = temp_dir("iters-ws");
     let (mut opts, run_dir) = options("iters", &workspace);
@@ -462,8 +463,52 @@ exit 0
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
+    assert_eq!(report.exit, EXIT_OK);
+    assert_eq!(report.iterations, 0);
+    assert_eq!(report.agent_counts, vec![("fix".to_string(), 3)]);
+    fs::remove_dir_all(&workspace).unwrap();
+    fs::remove_dir_all(&run_dir).unwrap();
+}
+
+#[test]
+fn max_iters_stops_between_judge_started_iterations() {
+    ensure_shim_env();
+    let workspace = temp_dir("judge-iters-ws");
+    let (mut opts, run_dir) = options("judge-iters", &workspace);
+    opts.max_iters = Some(1);
+    let host = StubHost::default();
+    let agent_log = Arc::clone(&host.agent_log);
+    let judge_log = Arc::clone(&host.judge_log);
+    host.judge_results
+        .lock()
+        .unwrap()
+        .push_back(verdict_result(failing_verdict("needs work")));
+
+    let script = r#"
+findings=$(judge judge "first pass")
+case $? in
+  1)
+    printf '%s' "$findings" | agent task "Execute this work order."
+    agent task '$commit'
+    ;;
+  *) exit $? ;;
+esac
+judge judge "second pass"
+exit $?
+"#;
+    let report = run_ralph(
+        Box::new(host),
+        opts,
+        script,
+        &[],
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     assert_eq!(report.exit, EXIT_TRANSPORT);
-    assert_eq!(report.iterations, 2);
+    assert_eq!(report.iterations, 1);
+    assert_eq!(report.agent_counts, vec![("task".to_string(), 2)]);
+    assert_eq!(agent_log.lock().unwrap().len(), 2);
+    assert_eq!(judge_log.lock().unwrap().len(), 1);
     fs::remove_dir_all(&workspace).unwrap();
     fs::remove_dir_all(&run_dir).unwrap();
 }

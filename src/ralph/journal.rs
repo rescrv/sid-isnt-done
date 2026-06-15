@@ -273,7 +273,7 @@ pub struct RunReport {
     pub run_dir: PathBuf,
     /// Run-level exit status.
     pub exit: i32,
-    /// Total agent invocations (the loop's iterations).
+    /// Total fixpoint iterations.
     pub iterations: u64,
     /// Per-service agent invocation counts, in first-seen order.
     pub agent_counts: Vec<(String, u64)>,

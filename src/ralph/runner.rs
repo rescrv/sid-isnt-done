@@ -170,7 +170,7 @@ pub struct RunnerOptions {
     pub run_dir: PathBuf,
     /// Workspace root for git checkpoints; `None` disables checkpointing.
     pub workspace_root: Option<PathBuf>,
-    /// Cap on agent invocations (loop iterations).
+    /// Cap on fixpoint iterations.
     pub max_iters: Option<u64>,
     /// Cap on total tokens across all child sessions.
     pub budget_tokens: Option<u64>,
@@ -189,6 +189,7 @@ pub struct RunnerCore {
     replay: VecDeque<StepRecord>,
     step: u64,
     iterations: u64,
+    max_iters_exhausted: bool,
     agent_counts: Vec<(String, u64)>,
     tokens_used: u64,
     soak_counters: HashMap<String, u32>,
@@ -227,6 +228,7 @@ impl RunnerCore {
             replay,
             step: 0,
             iterations: 0,
+            max_iters_exhausted: false,
             agent_counts: Vec::new(),
             tokens_used: 0,
             soak_counters: HashMap::new(),
@@ -268,13 +270,8 @@ impl RunnerCore {
         if self.interrupted.load(Ordering::Relaxed) {
             return ShimResponse::err(EXIT_SIGINT, "ralph: interrupted");
         }
-        if let Some(max) = self.options.max_iters
-            && self.iterations >= max
-        {
-            return ShimResponse::err(
-                EXIT_TRANSPORT,
-                format!("ralph: --max-iters {max} exhausted"),
-            );
+        if let Some(response) = self.max_iters_exhausted_response() {
+            return response;
         }
         if let Some(budget) = self.options.budget_tokens
             && self.tokens_used >= budget
@@ -284,7 +281,6 @@ impl RunnerCore {
                 format!("ralph: --budget {budget} tokens exhausted"),
             );
         }
-
         self.step += 1;
         let step = self.step;
         let context = self.capped_context(context, step);
@@ -297,7 +293,6 @@ impl RunnerCore {
             step,
         };
         let result = self.host.run_agent(&invocation);
-        self.iterations += 1;
         self.bump_agent_count(&parsed.service);
         self.tokens_used = self.tokens_used.saturating_add(result.tokens);
 
@@ -344,6 +339,9 @@ impl RunnerCore {
         if self.interrupted.load(Ordering::Relaxed) {
             return ShimResponse::err(EXIT_SIGINT, "ralph: interrupted");
         }
+        if let Some(response) = self.max_iters_exhausted_response() {
+            return response;
+        }
 
         // Config error before any API call.
         if !self.validated_judges.contains(&parsed.service) {
@@ -359,6 +357,9 @@ impl RunnerCore {
                 EXIT_TRANSPORT,
                 format!("ralph: --budget {budget} tokens exhausted"),
             );
+        }
+        if let Some(response) = self.begin_judge_iteration() {
+            return response;
         }
 
         self.step += 1;
@@ -567,7 +568,6 @@ impl RunnerCore {
             unreachable!("front was just matched as an agent record");
         };
         self.step = step;
-        self.iterations += 1;
         self.bump_agent_count(&service);
         if checkpoint.is_some() {
             self.last_checkpoint = checkpoint;
@@ -603,6 +603,7 @@ impl RunnerCore {
             unreachable!("front was just matched as a judge record");
         };
         self.step = step;
+        self.replay_judge_iteration();
         self.soak_counters.insert(service.clone(), soak);
         if let JudgeMode::Soak(target) = parsed.mode {
             self.final_soak = Some((soak, target));
@@ -615,6 +616,41 @@ impl RunnerCore {
             stdout: rendered,
             stderr: format!("ralph: replayed step {step} (judge {service})"),
         })
+    }
+
+    fn begin_judge_iteration(&mut self) -> Option<ShimResponse> {
+        // The run starts in implicit iteration 0.  Agents stay in the current
+        // iteration; each judge call advances to the next counted fixpoint pass.
+        self.begin_iteration()
+    }
+
+    fn begin_iteration(&mut self) -> Option<ShimResponse> {
+        if let Some(max) = self.options.max_iters
+            && self.iterations >= max
+        {
+            self.max_iters_exhausted = true;
+            return Some(ShimResponse::err(
+                EXIT_TRANSPORT,
+                format!("ralph: --max-iters {max} exhausted"),
+            ));
+        }
+        self.iterations += 1;
+        None
+    }
+
+    fn max_iters_exhausted_response(&self) -> Option<ShimResponse> {
+        if !self.max_iters_exhausted {
+            return None;
+        }
+        let max = self.options.max_iters?;
+        Some(ShimResponse::err(
+            EXIT_TRANSPORT,
+            format!("ralph: --max-iters {max} exhausted"),
+        ))
+    }
+
+    fn replay_judge_iteration(&mut self) {
+        self.iterations += 1;
     }
 
     fn capped_context(&self, context: &str, step: u64) -> String {
@@ -1359,9 +1395,73 @@ mod tests {
         opts.max_iters = Some(1);
         let mut core = core_with(StubHost::default(), opts);
         assert_eq!(core.handle(&request("agent", &["fix"], "")).exit, EXIT_OK);
-        let response = core.handle(&request("agent", &["task"], ""));
+        assert_eq!(core.handle(&request("judge", &["judge"], "")).exit, EXIT_OK);
+        let response = core.handle(&request("judge", &["judge"], ""));
         assert_eq!(response.exit, EXIT_TRANSPORT);
         assert!(response.stderr.contains("--max-iters"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn max_iters_counts_judge_started_iterations_not_followup_agents() {
+        let dir = temp_dir("max-iters-judge-pass");
+        let mut opts = options(&dir);
+        opts.max_iters = Some(1);
+        let mut host = StubHost::default();
+        let judge_invocations = Arc::clone(&host.judge_invocations);
+        host.judge_results
+            .push_back(verdict_result(failing_verdict("needs work")));
+        let mut core = core_with(host, opts);
+
+        assert_eq!(
+            core.handle(&request("judge", &["judge"], "")).exit,
+            EXIT_INSUFFICIENT
+        );
+        assert_eq!(core.handle(&request("agent", &["task"], "")).exit, EXIT_OK);
+        assert_eq!(core.handle(&request("agent", &["task"], "")).exit, EXIT_OK);
+
+        let response = core.handle(&request("judge", &["judge"], ""));
+        assert_eq!(response.exit, EXIT_TRANSPORT);
+        assert!(response.stderr.contains("--max-iters"));
+        assert_eq!(judge_invocations.lock().unwrap().len(), 1);
+
+        let ignored_exhaustion = core.handle(&request("agent", &["task"], ""));
+        assert_eq!(ignored_exhaustion.exit, EXIT_TRANSPORT);
+        assert!(ignored_exhaustion.stderr.contains("--max-iters"));
+
+        let report = core.report(response.exit);
+        assert_eq!(report.iterations, 1);
+        assert_eq!(report.agent_counts, vec![("task".to_string(), 2)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn followup_agents_after_judge_stay_in_current_iteration() {
+        let dir = temp_dir("max-iters-followup-agents");
+        let mut opts = options(&dir);
+        opts.max_iters = Some(1);
+        let mut host = StubHost::default();
+        host.judge_results
+            .push_back(verdict_result(failing_verdict("needs work")));
+        let mut core = core_with(host, opts);
+
+        assert_eq!(
+            core.handle(&request("judge", &["judge"], "")).exit,
+            EXIT_INSUFFICIENT
+        );
+        assert_eq!(core.handle(&request("agent", &["task"], "")).exit, EXIT_OK);
+        assert_eq!(core.handle(&request("agent", &["fix"], "")).exit, EXIT_OK);
+
+        let response = core.handle(&request("judge", &["judge"], ""));
+        assert_eq!(response.exit, EXIT_TRANSPORT);
+        assert!(response.stderr.contains("--max-iters"));
+
+        let report = core.report(response.exit);
+        assert_eq!(report.iterations, 1);
+        assert_eq!(
+            report.agent_counts,
+            vec![("task".to_string(), 1), ("fix".to_string(), 1)]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1746,7 +1846,7 @@ mod tests {
         core.handle(&request("judge", &["judge"], ""));
         let report = core.report(0);
         assert_eq!(report.exit, 0);
-        assert_eq!(report.iterations, 3);
+        assert_eq!(report.iterations, 2);
         assert_eq!(
             report.agent_counts,
             vec![("fix".to_string(), 1), ("task".to_string(), 2)]
