@@ -949,6 +949,47 @@ diff --git a/a.txt b/a.txt
     }
 
     #[test]
+    fn paired_change_rows_use_semantic_spans() {
+        let input = "\
+diff --git a/query.rs b/query.rs
+--- a/query.rs
++++ b/query.rs
+@@ -64,1 +64,1 @@
+-pub fn with_step(&self, step: Time) -> Result<QueryParams, Error> {
++pub fn with_step(&self, step: Time) -> Result<QueryParams, SError> {
+";
+        let blocks = build_blocks_with_color(&parse_unified_diff(input), true);
+        let added = blocks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == ReviewRowKind::Add)
+            .unwrap();
+        assert!(added.content.contains('\x1b'));
+
+        let rendered = render_row_line(
+            ReviewRow {
+                block: Some(0),
+                kind: added.kind,
+                text: added.render(),
+            },
+            None,
+        );
+        let bright_add = Some(Color::Rgb(80, 235, 150));
+        assert!(
+            rendered
+                .spans
+                .iter()
+                .any(|span| span.content == "SError" && span.style.fg == bright_add)
+        );
+        assert!(rendered.spans.iter().all(|span| {
+            !(span.content.contains("pub")
+                || span.content.contains("with_step")
+                || span.content.contains("Result"))
+                || span.style.fg != bright_add
+        }));
+    }
+
+    #[test]
     fn moved_addition_rows_render_muted_gray() {
         let blocks = build_blocks_with_color(&parse_unified_diff(MOVED_BLOCKS), true);
         let moved = blocks[1]

@@ -1204,7 +1204,7 @@ fn subtoken_insertion_ranges(
     if old.text.is_empty() || new.text.is_empty() {
         return None;
     }
-    if let Some(offset) = new.text.find(&old.text) {
+    if new.text.contains(&old.text) {
         return Some((
             vec![token_relative_range(
                 old,
@@ -1212,12 +1212,22 @@ fn subtoken_insertion_ranges(
                 old.text.len(),
                 NoveltyWeight::Unchanged,
             )],
-            split_around_matching_subtoken(new, offset, old.text.len()),
+            vec![token_relative_range(
+                new,
+                0,
+                new.text.len(),
+                NoveltyWeight::Full,
+            )],
         ));
     }
-    if let Some(offset) = old.text.find(&new.text) {
+    if old.text.contains(&new.text) {
         return Some((
-            split_around_matching_subtoken(old, offset, new.text.len()),
+            vec![token_relative_range(
+                old,
+                0,
+                old.text.len(),
+                NoveltyWeight::Full,
+            )],
             vec![token_relative_range(
                 new,
                 0,
@@ -1227,37 +1237,6 @@ fn subtoken_insertion_ranges(
         ));
     }
     None
-}
-
-fn split_around_matching_subtoken(
-    token: &Token,
-    match_start: usize,
-    match_len: usize,
-) -> Vec<NoveltyRange> {
-    let mut ranges = vec![];
-    if match_start > 0 {
-        ranges.push(token_relative_range(
-            token,
-            0,
-            match_start,
-            NoveltyWeight::Full,
-        ));
-    }
-    ranges.push(token_relative_range(
-        token,
-        match_start,
-        match_start + match_len,
-        NoveltyWeight::Unchanged,
-    ));
-    if match_start + match_len < token.text.len() {
-        ranges.push(token_relative_range(
-            token,
-            match_start + match_len,
-            token.text.len(),
-            NoveltyWeight::Full,
-        ));
-    }
-    ranges
 }
 
 fn token_relative_range(
@@ -1448,7 +1427,8 @@ pub(crate) fn build_review_line_metadata(
     use_color: bool,
 ) -> (BatLineColorMap, BTreeSet<(usize, usize, usize)>) {
     let analysis = analyze_diff(diff);
-    let bat_lines = build_bat_line_color_map_with_analysis(diff, &analysis, use_color);
+    let mut bat_lines = build_bat_line_color_map_with_analysis(diff, &analysis, use_color);
+    add_semantic_changed_lines_to_review_map(diff, &analysis, &mut bat_lines, use_color);
     let muted_moved_additions = analysis
         .lines
         .iter()
@@ -1464,6 +1444,48 @@ pub(crate) fn build_review_line_metadata(
         })
         .collect();
     (bat_lines, muted_moved_additions)
+}
+
+fn add_semantic_changed_lines_to_review_map(
+    diff: &Diff,
+    analysis: &Analysis,
+    map: &mut BatLineColorMap,
+    use_color: bool,
+) {
+    let options = SidiffOptions {
+        use_color,
+        ..SidiffOptions::default()
+    };
+    for (file_idx, file) in diff.files.iter().enumerate() {
+        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+            for (line_idx, line) in hunk.lines.iter().enumerate() {
+                if !matches!(line.op, DiffOp::Add | DiffOp::Remove) {
+                    continue;
+                }
+                let id = LineId {
+                    file: file_idx,
+                    hunk: hunk_idx,
+                    line: line_idx,
+                };
+                if map.get_id(id).is_some() {
+                    continue;
+                }
+                let meta = analysis.lines.get(&id);
+                if should_mute_moved_addition(line.op, meta) {
+                    continue;
+                }
+                let roles = meta
+                    .and_then(|meta| meta.role_chunk)
+                    .and_then(|chunk_id| analysis.chunk_roles.get(&chunk_id).map(Vec::as_slice))
+                    .unwrap_or(&[]);
+                let syntax = analysis.syntax.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+                map.lines.insert(
+                    id,
+                    render_content(&line.content, line.op, meta, syntax, roles, options),
+                );
+            }
+        }
+    }
 }
 
 fn build_bat_line_color_map_with_analysis(
@@ -2930,7 +2952,7 @@ diff --git a/old.rs b/new.rs
     }
 
     #[test]
-    fn word_delta_highlights_inserted_subtoken_prefix() {
+    fn word_delta_highlights_added_identifier_for_subtoken_insertions() {
         let new = "fn from_str(s: &str) -> Result<StringResolver, rpc_pb::SError> {";
         let meta = analyze_paired_line(
             "fn from_str(s: &str) -> Result<StringResolver, rpc_pb::Error> {",
@@ -2945,14 +2967,17 @@ diff --git a/old.rs b/new.rs
             .filter(|range| range.weight == NoveltyWeight::Full)
             .map(|range| &new[range.start..range.end])
             .collect();
-        assert_eq!(full, vec!["S"]);
+        assert_eq!(full, vec!["SError"]);
 
-        let serror = new.find("SError").unwrap();
-        assert!(meta.ranges.iter().any(|range| {
-            range.start == serror + 1
-                && range.end == serror + "SError".len()
-                && range.weight == NoveltyWeight::Unchanged
-        }));
+        let old = "fn from_str(s: &str) -> Result<StringResolver, rpc_pb::Error> {";
+        let old_meta = analyze_paired_line(old, new, Side::Pre);
+        assert_eq!(old_meta.novelty, LineNovelty::None);
+        assert!(
+            old_meta
+                .ranges
+                .iter()
+                .all(|range| range.weight == NoveltyWeight::Unchanged)
+        );
     }
 
     #[test]
