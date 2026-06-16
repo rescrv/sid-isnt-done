@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use claudius::FileSystem;
+use claudius::{FileSystem, MountHierarchy, Permissions};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use utf8path::Path;
@@ -38,6 +38,7 @@ struct ToolInvocation {
     request_file: PathBuf,
     result_file: PathBuf,
     workspace_root: Path<'static>,
+    skills_manifest_file: Option<PathBuf>,
     temp_dir: PathBuf,
 }
 
@@ -47,6 +48,16 @@ impl ToolInvocation {
         let result_file = PathBuf::from(required_env_var("RESULT_FILE")?);
         let workspace_root = required_env_var("WORKSPACE_ROOT")?;
         let workspace_root = Path::new(&workspace_root).into_owned();
+        let skills_manifest_file = env::var_os("SKILLS_MANIFEST_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("SCRATCH_DIR")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(|path| path.join("skills-manifest.json"))
+                    .filter(|path| path.is_file())
+            });
         let temp_dir = env::var_os("TEMP_DIR")
             .or_else(|| env::var_os("TMPDIR"))
             .map(PathBuf::from)
@@ -55,6 +66,7 @@ impl ToolInvocation {
             request_file,
             result_file,
             workspace_root,
+            skills_manifest_file,
             temp_dir,
         })
     }
@@ -181,6 +193,13 @@ struct ResolvedReadOnlyRequest {
     end_line: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct SkillMountManifestEntry {
+    id: String,
+    virtual_path: String,
+    content_path: String,
+}
+
 /// Entry point for the `sid-editor-tool` binary.
 ///
 /// Reads a tool-protocol request envelope from the environment, executes the
@@ -225,11 +244,18 @@ pub async fn run_sid_editor_tool() -> io::Result<()> {
 
     let output = match flavor {
         SidEditorToolFlavor::Editor => {
-            execute_editor_command(&invocation.workspace_root, &request.invocation.input).await
+            let filesystem = build_editor_filesystem(
+                &invocation.workspace_root,
+                invocation.skills_manifest_file.as_deref(),
+            )
+            .map_err(|failure| io::Error::new(io::ErrorKind::InvalidInput, failure.message))?;
+            execute_editor_command(&filesystem, &request.invocation.input).await
         }
-        SidEditorToolFlavor::ReadOnly => {
-            execute_readonly_command(&invocation.workspace_root, &request.invocation.input)
-        }
+        SidEditorToolFlavor::ReadOnly => execute_readonly_command(
+            &invocation.workspace_root,
+            invocation.skills_manifest_file.as_deref(),
+            &request.invocation.input,
+        ),
     };
     match output {
         Ok(output) => invocation.write_success(&request.request_id, output),
@@ -665,21 +691,21 @@ fn create_preview_diff_dir(temp_dir: &StdPath) -> PathBuf {
 }
 
 async fn execute_editor_command(
-    workspace_root: &Path<'_>,
+    filesystem: &dyn FileSystem,
     input: &Map<String, Value>,
 ) -> Result<String, ToolFailure> {
     let command = parse_request_input::<EditorCommand>(input)?;
     match command.command.as_str() {
         "view" => {
             let request = parse_request_input::<ViewRequest>(input)?;
-            workspace_root
+            filesystem
                 .view(&request.path, request.view_range)
                 .await
                 .map_err(map_filesystem_error)
         }
         "str_replace" => {
             let request = parse_request_input::<StrReplaceRequest>(input)?;
-            workspace_root
+            filesystem
                 .str_replace(
                     &request.path,
                     &request.old_str,
@@ -694,14 +720,14 @@ async fn execute_editor_command(
                 .insert_text
                 .or(request.new_str)
                 .ok_or_else(|| ToolFailure::new("invalid_input", "missing insert_text field"))?;
-            workspace_root
+            filesystem
                 .insert(&request.path, request.insert_line, &text)
                 .await
                 .map_err(map_filesystem_error)
         }
         "create" => {
             let request = parse_request_input::<CreateRequest>(input)?;
-            workspace_root
+            filesystem
                 .create(&request.path, &request.file_text)
                 .await
                 .map_err(map_filesystem_error)
@@ -711,6 +737,97 @@ async fn execute_editor_command(
             format!("{} is not a supported editor command", command.command),
         )),
     }
+}
+
+fn build_editor_filesystem(
+    workspace_root: &Path<'_>,
+    skills_manifest_file: Option<&StdPath>,
+) -> Result<MountHierarchy, ToolFailure> {
+    let mut filesystem = MountHierarchy::default();
+    filesystem
+        .mount(
+            "/".into(),
+            Permissions::ReadWrite,
+            workspace_root.clone().into_owned(),
+        )
+        .map_err(|err| ToolFailure::new("invalid_input", err))?;
+
+    let Some(skills_manifest_file) = skills_manifest_file else {
+        return Ok(filesystem);
+    };
+    for entry in read_skill_mount_manifest(skills_manifest_file)? {
+        mount_skill_manifest_entry(&mut filesystem, entry)?;
+    }
+    Ok(filesystem)
+}
+
+fn read_skill_mount_manifest(
+    skills_manifest_file: &StdPath,
+) -> Result<Vec<SkillMountManifestEntry>, ToolFailure> {
+    let payload = fs::read_to_string(skills_manifest_file).map_err(map_filesystem_error)?;
+    let entries =
+        serde_json::from_str::<Vec<SkillMountManifestEntry>>(&payload).map_err(|err| {
+            ToolFailure::new(
+                "invalid_input",
+                format!(
+                    "failed to parse skills manifest {}: {err}",
+                    skills_manifest_file.display()
+                ),
+            )
+        })?;
+    for entry in &entries {
+        validate_skill_manifest_entry(entry)?;
+    }
+    Ok(entries)
+}
+
+fn validate_skill_manifest_entry(entry: &SkillMountManifestEntry) -> Result<(), ToolFailure> {
+    if entry.id.is_empty() || entry.id.contains('/') {
+        return Err(ToolFailure::new(
+            "invalid_input",
+            format!("invalid skill id in skills manifest: {:?}", entry.id),
+        ));
+    }
+    let expected_virtual_path = format!("/skills/{}/SKILL.md", entry.id);
+    if entry.virtual_path != expected_virtual_path {
+        return Err(ToolFailure::new(
+            "invalid_input",
+            format!(
+                "skills manifest entry for {} has unexpected virtual path {}",
+                entry.id, entry.virtual_path
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn mount_skill_manifest_entry(
+    filesystem: &mut MountHierarchy,
+    entry: SkillMountManifestEntry,
+) -> Result<(), ToolFailure> {
+    validate_skill_manifest_entry(&entry)?;
+    let content_path = StdPath::new(&entry.content_path);
+    let parent = content_path.parent().ok_or_else(|| {
+        ToolFailure::new(
+            "invalid_input",
+            format!("skill content path has no parent: {}", entry.content_path),
+        )
+    })?;
+    let parent = Path::try_from(parent.to_path_buf())
+        .map(Path::into_owned)
+        .map_err(|err| {
+            ToolFailure::new(
+                "invalid_input",
+                format!("skill content path is not valid UTF-8: {err:?}"),
+            )
+        })?;
+    filesystem
+        .mount(
+            Path::new(&format!("/skills/{}", entry.id)).into_owned(),
+            Permissions::ReadOnly,
+            parent,
+        )
+        .map_err(|err| ToolFailure::new("invalid_input", err))
 }
 
 fn parse_request_input<T: for<'de> Deserialize<'de>>(
@@ -786,9 +903,15 @@ fn format_readonly_preview_range(start_line: Option<i64>, end_line: Option<i64>)
 
 fn execute_readonly_command(
     workspace_root: &Path<'_>,
+    skills_manifest_file: Option<&StdPath>,
     input: &Map<String, Value>,
 ) -> Result<String, ToolFailure> {
     let request = resolve_readonly_request(input)?;
+    if let Some(skills_manifest_file) = skills_manifest_file
+        && is_virtual_skills_path(&request.path)
+    {
+        return execute_readonly_skill_command(&request, skills_manifest_file);
+    }
     let path = sanitize_editor_path(workspace_root, &request.path)?;
     if !path.exists() {
         return Err(ToolFailure::new(
@@ -807,6 +930,55 @@ fn execute_readonly_command(
     }
 
     let content = fs::read_to_string(path).map_err(map_filesystem_error)?;
+    render_readonly_file(&content, request.start_line, request.end_line)
+}
+
+fn is_virtual_skills_path(path: &str) -> bool {
+    path == "/skills" || path.starts_with("/skills/")
+}
+
+fn execute_readonly_skill_command(
+    request: &ResolvedReadOnlyRequest,
+    skills_manifest_file: &StdPath,
+) -> Result<String, ToolFailure> {
+    let entries = read_skill_mount_manifest(skills_manifest_file)?;
+    let path = request.path.trim_end_matches('/');
+    if path == "/skills" {
+        return Ok(entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n");
+    }
+    let Some(rest) = path.strip_prefix("/skills/") else {
+        return Err(ToolFailure::new(
+            "not_found",
+            format!("file not found: {}", request.path),
+        ));
+    };
+    if !rest.contains('/') {
+        let Some(_) = entries.iter().find(|entry| entry.id == rest) else {
+            return Err(ToolFailure::new(
+                "not_found",
+                format!("file not found: {}", request.path),
+            ));
+        };
+        return Ok("SKILL.md\n".to_string());
+    }
+    let Some(skill_id) = rest.strip_suffix("/SKILL.md") else {
+        return Err(ToolFailure::new(
+            "not_found",
+            format!("file not found: {}", request.path),
+        ));
+    };
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == skill_id)
+        .ok_or_else(|| {
+            ToolFailure::new("not_found", format!("file not found: {}", request.path))
+        })?;
+    let content = fs::read_to_string(&entry.content_path).map_err(map_filesystem_error)?;
     render_readonly_file(&content, request.start_line, request.end_line)
 }
 
@@ -968,6 +1140,59 @@ mod tests {
     }
 
     #[test]
+    fn editor_tool_views_skill_file_from_manifest() {
+        let root = unique_temp_dir("editor-tool");
+        let skill = unique_temp_dir("editor-tool-skill");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::create_dir_all(skill.as_str()).unwrap();
+        let skill_file = skill.join("SKILL.md");
+        fs::write(skill_file.as_str(), "# Rust Skill\n").unwrap();
+        let manifest_file = root.join("skills-manifest.json");
+        fs::write(
+            manifest_file.as_str(),
+            serde_json::to_vec_pretty(&json!([{
+                "id": "rust",
+                "virtual_path": "/skills/rust/SKILL.md",
+                "content_path": skill_file.as_str()
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let filesystem =
+            build_editor_filesystem(&root, Some(StdPath::new(manifest_file.as_str()))).unwrap();
+
+        let input = json!({
+            "command": "view",
+            "path": "/skills/rust/SKILL.md"
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let output = runtime
+            .block_on(execute_editor_command(
+                &filesystem,
+                input.as_object().expect("input must be an object"),
+            ))
+            .expect("editor command should succeed");
+        assert_eq!(output, "# Rust Skill\n\n");
+
+        let replace = json!({
+            "command": "str_replace",
+            "path": "/skills/rust/SKILL.md",
+            "old_str": "Rust",
+            "new_str": "Python"
+        });
+        let err = runtime
+            .block_on(execute_editor_command(
+                &filesystem,
+                replace.as_object().expect("input must be an object"),
+            ))
+            .unwrap_err();
+        assert_eq!(err.code, "permission_denied");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(skill.as_str()).unwrap();
+    }
+
+    #[test]
     fn editor_tool_previews_mutating_commands() {
         let root = unique_temp_dir("editor-tool");
         let temp_dir = StdPath::new(root.as_str());
@@ -1108,7 +1333,7 @@ mod tests {
         let input = json!({
             "path": "file.txt"
         });
-        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        let output = execute_readonly_command(&root, None, input.as_object().unwrap()).unwrap();
         assert_eq!(output, "1     \tline one\n2     \tline two\n");
 
         fs::remove_dir_all(root.as_str()).unwrap();
@@ -1125,7 +1350,7 @@ mod tests {
             "start_line": 2,
             "end_line": 3
         });
-        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        let output = execute_readonly_command(&root, None, input.as_object().unwrap()).unwrap();
         assert_eq!(output, "2     \ttwo\n3     \tthree\n");
 
         fs::remove_dir_all(root.as_str()).unwrap();
@@ -1142,10 +1367,47 @@ mod tests {
             "path": "file.txt",
             "view_range": [2, 4]
         });
-        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        let output = execute_readonly_command(&root, None, input.as_object().unwrap()).unwrap();
         assert_eq!(output, "2     \ttwo\n3     \tthree\n4     \tfour\n");
 
         fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_readonly_views_skill_file_from_manifest() {
+        let root = unique_temp_dir("editor-tool");
+        let skill = unique_temp_dir("editor-tool-skill");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::create_dir_all(skill.as_str()).unwrap();
+        let skill_file = skill.join("SKILL.md");
+        fs::write(skill_file.as_str(), "# Rust Skill\nUse rustfmt.\n").unwrap();
+        let manifest_file = root.join("skills-manifest.json");
+        fs::write(
+            manifest_file.as_str(),
+            serde_json::to_vec_pretty(&json!([{
+                "id": "rust",
+                "virtual_path": "/skills/rust/SKILL.md",
+                "content_path": skill_file.as_str()
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let input = json!({
+            "path": "/skills/rust/SKILL.md",
+            "start_line": 2,
+            "end_line": -1
+        });
+        let output = execute_readonly_command(
+            &root,
+            Some(StdPath::new(manifest_file.as_str())),
+            input.as_object().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output, "2     \tUse rustfmt.\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+        fs::remove_dir_all(skill.as_str()).unwrap();
     }
 
     #[test]
@@ -1158,7 +1420,7 @@ mod tests {
         let input = json!({
             "path": "dir"
         });
-        let output = execute_readonly_command(&root, input.as_object().unwrap()).unwrap();
+        let output = execute_readonly_command(&root, None, input.as_object().unwrap()).unwrap();
         assert_eq!(output, "a.txt\nb.txt\n");
 
         fs::remove_dir_all(root.as_str()).unwrap();
@@ -1172,8 +1434,8 @@ mod tests {
             "insert_line": 1,
             "insert_text": "hello"
         });
-        let err =
-            execute_readonly_command(&Path::new("."), input.as_object().unwrap()).unwrap_err();
+        let err = execute_readonly_command(&Path::new("."), None, input.as_object().unwrap())
+            .unwrap_err();
         assert_eq!(
             err,
             ToolFailure::new(

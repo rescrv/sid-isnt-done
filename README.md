@@ -465,7 +465,10 @@ build_SKILLS="*"
 A skill should be self-contained markdown that tells the model when to use it
 and what procedure to follow.  Keep skill ids stable and filesystem-friendly;
 the document is mounted for the model at `/skills/<skill>/SKILL.md`.  Bash and
-external tools do not see this virtual `/skills` mount.
+arbitrary external tools do not see this virtual `/skills` mount.  The bundled
+`edit` and `read` bridges receive a per-invocation manifest so
+`sid-editor-tool` can mount exposed skills read-only without copying their
+contents.
 
 The bundled `skill-inject` user-instructions hook delegates to
 `sid-skill-inject`.  Enable it with `<agent>_USER_INSTRUCTIONS_HOOK` and mention
@@ -538,7 +541,9 @@ format_ALIASES="fmt"
   script execs `sid-editor-tool`.  The helper process is not chrooted, but the
   editor protocol resolves file paths under `WORKSPACE_ROOT`; `/etc/passwd` in
   an editor request means `$WORKSPACE_ROOT/etc/passwd`, not host `/etc/passwd`.
-  `tools/edit` must exist and be executable when `edit` is configured.  A
+  `tools/edit` must exist and be executable when `edit` is configured.  The
+  helper can view exposed skill documents through `/skills/<skill>/SKILL.md`
+  using sid's per-invocation skill manifest; skill mounts remain read-only.  A
   `tools/edit.json` manifest is optional because the model-visible schema comes
   from the built-in Anthropic text-editor tool definition.
 
@@ -821,6 +826,11 @@ Protocol rules:
 : Per-turn user-instructions hook rcvar containing the scratch directory that
   holds skill content files referenced by `<hook>_SKILLS_MANIFEST_FILE`.
 
+`<tool>_SKILLS_MANIFEST_FILE`
+: Per-tool invocation rcvar containing a JSON manifest of exposed skill
+  mappings.  Each entry has `id`, `virtual_path`, and `content_path`; sid-owned
+  helpers use it to mount `/skills/<skill>/SKILL.md` read-only.
+
 `AGENTS_MD_PATH`
 : Colon-separated list of AGENTS.md files to inject when
   `<agent>_AGENTS_MD_PATH` is unset.  Relative paths are resolved under the
@@ -1090,7 +1100,9 @@ writes a sid tool result to `RESULT_FILE`.  With `--readonly`, the helper
 serves the `read` tool: it previews read requests, formats file contents with
 line numbers, lists directories, and rejects mutating editor commands.  The
 helper process is not chrooted, but editor paths are workspace-rooted by the
-protocol implementation.
+protocol implementation.  When `SKILLS_MANIFEST_FILE` is set, or when
+`SCRATCH_DIR/skills-manifest.json` exists, the helper also resolves exposed
+skill directories read-only at their `/skills/<skill>/` virtual paths.
 
 The starter `init/tools/edit` and `init/tools/read` scripts are the normal
 entrypoints.  They receive prefixed rc-conf variables from `sid`, export the

@@ -892,6 +892,7 @@ impl SidAgent {
             workspace_root: &self.workspace_root,
             writable_roots: &self.writable_roots,
             session: self.session.as_deref(),
+            skills: &self.skills,
         }
     }
 
@@ -2730,6 +2731,7 @@ async fn invoke_external_tool(
         workspace_root: &agent.workspace_root,
         writable_roots: &agent.writable_roots,
         session: agent.session.as_deref(),
+        skills: &agent.skills,
     };
     match tool_runtime::invoke_rc_tool_text(
         &tool.name,
@@ -5959,6 +5961,49 @@ esac
     }
 
     #[test]
+    fn tool_invocation_exposes_skill_manifest_paths_without_copying_content() {
+        let root = temp_config_root("agent");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::create_dir_all(root.join("skills/rust").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_TOOLS='format'\nbuild_SKILLS='rust'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "format_ENABLED=YES\n").unwrap();
+        fs::write(root.join("agents/build.md").as_str(), "# Build\n").unwrap();
+        let skill_file = root.join("skills/rust/SKILL.md");
+        fs::write(skill_file.as_str(), "# Rust Skill\n\nWrite safe Rust.\n").unwrap();
+        write_tool_contract(
+            &root,
+            "format",
+            "Format files in the workspace.",
+            &skill_manifest_capture_tool_script("manifest captured"),
+        );
+
+        let result = invoke_configured_tool(&root, "format", json!({}));
+        assert_eq!(unwrap_success_text(result), "manifest captured");
+
+        let manifest_text =
+            fs::read_to_string(root.join("skills-manifest-capture.json").as_str()).unwrap();
+        assert!(
+            !manifest_text.contains("Write safe Rust."),
+            "manifest should point at skill files without embedding skill content"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest,
+            json!([{
+                "id": "rust",
+                "virtual_path": "/skills/rust/SKILL.md",
+                "content_path": skill_file.as_str()
+            }])
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
     fn tool_invocation_uses_ordered_session_tmp_and_journals() {
         let root = temp_config_root("agent");
         write_sample_config_with_fmt_script(
@@ -6567,6 +6612,12 @@ format_ALIASES="fmt"
         )
     }
 
+    fn skill_manifest_capture_tool_script(text: &str) -> String {
+        format!(
+            "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\ncp \"$SKILLS_MANIFEST_FILE\" \"$WORKSPACE_ROOT/skills-manifest-capture.json\"\ncat >\"$RESULT_FILE\" <<EOF\n{{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{{\"kind\":\"text\",\"text\":\"{text}\"}}}}\nEOF\n"
+        )
+    }
+
     fn capturing_tool_script(text: &str, request_capture: &str, env_capture: &str) -> String {
         format!(
             "#!/bin/sh\nREQUEST_ID=$(sed -n 's/.*\"request_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$REQUEST_FILE\")\ncp \"$REQUEST_FILE\" \"$WORKSPACE_ROOT/{request_capture}\"\ncat >\"$WORKSPACE_ROOT/{env_capture}\" <<EOF\n{{\"protocol\":\"$TOOL_PROTOCOL\",\"request_file\":\"$REQUEST_FILE\",\"result_file\":\"$RESULT_FILE\",\"scratch_dir\":\"$SCRATCH_DIR\",\"temp_dir\":\"$TEMP_DIR\",\"tmpdir\":\"$TMPDIR\",\"workspace_root\":\"$WORKSPACE_ROOT\",\"agent_id\":\"$AGENT_ID\",\"session_id\":\"$SESSION_ID\",\"session_dir\":\"$SESSION_DIR\",\"tool_id\":\"$TOOL_ID\",\"tool_name\":\"$TOOL_NAME\",\"rc_conf_path\":\"$RC_CONF_PATH\",\"rc_d_path\":\"$RC_D_PATH\"}}\nEOF\ncat >\"$RESULT_FILE\" <<EOF\n{{\"protocol_version\":1,\"request_id\":\"$REQUEST_ID\",\"ok\":true,\"output\":{{\"kind\":\"text\",\"text\":\"{text}\"}}}}\nEOF\n"
@@ -6645,7 +6696,7 @@ format_ALIASES="fmt"
         fs::write(
             executable.as_str(),
             format!(
-                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_TEMP_DIR\" \\\n        \"${{PREFIX}}_TMPDIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_SESSION_ID\" \\\n        \"${{PREFIX}}_SESSION_DIR\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nconfirm|run)\n    export TOOL_MODE=\"$1\"\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export TEMP_DIR=\"$(lookup \"${{PREFIX}}_TEMP_DIR\")\"\n    export TMPDIR=\"$(lookup \"${{PREFIX}}_TMPDIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export SESSION_ID=\"$(lookup \"${{PREFIX}}_SESSION_ID\")\"\n    export SESSION_DIR=\"$(lookup \"${{PREFIX}}_SESSION_DIR\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|confirm|run]\" >&2\n    exit 129\n    ;;\nesac\n",
+                "#!/bin/sh\nset -eu\n\nlookup() {{\n    printenv \"$1\"\n}}\n\nPREFIX=${{RCVAR_ARGV0:?missing RCVAR_ARGV0}}\n\ncase \"${{1:-}}\" in\nrcvar)\n    printf '%s\\n' \\\n        \"${{PREFIX}}_REQUEST_FILE\" \\\n        \"${{PREFIX}}_RESULT_FILE\" \\\n        \"${{PREFIX}}_SCRATCH_DIR\" \\\n        \"${{PREFIX}}_TEMP_DIR\" \\\n        \"${{PREFIX}}_TMPDIR\" \\\n        \"${{PREFIX}}_WORKSPACE_ROOT\" \\\n        \"${{PREFIX}}_SKILLS_MANIFEST_FILE\" \\\n        \"${{PREFIX}}_SESSION_ID\" \\\n        \"${{PREFIX}}_SESSION_DIR\" \\\n        \"${{PREFIX}}_AGENT_ID\" \\\n        \"${{PREFIX}}_TOOL_ID\" \\\n        \"${{PREFIX}}_TOOL_NAME\" \\\n        \"${{PREFIX}}_TOOL_PROTOCOL\" \\\n        \"${{PREFIX}}_RC_CONF_PATH\" \\\n        \"${{PREFIX}}_RC_D_PATH\"\n    ;;\nconfirm|run)\n    export TOOL_MODE=\"$1\"\n    shift\n    export REQUEST_FILE=\"$(lookup \"${{PREFIX}}_REQUEST_FILE\")\"\n    export RESULT_FILE=\"$(lookup \"${{PREFIX}}_RESULT_FILE\")\"\n    export SCRATCH_DIR=\"$(lookup \"${{PREFIX}}_SCRATCH_DIR\")\"\n    export TEMP_DIR=\"$(lookup \"${{PREFIX}}_TEMP_DIR\")\"\n    export TMPDIR=\"$(lookup \"${{PREFIX}}_TMPDIR\")\"\n    export WORKSPACE_ROOT=\"$(lookup \"${{PREFIX}}_WORKSPACE_ROOT\")\"\n    export SKILLS_MANIFEST_FILE=\"$(lookup \"${{PREFIX}}_SKILLS_MANIFEST_FILE\")\"\n    export SESSION_ID=\"$(lookup \"${{PREFIX}}_SESSION_ID\")\"\n    export SESSION_DIR=\"$(lookup \"${{PREFIX}}_SESSION_DIR\")\"\n    export AGENT_ID=\"$(lookup \"${{PREFIX}}_AGENT_ID\")\"\n    export TOOL_ID=\"$(lookup \"${{PREFIX}}_TOOL_ID\")\"\n    export TOOL_NAME=\"$(lookup \"${{PREFIX}}_TOOL_NAME\")\"\n    export TOOL_PROTOCOL=\"$(lookup \"${{PREFIX}}_TOOL_PROTOCOL\")\"\n    export RC_CONF_PATH=\"$(lookup \"${{PREFIX}}_RC_CONF_PATH\")\"\n    export RC_D_PATH=\"$(lookup \"${{PREFIX}}_RC_D_PATH\")\"\n    exec {} \"$@\"\n    ;;\n*)\n    echo \"usage: $0 [rcvar|confirm|run]\" >&2\n    exit 129\n    ;;\nesac\n",
                 shvar::quote_string(implementation.as_str())
             ),
         )

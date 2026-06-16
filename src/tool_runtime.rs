@@ -19,7 +19,7 @@ use rc_conf::{RcConf, var_name_from_service, var_prefix_from_service};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use utf8path::Path;
 
-use crate::config::{TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
+use crate::config::{SkillConfig, TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_DIR};
 use crate::raw_protocol::{
     ToolOutputEvent, has_active_tool_output_observer, notify_tool_output_observer,
 };
@@ -50,6 +50,8 @@ pub(crate) struct ToolRuntimeContext<'a> {
     pub(crate) writable_roots: &'a WritableRoots,
     /// Session artifact root for logs and ordered tool directories.
     pub(crate) session: Option<&'a SidSession>,
+    /// Skill documents mounted for the agent.
+    pub(crate) skills: &'a [SkillConfig],
 }
 
 #[derive(Debug)]
@@ -77,6 +79,7 @@ pub(crate) struct PreparedRcToolInvocation {
     session_id: Option<String>,
     session_dir: Option<PathBuf>,
     sessions_root: Option<PathBuf>,
+    skill_read_roots: Vec<String>,
     runtime: ToolRcRuntime,
     /// Maximum execution time, or `None` for no timeout.
     timeout: Option<Duration>,
@@ -87,8 +90,16 @@ struct ToolOverlayContext<'a> {
     result_file: &'a StdPath,
     scratch_dir: &'a StdPath,
     temp_dir: &'a StdPath,
+    skills_manifest_file: &'a StdPath,
     rc_conf_path: &'a str,
     rc_d_path: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct ToolSkillManifestEntry<'a> {
+    id: &'a str,
+    virtual_path: String,
+    content_path: &'a str,
 }
 
 /// Invoke an rc-conf-based tool and return its text output.
@@ -138,6 +149,8 @@ pub(crate) fn prepare_rc_tool_invocation(
     let temp_dir = invocation_dirs.temp_dir;
     let request_file = scratch_dir.join("request.json");
     let result_file = scratch_dir.join("result.json");
+    let skills_manifest_file = write_tool_skills_manifest(context, &scratch_dir)
+        .map_err(|err| format!("tool '{display_name}' failed to write skills manifest: {err}"))?;
 
     let request = ToolRequestEnvelope {
         protocol_version: TOOL_PROTOCOL_VERSION,
@@ -175,6 +188,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         &result_file,
         &scratch_dir,
         &temp_dir,
+        &skills_manifest_file,
     )
     .map_err(|err| format!("tool '{display_name}' failed to prepare rc invocation: {err}"))?;
 
@@ -197,9 +211,65 @@ pub(crate) fn prepare_rc_tool_invocation(
         sessions_root: context
             .session
             .map(|session| session.sessions_root().clone()),
+        skill_read_roots: skill_read_roots(context.skills),
         runtime,
         timeout,
     })
+}
+
+fn write_tool_skills_manifest(
+    context: &ToolRuntimeContext<'_>,
+    scratch_dir: &StdPath,
+) -> Result<PathBuf, SError> {
+    let path = scratch_dir.join("skills-manifest.json");
+    let entries = context
+        .skills
+        .iter()
+        .map(|skill| ToolSkillManifestEntry {
+            id: &skill.id,
+            virtual_path: format!("/skills/{}/SKILL.md", skill.id),
+            content_path: skill.path.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec_pretty(&entries).map_err(|err| {
+        tool_runtime_error(
+            "skills",
+            "serialization_error",
+            "failed to serialize skills manifest",
+        )
+        .with_string_field("path", path.to_string_lossy().as_ref())
+        .with_string_field("cause", &err.to_string())
+    })?;
+    fs::write(&path, payload).map_err(|err| {
+        tool_runtime_error("skills", "io_error", "failed to write skills manifest")
+            .with_string_field("path", path.to_string_lossy().as_ref())
+            .with_string_field("cause", &err.to_string())
+    })?;
+    Ok(path)
+}
+
+fn skill_read_roots(skills: &[SkillConfig]) -> Vec<String> {
+    let mut roots = Vec::new();
+    for skill in skills {
+        let skill_path = StdPath::new(skill.path.as_str());
+        append_parent_path(&mut roots, skill_path);
+        if let Ok(canonical) = fs::canonicalize(skill_path) {
+            append_parent_path(&mut roots, &canonical);
+        }
+    }
+    roots
+}
+
+fn append_parent_path(roots: &mut Vec<String>, path: &StdPath) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(parent) = parent.to_str() else {
+        return;
+    };
+    if !roots.iter().any(|root| root == parent) {
+        roots.push(parent.to_string());
+    }
 }
 
 fn create_tool_invocation_dirs(
@@ -903,6 +973,7 @@ fn prepared_rc_tool_command(
     if let Some(session_dir) = prepared.session_dir.as_ref() {
         read_roots.push(session_dir.to_string_lossy().into_owned());
     }
+    read_roots.extend(prepared.skill_read_roots.iter().cloned());
     let mut cmd = seatbelt::sandboxed_command_with_read_roots(
         prepared.executable_path.as_str(),
         &[subcommand],
@@ -954,6 +1025,7 @@ fn prepare_tool_rc_runtime(
     result_file: &StdPath,
     scratch_dir: &StdPath,
     temp_dir: &StdPath,
+    skills_manifest_file: &StdPath,
 ) -> Result<ToolRcRuntime, SError> {
     let tools_conf_path = context.config_root.join(TOOLS_CONF_FILE);
     let rc_d_path = context.config_root.join(TOOLS_DIR);
@@ -980,6 +1052,7 @@ fn prepare_tool_rc_runtime(
         result_file,
         scratch_dir,
         temp_dir,
+        skills_manifest_file,
         rc_conf_path: &rc_conf_path,
         rc_d_path: &rc_d_path,
     };
@@ -1027,6 +1100,10 @@ fn render_tool_rc_overlay(
     let result_file = overlay_context.result_file.to_string_lossy().into_owned();
     let scratch_dir = overlay_context.scratch_dir.to_string_lossy().into_owned();
     let temp_dir = overlay_context.temp_dir.to_string_lossy().into_owned();
+    let skills_manifest_file = overlay_context
+        .skills_manifest_file
+        .to_string_lossy()
+        .into_owned();
     let workspace_root = context.workspace_root.as_str().to_string();
     let tool_protocol = TOOL_PROTOCOL_VERSION.to_string();
     let session_id = context.session.map(SidSession::id);
@@ -1050,6 +1127,11 @@ fn render_tool_rc_overlay(
             &mut overlay,
             &format!("{prefix}WORKSPACE_ROOT"),
             &workspace_root,
+        );
+        append_rc_conf_assignment(
+            &mut overlay,
+            &format!("{prefix}SKILLS_MANIFEST_FILE"),
+            &skills_manifest_file,
         );
         if let Some(session_id) = session_id {
             append_rc_conf_assignment(&mut overlay, &format!("{prefix}SESSION_ID"), session_id);
