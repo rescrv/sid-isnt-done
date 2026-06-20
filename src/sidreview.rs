@@ -480,15 +480,85 @@ impl ReviewApp {
     }
 
     fn status_text(&self) -> String {
-        match self.selected {
-            Some(selected) => format!(
-                "{}/{}  {}  j/k scroll  J/K folds  f fold  G end  q quit",
-                selected + 1,
-                self.blocks.len(),
-                self.blocks[selected].title
+        let progress = self.view_progress();
+        let progress_text = format!(
+            "current-chunk {}  current-file {}  current-review {}",
+            progress.chunk.render(),
+            progress.file.render(),
+            progress.review.render()
+        );
+        match progress.block_index {
+            Some(block_index) => format!(
+                "{progress_text}  {}  j/k scroll  J/K folds  f fold  G end  q quit",
+                self.blocks[block_index].title
             ),
-            None => "0/0  no diff chunks  q quit".to_string(),
+            None => format!("{progress_text}  no diff chunks  q quit"),
         }
+    }
+
+    fn view_progress(&self) -> ViewProgress {
+        let total_rows = self.visible_height();
+        if total_rows == 0 {
+            return ViewProgress::empty();
+        }
+
+        let current_row = self.scroll_top.min(total_rows - 1);
+        let review = Progress::new(current_row + 1, total_rows);
+        let Some((block_index, block_start, block)) = self.block_at_visible_row(current_row) else {
+            return ViewProgress {
+                review,
+                ..ViewProgress::empty()
+            };
+        };
+        let chunk = Progress::new(current_row - block_start + 1, block.height());
+        let file = self.file_progress(block.file_index, current_row);
+        ViewProgress {
+            block_index: Some(block_index),
+            chunk,
+            file,
+            review,
+        }
+    }
+
+    fn visible_height(&self) -> usize {
+        self.blocks.iter().map(ReviewBlock::height).sum()
+    }
+
+    fn block_at_visible_row(&self, row: usize) -> Option<(usize, usize, &ReviewBlock)> {
+        let mut block_start = 0usize;
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_height = block.height();
+            let block_end = block_start + block_height;
+            if row < block_end {
+                return Some((block_index, block_start, block));
+            }
+            block_start = block_end;
+        }
+        None
+    }
+
+    fn file_progress(&self, file_index: Option<usize>, current_row: usize) -> Progress {
+        let Some(file_index) = file_index else {
+            return Progress::empty();
+        };
+
+        let mut block_start = 0usize;
+        let mut file_total = 0usize;
+        let mut file_current = None;
+        for block in &self.blocks {
+            let block_height = block.height();
+            if block.file_index == Some(file_index) {
+                if (block_start..block_start + block_height).contains(&current_row) {
+                    file_current = Some(file_total + current_row - block_start + 1);
+                }
+                file_total += block_height;
+            }
+            block_start += block_height;
+        }
+
+        file_current
+            .map(|current| Progress::new(current, file_total))
+            .unwrap_or_else(Progress::empty)
     }
 
     #[cfg(test)]
@@ -499,6 +569,62 @@ impl ReviewApp {
             .take(self.viewport_height)
             .map(|row| row.text)
             .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ViewProgress {
+    block_index: Option<usize>,
+    chunk: Progress,
+    file: Progress,
+    review: Progress,
+}
+
+impl ViewProgress {
+    fn empty() -> Self {
+        Self {
+            block_index: None,
+            chunk: Progress::empty(),
+            file: Progress::empty(),
+            review: Progress::empty(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Progress {
+    current: usize,
+    total: usize,
+}
+
+impl Progress {
+    fn empty() -> Self {
+        Self {
+            current: 0,
+            total: 0,
+        }
+    }
+
+    fn new(current: usize, total: usize) -> Self {
+        if total == 0 {
+            return Self::empty();
+        }
+        Self {
+            current: current.clamp(1, total),
+            total,
+        }
+    }
+
+    fn percent(self) -> usize {
+        if self.total == 0 {
+            0
+        } else {
+            self.current.saturating_mul(100) / self.total
+        }
+    }
+
+    fn render(self) -> String {
+        format!("{}/{} {}%", self.current, self.total, self.percent())
     }
 }
 
@@ -610,6 +736,7 @@ struct ReviewBlock {
     title: String,
     lines: Vec<ReviewLine>,
     folded: bool,
+    file_index: Option<usize>,
 }
 
 impl ReviewBlock {
@@ -618,6 +745,16 @@ impl ReviewBlock {
             title,
             lines,
             folded: false,
+            file_index: None,
+        }
+    }
+
+    fn for_file(file_index: usize, title: String, lines: Vec<ReviewLine>) -> Self {
+        Self {
+            title,
+            lines,
+            folded: false,
+            file_index: Some(file_index),
         }
     }
 
@@ -756,7 +893,8 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
             let mut lines = Vec::new();
             lines.extend(file.header.iter().map(ReviewLine::header));
             lines.extend(rendered.lines().map(ReviewLine::bat));
-            blocks.push(ReviewBlock::new(
+            blocks.push(ReviewBlock::for_file(
+                file_idx,
                 format!("file {}", display_path(file)),
                 lines,
             ));
@@ -764,7 +902,8 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
         }
 
         if file.hunks.is_empty() {
-            blocks.push(ReviewBlock::new(
+            blocks.push(ReviewBlock::for_file(
+                file_idx,
                 format!("file {}", display_path(file)),
                 file.header.iter().map(ReviewLine::header).collect(),
             ));
@@ -787,7 +926,8 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
                 };
                 ReviewLine::from_diff_line_with_content(line, content, muted_moved_addition)
             }));
-            blocks.push(ReviewBlock::new(
+            blocks.push(ReviewBlock::for_file(
+                file_idx,
                 format!("{} {}", display_path(file), hunk.header),
                 lines,
             ));
@@ -898,6 +1038,21 @@ index 0000000..1111111
 +fn main() {
 +    println!(\"hello\");
 +}
+";
+
+    const TWO_FILES: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,1 +1,1 @@
+-old_a
++new_a
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1,1 +1,1 @@
+-old_b
++new_b
 ";
 
     const MOVED_BLOCKS: &str = "\
@@ -1101,6 +1256,7 @@ diff --git a/query.rs b/query.rs
                         },
                     ],
                     folded: false,
+                    file_index: Some(0),
                 },
                 ReviewBlock {
                     title: "a.rs @@ -10,2 +10,2 @@".to_string(),
@@ -1135,8 +1291,45 @@ diff --git a/query.rs b/query.rs
                         },
                     ],
                     folded: false,
+                    file_index: Some(0),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn status_line_reports_chunk_file_and_review_progress() {
+        let app = ReviewApp::from_input(TWO_HUNKS);
+
+        assert_eq!(
+            app.status_text(),
+            "current-chunk 1/8 12%  current-file 1/13 7%  current-review 1/13 7%  a.rs @@ -1,2 +1,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+        );
+    }
+
+    #[test]
+    fn status_progress_tracks_top_visible_row_when_line_scrolling() {
+        let mut app = ReviewApp::from_input(TWO_HUNKS);
+        app.set_viewport_height(4);
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Char('j'));
+        }
+
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.status_text(),
+            "current-chunk 1/5 20%  current-file 9/13 69%  current-review 9/13 69%  a.rs @@ -10,2 +10,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+        );
+    }
+
+    #[test]
+    fn status_file_progress_resets_per_file() {
+        let mut app = ReviewApp::from_input(TWO_FILES);
+        app.select_next();
+
+        assert_eq!(
+            app.status_text(),
+            "current-chunk 1/7 14%  current-file 1/7 14%  current-review 8/14 57%  b.rs @@ -1,1 +1,1 @@  j/k scroll  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1467,5 +1660,9 @@ diff --git a/query.rs b/query.rs
             }
         );
         assert_eq!(render_plain(""), "no diff chunks\n".to_string());
+        assert_eq!(
+            ReviewApp::from_input("").status_text(),
+            "current-chunk 0/0 0%  current-file 0/0 0%  current-review 0/0 0%  no diff chunks  q quit"
+        );
     }
 }
