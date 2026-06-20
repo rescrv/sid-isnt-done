@@ -297,6 +297,7 @@ pub(crate) struct BatLineColorMap {
 }
 
 impl BatLineColorMap {
+    #[cfg(test)]
     pub(crate) fn get(&self, file: usize, hunk: usize, line: usize) -> Option<&str> {
         self.lines
             .get(&LineId { file, hunk, line })
@@ -1422,10 +1423,25 @@ fn run_similarity(remove: &[String], add: &[String]) -> f32 {
     common as f32 / min(remove.len(), add.len()) as f32
 }
 
-pub(crate) fn build_review_line_metadata(
-    diff: &Diff,
-    use_color: bool,
-) -> (BatLineColorMap, BTreeSet<(usize, usize, usize)>) {
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReviewLineMetadata {
+    styled_lines: HashMap<LineId, String>,
+    muted_moved_additions: BTreeSet<(usize, usize, usize)>,
+}
+
+impl ReviewLineMetadata {
+    pub(crate) fn get(&self, file: usize, hunk: usize, line: usize) -> Option<&str> {
+        self.styled_lines
+            .get(&LineId { file, hunk, line })
+            .map(String::as_str)
+    }
+
+    pub(crate) fn is_muted_moved_addition(&self, file: usize, hunk: usize, line: usize) -> bool {
+        self.muted_moved_additions.contains(&(file, hunk, line))
+    }
+}
+
+pub(crate) fn build_review_line_metadata(diff: &Diff, use_color: bool) -> ReviewLineMetadata {
     let analysis = analyze_diff(diff);
     let mut bat_lines = build_bat_line_color_map_with_analysis(diff, &analysis, use_color);
     add_semantic_changed_lines_to_review_map(diff, &analysis, &mut bat_lines, use_color);
@@ -1443,7 +1459,55 @@ pub(crate) fn build_review_line_metadata(
             should_mute_moved_addition(line.op, Some(meta)).then_some((id.file, id.hunk, id.line))
         })
         .collect();
-    (bat_lines, muted_moved_additions)
+    let mut styled_lines = HashMap::new();
+    if use_color {
+        for (file_idx, file) in diff.files.iter().enumerate() {
+            if file_is_pure_addition(file) {
+                continue;
+            }
+            for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                for (line_idx, line) in hunk.lines.iter().enumerate() {
+                    let id = LineId {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                        line: line_idx,
+                    };
+                    let meta = analysis.lines.get(&id);
+                    if matches!(line.op, DiffOp::Add | DiffOp::Remove)
+                        && meta.is_some_and(|meta| meta.paired_with.is_some())
+                    {
+                        let syntax = analysis.syntax.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+                        let roles = meta
+                            .and_then(|meta| meta.role_chunk)
+                            .and_then(|chunk_id| {
+                                analysis.chunk_roles.get(&chunk_id).map(Vec::as_slice)
+                            })
+                            .unwrap_or(&[]);
+                        styled_lines.insert(
+                            id,
+                            render_content(
+                                &line.content,
+                                line.op,
+                                meta,
+                                syntax,
+                                roles,
+                                SidiffOptions {
+                                    use_color,
+                                    ..SidiffOptions::default()
+                                },
+                            ),
+                        );
+                    } else if let Some(colored) = bat_lines.get_id(id) {
+                        styled_lines.insert(id, colored.to_string());
+                    }
+                }
+            }
+        }
+    }
+    ReviewLineMetadata {
+        styled_lines,
+        muted_moved_additions,
+    }
 }
 
 fn add_semantic_changed_lines_to_review_map(

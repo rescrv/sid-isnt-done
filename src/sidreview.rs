@@ -922,7 +922,7 @@ fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
 }
 
 fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
-    let (bat_lines, muted_moved_additions) = build_review_line_metadata(diff, use_color);
+    let metadata = build_review_line_metadata(diff, use_color);
     let mut blocks = Vec::new();
     if !diff.preamble.is_empty() {
         blocks.push(ReviewBlock::new(
@@ -963,11 +963,11 @@ fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
             lines.push(ReviewLine::header(&hunk.header));
             lines.extend(hunk.lines.iter().enumerate().map(|(line_idx, line)| {
                 let muted_moved_addition =
-                    muted_moved_additions.contains(&(file_idx, hunk_idx, line_idx));
+                    metadata.is_muted_moved_addition(file_idx, hunk_idx, line_idx);
                 let content = if muted_moved_addition {
                     None
                 } else {
-                    bat_lines.get(file_idx, hunk_idx, line_idx)
+                    metadata.get(file_idx, hunk_idx, line_idx)
                 };
                 ReviewLine::from_diff_line_with_content(line, content, muted_moved_addition)
             }));
@@ -1187,6 +1187,37 @@ diff --git a/query.rs b/query.rs
                 || span.content.contains("Result"))
                 || span.style.fg != bright_add
         }));
+    }
+
+    #[test]
+    fn review_changed_lines_highlight_only_changed_words() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,1 @@
+-alpha old beta
++alpha new beta
+";
+        let blocks = build_blocks_with_color(&parse_unified_diff(input), true);
+        let removed = blocks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == ReviewRowKind::Remove)
+            .unwrap();
+        let added = blocks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == ReviewRowKind::Add)
+            .unwrap();
+
+        assert!(removed.content.contains("\x1b[38;2;165;95;100malpha"));
+        assert!(removed.content.contains("\x1b[38;2;255;105;115mold"));
+        assert!(!removed.content.contains("\x1b[38;2;255;105;115malpha"));
+
+        assert!(added.content.contains("\x1b[38;2;100;155;120malpha"));
+        assert!(added.content.contains("\x1b[38;2;80;235;150mnew"));
+        assert!(!added.content.contains("\x1b[38;2;80;235;150malpha"));
     }
 
     #[test]
