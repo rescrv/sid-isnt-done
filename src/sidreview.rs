@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 
@@ -79,14 +79,16 @@ fn run_app(
 fn render_review(frame: &mut Frame, app: &mut ReviewApp) {
     let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    app.set_viewport_height(body_area.height as usize);
+    app.set_viewport(body_area.width as usize, body_area.height as usize);
 
     let rows = app
         .rows()
         .into_iter()
         .map(|row| render_row_line(row, app.selected))
         .collect::<Vec<_>>();
-    let body = Paragraph::new(rows).scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
+    let body = Paragraph::new(rows)
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(body, body_area);
 
     let footer = Paragraph::new(app.status_text()).style(
@@ -268,9 +270,12 @@ struct ReviewApp {
     blocks: Vec<ReviewBlock>,
     selected: Option<usize>,
     scroll_top: usize,
+    viewport_width: usize,
     viewport_height: usize,
     should_quit: bool,
 }
+
+const DEFAULT_VIEWPORT_WIDTH: usize = u16::MAX as usize;
 
 impl ReviewApp {
     #[cfg(test)]
@@ -291,6 +296,7 @@ impl ReviewApp {
             blocks,
             selected,
             scroll_top: 0,
+            viewport_width: DEFAULT_VIEWPORT_WIDTH,
             viewport_height: 1,
             should_quit: false,
         }
@@ -331,6 +337,13 @@ impl ReviewApp {
         }
     }
 
+    fn set_viewport(&mut self, width: usize, height: usize) {
+        self.viewport_width = width.max(1);
+        self.viewport_height = height.max(1);
+        self.clamp_scroll();
+    }
+
+    #[cfg(test)]
     fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
         self.clamp_scroll();
@@ -434,14 +447,14 @@ impl ReviewApp {
     }
 
     fn max_scroll(&self) -> usize {
-        self.rows().len().saturating_sub(self.viewport_height)
+        self.visible_height().saturating_sub(self.viewport_height)
     }
 
     fn block_start(&self, target: usize) -> usize {
-        self.blocks
+        self.rows()
             .iter()
-            .take(target)
-            .map(ReviewBlock::height)
+            .take_while(|row| row.block.map(|block| block < target).unwrap_or(false))
+            .map(|row| self.row_height(row))
             .sum()
     }
 
@@ -510,7 +523,10 @@ impl ReviewApp {
                 ..ViewProgress::empty()
             };
         };
-        let chunk = Progress::new(current_row - block_start + 1, block.height());
+        let chunk = Progress::new(
+            current_row - block_start + 1,
+            self.block_height(block_index),
+        );
         let file = self.file_progress(block.file_index, current_row);
         ViewProgress {
             block_index: Some(block_index),
@@ -521,18 +537,30 @@ impl ReviewApp {
     }
 
     fn visible_height(&self) -> usize {
-        self.blocks.iter().map(ReviewBlock::height).sum()
+        if self.blocks.is_empty() {
+            return 0;
+        }
+        self.rows().iter().map(|row| self.row_height(row)).sum()
     }
 
     fn block_at_visible_row(&self, row: usize) -> Option<(usize, usize, &ReviewBlock)> {
+        let mut row_start = 0usize;
         let mut block_start = 0usize;
-        for (block_index, block) in self.blocks.iter().enumerate() {
-            let block_height = block.height();
-            let block_end = block_start + block_height;
-            if row < block_end {
-                return Some((block_index, block_start, block));
+        let mut current_block = None;
+        for review_row in self.rows() {
+            let Some(block_index) = review_row.block else {
+                continue;
+            };
+            if current_block != Some(block_index) {
+                current_block = Some(block_index);
+                block_start = row_start;
             }
-            block_start = block_end;
+            let row_height = self.row_height(&review_row);
+            let row_end = row_start + row_height;
+            if row < row_end {
+                return Some((block_index, block_start, &self.blocks[block_index]));
+            }
+            row_start = row_end;
         }
         None
     }
@@ -545,8 +573,8 @@ impl ReviewApp {
         let mut block_start = 0usize;
         let mut file_total = 0usize;
         let mut file_current = None;
-        for block in &self.blocks {
-            let block_height = block.height();
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_height = self.block_height(block_index);
             if block.file_index == Some(file_index) {
                 if (block_start..block_start + block_height).contains(&current_row) {
                     file_current = Some(file_total + current_row - block_start + 1);
@@ -559,6 +587,22 @@ impl ReviewApp {
         file_current
             .map(|current| Progress::new(current, file_total))
             .unwrap_or_else(Progress::empty)
+    }
+
+    fn block_height(&self, block_index: usize) -> usize {
+        self.rows()
+            .iter()
+            .filter(|row| row.block == Some(block_index))
+            .map(|row| self.row_height(row))
+            .sum()
+    }
+
+    fn row_height(&self, row: &ReviewRow) -> usize {
+        let line = render_row_line(row.clone(), None);
+        Paragraph::new(line)
+            .wrap(Wrap { trim: false })
+            .line_count(self.viewport_width.min(u16::MAX as usize) as u16)
+            .max(1)
     }
 
     #[cfg(test)]
@@ -758,6 +802,7 @@ impl ReviewBlock {
         }
     }
 
+    #[cfg(test)]
     fn height(&self) -> usize {
         1 + if self.folded { 0 } else { self.lines.len() }
     }
@@ -1344,6 +1389,7 @@ diff --git a/query.rs b/query.rs
                 blocks: build_blocks(&parse_unified_diff(THREE_HUNKS)),
                 selected: Some(1),
                 scroll_top: 8,
+                viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 4,
                 should_quit: false,
             }
@@ -1381,6 +1427,7 @@ diff --git a/query.rs b/query.rs
                 blocks: build_blocks(&parse_unified_diff(THREE_HUNKS)),
                 selected: Some(2),
                 scroll_top: 20,
+                viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 4,
                 should_quit: false,
             }
@@ -1431,6 +1478,36 @@ diff --git a/query.rs b/query.rs
         assert_eq!(app.handle_key(KeyCode::Char('K')), ReviewAction::None);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_top, 0);
+    }
+
+    #[test]
+    fn wrapped_rows_count_for_scroll_and_chunk_navigation() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,1 @@
+-old_one
++alpha beta gamma delta epsilon zeta eta theta iota kappa
+@@ -10,1 +10,1 @@
+-old_two
++new_two
+";
+        let mut app = ReviewApp::from_input(input);
+        app.set_viewport(24, 4);
+
+        let wrapped_first_height = app.block_height(0);
+        assert!(wrapped_first_height > app.blocks[0].height());
+
+        app.select_next();
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_top, wrapped_first_height);
+
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('j'));
+        }
+        assert_eq!(app.scroll_top, app.max_scroll());
+        assert!(app.max_scroll() > app.rows().len().saturating_sub(app.viewport_height));
     }
 
     #[test]
@@ -1655,6 +1732,7 @@ diff --git a/query.rs b/query.rs
                 blocks: vec![],
                 selected: None,
                 scroll_top: 0,
+                viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 1,
                 should_quit: false,
             }
