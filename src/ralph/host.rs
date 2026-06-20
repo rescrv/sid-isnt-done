@@ -318,11 +318,15 @@ impl SidRalphHost {
         Ok(())
     }
 
-    fn persist_judge_transcript(&self) {
-        let Some(judge) = self.judge.as_ref() else {
+    fn persist_judge_transcript(&mut self) {
+        let path = self.judge_transcript_path();
+        let Some(judge) = self.judge.as_mut() else {
             return;
         };
-        let _ = judge.chat.save_transcript_to(self.judge_transcript_path());
+        let mut messages = judge.chat.clone_messages();
+        sanitize_transcript_messages(&mut messages);
+        judge.chat.replace_messages(messages);
+        let _ = judge.chat.save_transcript_to(path);
     }
 
     fn tokens_delta(
@@ -454,6 +458,9 @@ impl RalphHost for SidRalphHost {
             if interrupted.load(Ordering::Relaxed) {
                 break JudgeOutcome::Interrupted;
             }
+            let mut messages = judge.chat.clone_messages();
+            sanitize_transcript_messages(&mut messages);
+            judge.chat.replace_messages(messages);
             let before_len = judge.chat.clone_messages().len();
             if force {
                 *judge

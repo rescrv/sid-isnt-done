@@ -3125,21 +3125,27 @@ pub fn load_transcript_messages(path: &std::path::Path) -> Result<Vec<MessagePar
     Ok(messages)
 }
 
-/// Remove transcript content blocks that Anthropic rejects on replay.
+/// Remove transcript messages and content blocks that Anthropic rejects on replay.
 ///
 /// Some model responses include `thinking` blocks whose `thinking` text is
 /// empty.  Those blocks are valid enough to deserialize and persist, but the
-/// Messages API rejects them when they are sent back in a later request.
+/// Messages API rejects them when they are sent back in a later request.  A
+/// malformed or interrupted tool exchange can also leave an empty message
+/// content payload (`""` or `[]`), which must not be replayed.
 pub fn sanitize_transcript_messages(messages: &mut Vec<MessageParam>) {
     messages.retain_mut(|message| {
-        let MessageParamContent::Array(blocks) = &mut message.content else {
-            return true;
-        };
-        let before = blocks.len();
-        blocks.retain(|block| !is_empty_thinking_block(block));
-        let removed_empty_thinking = before != blocks.len();
-        !(message.role == MessageRole::Assistant && removed_empty_thinking && blocks.is_empty())
+        if let MessageParamContent::Array(blocks) = &mut message.content {
+            blocks.retain(|block| !is_empty_thinking_block(block));
+        }
+        !is_empty_message_content(&message.content)
     });
+}
+
+fn is_empty_message_content(content: &MessageParamContent) -> bool {
+    match content {
+        MessageParamContent::String(text) => text.is_empty(),
+        MessageParamContent::Array(blocks) => blocks.is_empty(),
+    }
 }
 
 fn is_empty_thinking_block(block: &ContentBlock) -> bool {
@@ -4544,6 +4550,46 @@ compact_TOOLS='bash'
     }
 
     #[test]
+    fn sanitize_transcript_messages_removes_empty_message_content() {
+        let tool_result =
+            ToolResultBlock::new("toolu_ok".to_string()).with_string_content("ok".to_string());
+        let mut messages = vec![
+            MessageParam::user("before"),
+            MessageParam::user(""),
+            MessageParam::new(MessageParamContent::Array(Vec::new()), MessageRole::User),
+            MessageParam::new(
+                MessageParamContent::String(String::new()),
+                MessageRole::Assistant,
+            ),
+            MessageParam::new(
+                MessageParamContent::Array(Vec::new()),
+                MessageRole::Assistant,
+            ),
+            MessageParam::new(
+                MessageParamContent::Array(vec![tool_result.into()]),
+                MessageRole::User,
+            ),
+            MessageParam::user("after"),
+        ];
+
+        sanitize_transcript_messages(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0], MessageParam::user("before"));
+        assert_eq!(messages[2], MessageParam::user("after"));
+        let MessageParamContent::Array(blocks) = &messages[1].content else {
+            panic!("expected tool result message to be preserved");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0]
+                .as_tool_result()
+                .map(|block| block.tool_use_id.as_str()),
+            Some("toolu_ok")
+        );
+    }
+
+    #[test]
     fn load_transcript_messages_sanitizes_empty_thinking_blocks() {
         let root = unique_temp_dir("transcript");
         fs::create_dir_all(root.as_str()).unwrap();
@@ -4582,6 +4628,44 @@ compact_TOOLS='bash'
         assert_eq!(
             blocks[0].as_text().map(|block| block.text.as_str()),
             Some("visible answer")
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn load_transcript_messages_sanitizes_empty_user_arrays() {
+        let root = unique_temp_dir("transcript-empty-user");
+        fs::create_dir_all(root.as_str()).unwrap();
+        let path = root.join("transcript.json");
+        fs::write(
+            path.as_str(),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "before"
+                    },
+                    {
+                        "role": "user",
+                        "content": []
+                    },
+                    {
+                        "role": "user",
+                        "content": "after"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let messages = load_transcript_messages(std::path::Path::new(path.as_str())).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![MessageParam::user("before"), MessageParam::user("after")]
         );
 
         fs::remove_dir_all(root.as_str()).unwrap();
