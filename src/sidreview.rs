@@ -515,19 +515,19 @@ impl ReviewApp {
             return ViewProgress::empty();
         }
 
-        let current_row = self.scroll_top.min(total_rows - 1);
-        let review = Progress::new(current_row + 1, total_rows);
-        let Some((block_index, block_start, block)) = self.block_at_visible_row(current_row) else {
+        let top_row = self.scroll_top.min(total_rows - 1);
+        let viewport_end = self.viewport_end(total_rows);
+        let review = Progress::new(viewport_end, total_rows);
+        let Some((block_index, block_start, block)) = self.block_at_visible_row(top_row) else {
             return ViewProgress {
                 review,
                 ..ViewProgress::empty()
             };
         };
-        let chunk = Progress::new(
-            current_row - block_start + 1,
-            self.block_height(block_index),
-        );
-        let file = self.file_progress(block.file_index, current_row);
+        let block_height = self.block_height(block_index);
+        let block_end = block_start + block_height;
+        let chunk = Progress::new(viewport_end.min(block_end) - block_start, block_height);
+        let file = self.file_progress(block.file_index, viewport_end);
         ViewProgress {
             block_index: Some(block_index),
             chunk,
@@ -541,6 +541,12 @@ impl ReviewApp {
             return 0;
         }
         self.rows().iter().map(|row| self.row_height(row)).sum()
+    }
+
+    fn viewport_end(&self, total_rows: usize) -> usize {
+        self.scroll_top
+            .saturating_add(self.viewport_height)
+            .min(total_rows)
     }
 
     fn block_at_visible_row(&self, row: usize) -> Option<(usize, usize, &ReviewBlock)> {
@@ -565,28 +571,28 @@ impl ReviewApp {
         None
     }
 
-    fn file_progress(&self, file_index: Option<usize>, current_row: usize) -> Progress {
+    fn file_progress(&self, file_index: Option<usize>, viewport_end: usize) -> Progress {
         let Some(file_index) = file_index else {
             return Progress::empty();
         };
 
         let mut block_start = 0usize;
         let mut file_total = 0usize;
-        let mut file_current = None;
+        let mut file_current = 0usize;
         for (block_index, block) in self.blocks.iter().enumerate() {
             let block_height = self.block_height(block_index);
             if block.file_index == Some(file_index) {
-                if (block_start..block_start + block_height).contains(&current_row) {
-                    file_current = Some(file_total + current_row - block_start + 1);
-                }
+                file_current += viewport_end.saturating_sub(block_start).min(block_height);
                 file_total += block_height;
             }
             block_start += block_height;
         }
 
-        file_current
-            .map(|current| Progress::new(current, file_total))
-            .unwrap_or_else(Progress::empty)
+        if file_current == 0 {
+            Progress::empty()
+        } else {
+            Progress::new(file_current, file_total)
+        }
     }
 
     fn block_height(&self, block_index: usize) -> usize {
@@ -1384,7 +1390,7 @@ diff --git a/a.txt b/a.txt
     }
 
     #[test]
-    fn status_progress_tracks_top_visible_row_when_line_scrolling() {
+    fn status_progress_includes_visible_rows_when_line_scrolling() {
         let mut app = ReviewApp::from_input(TWO_HUNKS);
         app.set_viewport_height(4);
         for _ in 0..8 {
@@ -1394,7 +1400,7 @@ diff --git a/a.txt b/a.txt
         assert_eq!(app.selected, Some(0));
         assert_eq!(
             app.status_text(),
-            "current-chunk 1/5 20%  current-file 9/13 69%  current-review 9/13 69%  a.rs @@ -10,2 +10,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+            "current-chunk 4/5 80%  current-file 12/13 92%  current-review 12/13 92%  a.rs @@ -10,2 +10,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1471,6 +1477,10 @@ diff --git a/a.txt b/a.txt
                 "  26   26   keep_eight".to_string(),
                 "  27   27   keep_nine".to_string(),
             ]
+        );
+        assert_eq!(
+            app.status_text(),
+            "current-chunk 11/11 100%  current-file 24/24 100%  current-review 24/24 100%  a.rs @@ -20,8 +20,8 @@  j/k scroll  J/K folds  f fold  G end  q quit"
         );
     }
 
