@@ -3,6 +3,7 @@
 //! This module provides a [`PlainTextRenderer`] that formats tool calls in a
 //! human-readable way instead of dumping raw JSON.
 
+use std::collections::VecDeque;
 use std::io::{self, Stderr, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,189 @@ const ANSI_TOOL_RESULT_BODY: &str = "\x1b[38;5;187m";
 const ANSI_FIELD_LABEL: &str = "\x1b[38;5;109m";
 
 const MAX_REPLACEMENT_DIFF_CELLS: usize = 250_000;
+const COMPACT_HEAD_LINES: usize = 3;
+const COMPACT_TAIL_LINES: usize = 3;
+const COMPACT_VISIBLE_LINES: usize = COMPACT_HEAD_LINES + COMPACT_TAIL_LINES;
+const COMPACT_ELLIPSIS: &[u8] = b"...";
+
+/// Line-window compactor for terminal-only tool output.
+///
+/// The first six complete lines are emitted unchanged.  When the seventh line
+/// arrives, the previously rendered tail is rewritten as:
+///
+/// ```text
+/// ...
+/// <last 3 lines>
+/// ```
+///
+/// Later lines keep that last-three-line tail as a sliding window.  The raw
+/// session data remains untouched; this only returns terminal display bytes.
+#[derive(Debug)]
+pub struct CompactLineBuffer {
+    prefix: Vec<u8>,
+    current_line: Vec<u8>,
+    tail: VecDeque<Vec<u8>>,
+    line_count: usize,
+    line_start: bool,
+    current_line_started: bool,
+    current_line_visible: bool,
+    compacted: bool,
+}
+
+impl CompactLineBuffer {
+    /// Create a new compacting line buffer.
+    pub fn new(prefix: impl Into<Vec<u8>>, line_start: bool) -> Self {
+        Self {
+            prefix: prefix.into(),
+            current_line: Vec::new(),
+            tail: VecDeque::new(),
+            line_count: 0,
+            line_start,
+            current_line_started: false,
+            current_line_visible: false,
+            compacted: false,
+        }
+    }
+
+    /// Return whether the terminal cursor is currently at the start of a line.
+    pub fn line_start(&self) -> bool {
+        self.line_start
+    }
+
+    /// Push bytes into the compactor and return bytes to write to the terminal.
+    pub fn write(&mut self, mut bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        while let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            self.write_fragment(&bytes[..newline], &mut output);
+            self.finish_current_line(true, &mut output);
+            bytes = &bytes[newline + 1..];
+        }
+        self.write_fragment(bytes, &mut output);
+        output
+    }
+
+    /// Flush any trailing unterminated line.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.current_line_started {
+            return Vec::new();
+        }
+        let mut output = Vec::new();
+        self.finish_current_line(false, &mut output);
+        output
+    }
+
+    fn write_fragment(&mut self, fragment: &[u8], output: &mut Vec<u8>) {
+        if fragment.is_empty() {
+            return;
+        }
+        if !self.current_line_started {
+            self.start_line();
+        }
+        self.current_line.extend_from_slice(fragment);
+        if let Some(tail) = self.tail.back_mut() {
+            tail.extend_from_slice(fragment);
+        }
+        if self.line_count <= COMPACT_VISIBLE_LINES {
+            if !self.current_line_visible && self.line_start {
+                output.extend_from_slice(&self.prefix);
+            }
+            output.extend_from_slice(fragment);
+            self.current_line_visible = true;
+            self.line_start = false;
+        } else {
+            self.redraw_compacted_tail(false, output);
+        }
+    }
+
+    fn start_line(&mut self) {
+        self.line_count = self.line_count.saturating_add(1);
+        self.current_line.clear();
+        self.current_line_started = true;
+        self.current_line_visible = false;
+        if self.line_count <= COMPACT_VISIBLE_LINES {
+            if self.line_count > COMPACT_HEAD_LINES {
+                self.push_tail(Vec::new());
+            }
+            return;
+        }
+
+        self.push_tail(Vec::new());
+    }
+
+    fn finish_current_line(&mut self, newline: bool, output: &mut Vec<u8>) {
+        if !self.current_line_started {
+            self.start_line();
+        }
+
+        if self.line_count <= COMPACT_VISIBLE_LINES {
+            if !self.current_line_visible && self.line_start {
+                output.extend_from_slice(&self.prefix);
+            }
+            if newline {
+                output.push(b'\n');
+                self.line_start = true;
+            } else {
+                self.line_start = false;
+            }
+        } else if self.current_line_visible {
+            if newline {
+                output.push(b'\n');
+                self.line_start = true;
+            } else {
+                self.line_start = false;
+            }
+        } else {
+            self.redraw_compacted_tail(newline, output);
+        }
+
+        self.current_line.clear();
+        self.current_line_started = false;
+        self.current_line_visible = false;
+    }
+
+    fn push_tail(&mut self, line: Vec<u8>) {
+        self.tail.push_back(line);
+        while self.tail.len() > COMPACT_TAIL_LINES {
+            self.tail.pop_front();
+        }
+    }
+
+    fn redraw_compacted_tail(&mut self, current_newline: bool, output: &mut Vec<u8>) {
+        let rows_up = if self.line_start {
+            COMPACT_TAIL_LINES
+        } else {
+            COMPACT_TAIL_LINES.saturating_sub(1)
+        };
+        write_move_up(rows_up, output);
+        if !self.compacted {
+            self.write_rewritten_line(COMPACT_ELLIPSIS, true, output);
+            self.compacted = true;
+        }
+        let tail_len = self.tail.len();
+        for index in 0..tail_len {
+            let line = self.tail[index].clone();
+            let tail_newline = index + 1 < tail_len || current_newline;
+            self.write_rewritten_line(&line, tail_newline, output);
+        }
+        self.current_line_visible = true;
+    }
+
+    fn write_rewritten_line(&mut self, line: &[u8], newline: bool, output: &mut Vec<u8>) {
+        output.extend_from_slice(b"\r\x1b[2K");
+        output.extend_from_slice(&self.prefix);
+        output.extend_from_slice(line);
+        if newline {
+            output.push(b'\n');
+            self.line_start = true;
+        } else {
+            self.line_start = false;
+        }
+    }
+}
+
+fn write_move_up(lines: usize, output: &mut Vec<u8>) {
+    output.extend_from_slice(format!("\x1b[{lines}A").as_bytes());
+}
 
 enum RenderOutput {
     Stdout(Stdout),
@@ -121,6 +305,8 @@ pub struct PlainTextRenderer {
     tool_input_buf: String,
     /// Last command-like preview rendered from a partially parsed tool input.
     tool_input_preview: Option<ToolInputPreview>,
+    compact_tool_output: bool,
+    tool_result_compactor: Option<CompactLineBuffer>,
 }
 
 impl PlainTextRenderer {
@@ -140,6 +326,8 @@ impl PlainTextRenderer {
             current_tool_name: None,
             tool_input_buf: String::new(),
             tool_input_preview: None,
+            compact_tool_output: false,
+            tool_result_compactor: None,
         }
     }
 
@@ -156,6 +344,12 @@ impl PlainTextRenderer {
     /// Attaches an interrupt flag to the renderer.
     pub fn with_interrupt(mut self, interrupted: Arc<AtomicBool>) -> Self {
         self.interrupted = Some(interrupted);
+        self
+    }
+
+    /// Enable or disable compact terminal display for streamed tool output.
+    pub fn with_compact_tool_output(mut self, compact_tool_output: bool) -> Self {
+        self.compact_tool_output = compact_tool_output;
         self
     }
 
@@ -191,6 +385,7 @@ impl PlainTextRenderer {
     }
 
     fn reset_tool_result(&mut self) {
+        self.finish_tool_result_compactor();
         if self.in_tool_result {
             if self.use_color {
                 self.write_raw(ANSI_RESET);
@@ -217,6 +412,30 @@ impl PlainTextRenderer {
             self.line_start = line.ends_with('\n');
         }
         self.flush();
+    }
+
+    fn write_compacted_tool_result_text(&mut self, text: &str) {
+        let Some(compactor) = self.tool_result_compactor.as_mut() else {
+            return;
+        };
+        let output = compactor.write(text.as_bytes());
+        self.line_start = compactor.line_start();
+        if !output.is_empty() {
+            let _ = self.output.write_all(&output);
+            self.flush();
+        }
+    }
+
+    fn finish_tool_result_compactor(&mut self) {
+        let Some(mut compactor) = self.tool_result_compactor.take() else {
+            return;
+        };
+        let output = compactor.finish();
+        self.line_start = compactor.line_start();
+        if !output.is_empty() {
+            let _ = self.output.write_all(&output);
+            self.flush();
+        }
     }
 
     fn write_agent_label_before_block(&mut self, context: &dyn StreamContext) {
@@ -942,13 +1161,22 @@ impl Renderer for PlainTextRenderer {
         } else {
             self.write_with_indent(context, &format!("\n[tool result: {tool_use_id}]\n"));
         }
+        if self.compact_tool_output {
+            let prefix = "  ".repeat(context.depth()).into_bytes();
+            self.tool_result_compactor = Some(CompactLineBuffer::new(prefix, self.line_start));
+        }
     }
 
     fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
-        self.write_with_indent(context, text);
+        if self.tool_result_compactor.is_some() {
+            self.write_compacted_tool_result_text(text);
+        } else {
+            self.write_with_indent(context, text);
+        }
     }
 
     fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.finish_tool_result_compactor();
         self.reset_tool_result();
         self.write_with_indent(context, "\n");
     }
@@ -991,6 +1219,88 @@ mod tests {
     fn buffer_text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
         let bytes = buffer.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn compact_line_buffer_leaves_six_lines_visible() {
+        let mut buffer = CompactLineBuffer::new(Vec::<u8>::new(), true);
+        let output = buffer.write(b"1\n2\n3\n4\n5\n6\n");
+
+        assert_eq!(String::from_utf8(output).unwrap(), "1\n2\n3\n4\n5\n6\n");
+    }
+
+    #[test]
+    fn compact_line_buffer_rewrites_on_seventh_line() {
+        let mut buffer = CompactLineBuffer::new(Vec::<u8>::new(), true);
+        let output = buffer.write(b"1\n2\n3\n4\n5\n6\n7\n");
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "1\n",
+                "2\n",
+                "3\n",
+                "4\n",
+                "5\n",
+                "6\n",
+                "\x1b[3A",
+                "\r\x1b[2K...\n",
+                "\r\x1b[2K5\n",
+                "\r\x1b[2K6\n",
+                "\r\x1b[2K7\n",
+            )
+        );
+    }
+
+    #[test]
+    fn compact_line_buffer_rewrites_when_seventh_line_starts() {
+        let mut buffer = CompactLineBuffer::new(Vec::<u8>::new(), true);
+        let mut output = buffer.write(b"1\n2\n3\n4\n5\n6\n");
+        output.extend(buffer.write(b"7"));
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "1\n",
+                "2\n",
+                "3\n",
+                "4\n",
+                "5\n",
+                "6\n",
+                "\x1b[3A",
+                "\r\x1b[2K...\n",
+                "\r\x1b[2K5\n",
+                "\r\x1b[2K6\n",
+                "\r\x1b[2K7",
+            )
+        );
+    }
+
+    #[test]
+    fn compact_line_buffer_slides_tail_after_seventh_line() {
+        let mut buffer = CompactLineBuffer::new(Vec::<u8>::new(), true);
+        let output = buffer.write(b"1\n2\n3\n4\n5\n6\n7\n8\n");
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "1\n",
+                "2\n",
+                "3\n",
+                "4\n",
+                "5\n",
+                "6\n",
+                "\x1b[3A",
+                "\r\x1b[2K...\n",
+                "\r\x1b[2K5\n",
+                "\r\x1b[2K6\n",
+                "\r\x1b[2K7\n",
+                "\x1b[3A",
+                "\r\x1b[2K6\n",
+                "\r\x1b[2K7\n",
+                "\r\x1b[2K8\n",
+            )
+        );
     }
 
     #[test]

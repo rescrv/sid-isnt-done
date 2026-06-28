@@ -23,6 +23,7 @@ use crate::config::{SkillConfig, TOOL_PROTOCOL_VERSION, TOOLS_CONF_FILE, TOOLS_D
 use crate::raw_protocol::{
     ToolOutputEvent, has_active_tool_output_observer, notify_tool_output_observer,
 };
+use crate::render::CompactLineBuffer;
 use crate::seatbelt;
 use crate::seatbelt::WritableRoots;
 use crate::session::{self, SidSession, ToolFinishEvent, ToolStartEvent, ToolStreamJournal};
@@ -52,6 +53,8 @@ pub(crate) struct ToolRuntimeContext<'a> {
     pub(crate) session: Option<&'a SidSession>,
     /// Skill documents mounted for the agent.
     pub(crate) skills: &'a [SkillConfig],
+    /// Whether live terminal tool output should be compacted for display.
+    pub(crate) compact_tool_output: bool,
 }
 
 #[derive(Debug)]
@@ -83,6 +86,7 @@ pub(crate) struct PreparedRcToolInvocation {
     runtime: ToolRcRuntime,
     /// Maximum execution time, or `None` for no timeout.
     timeout: Option<Duration>,
+    compact_tool_output: bool,
 }
 
 struct ToolOverlayContext<'a> {
@@ -214,6 +218,7 @@ pub(crate) fn prepare_rc_tool_invocation(
         skill_read_roots: skill_read_roots(context.skills),
         runtime,
         timeout,
+        compact_tool_output: context.compact_tool_output,
     })
 }
 
@@ -510,6 +515,7 @@ async fn run_prepared_rc_tool_text_inner(
         .expect("child stderr should be piped before spawn");
     let journal = session.map(SidSession::tool_stream_journal);
     let suppress_terminal_output = has_active_tool_output_observer();
+    let compact_terminal_output = prepared.compact_tool_output && !suppress_terminal_output;
     let stdout_terminal: Box<dyn AsyncWrite + Unpin + Send> = if suppress_terminal_output {
         Box::new(tokio::io::sink())
     } else {
@@ -529,6 +535,7 @@ async fn run_prepared_rc_tool_text_inner(
         prepared.request_id.clone(),
         prepared.display_name.clone(),
         prepared.tool_use_id.clone(),
+        compact_terminal_output,
     ));
     let stderr_task = tokio::spawn(tee_child_output(
         stderr,
@@ -539,6 +546,7 @@ async fn run_prepared_rc_tool_text_inner(
         prepared.request_id.clone(),
         prepared.display_name.clone(),
         prepared.tool_use_id.clone(),
+        compact_terminal_output,
     ));
 
     let deadline = prepared
@@ -829,19 +837,30 @@ async fn tee_child_output<R, W>(
     request_id: String,
     tool_name: String,
     tool_use_id: String,
+    compact_terminal_output: bool,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buffer = [0u8; 8192];
+    let mut compactor =
+        compact_terminal_output.then(|| CompactLineBuffer::new(Vec::<u8>::new(), true));
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        terminal.write_all(&buffer[..read]).await?;
-        terminal.flush().await?;
+        if let Some(compactor) = compactor.as_mut() {
+            let output = compactor.write(&buffer[..read]);
+            if !output.is_empty() {
+                terminal.write_all(&output).await?;
+                terminal.flush().await?;
+            }
+        } else {
+            terminal.write_all(&buffer[..read]).await?;
+            terminal.flush().await?;
+        }
         if let Some(journal) = journal.as_ref() {
             journal
                 .append(tool_seq, stream, &buffer[..read])
@@ -859,6 +878,13 @@ where
             text,
             data_b64,
         });
+    }
+    if let Some(mut compactor) = compactor {
+        let output = compactor.finish();
+        if !output.is_empty() {
+            terminal.write_all(&output).await?;
+            terminal.flush().await?;
+        }
     }
     Ok(())
 }

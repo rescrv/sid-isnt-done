@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -50,7 +51,7 @@ use sid_isnt_done::raw_protocol::{
     RawResultEnvelope, RawServerMessage, install_tool_output_observer,
     install_usage_report_observer,
 };
-use sid_isnt_done::render::PlainTextRenderer;
+use sid_isnt_done::render::{CompactLineBuffer, PlainTextRenderer};
 use sid_isnt_done::{
     COMPACTION_REQUEST_PROMPT, SidAgent, append_resumed_bash_reset_marker, compacted_transcript,
     extract_last_assistant_text, sanitize_transcript_messages, seatbelt, session,
@@ -185,6 +186,8 @@ struct SidTerminal {
     renderer: PlainTextRenderer,
     histfile: PathBuf,
     pending_history: Vec<String>,
+    compact_tool_output: bool,
+    raw_tool_output_compactors: BTreeMap<(String, String), CompactLineBuffer>,
 }
 
 impl SidTerminal {
@@ -192,6 +195,7 @@ impl SidTerminal {
         use_color: bool,
         interrupted: Arc<AtomicBool>,
         sid_home: PathBuf,
+        compact_tool_output: bool,
     ) -> Result<Self, SError> {
         let config = Config::builder().edit_mode(EditMode::Vi).build();
         let mut editor = DefaultEditor::with_config(config).map_err(|err| {
@@ -208,9 +212,12 @@ impl SidTerminal {
         let _ = editor.load_history(&histfile);
         Ok(Self {
             editor,
-            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted)
+                .with_compact_tool_output(compact_tool_output),
             histfile,
             pending_history: Vec::new(),
+            compact_tool_output,
+            raw_tool_output_compactors: BTreeMap::new(),
         })
     }
 
@@ -240,6 +247,69 @@ impl SidTerminal {
         if append_history_entries(&self.histfile, &self.pending_history).is_ok() {
             self.pending_history.clear();
         }
+    }
+
+    fn write_raw_tool_output(
+        &mut self,
+        tool_use_id: &str,
+        stream: &str,
+        bytes: &[u8],
+    ) -> Result<(), SError> {
+        if !self.compact_tool_output {
+            return write_tool_output_bytes(stream, bytes);
+        }
+        let key = (tool_use_id.to_string(), stream.to_string());
+        let compactor = self
+            .raw_tool_output_compactors
+            .entry(key)
+            .or_insert_with(|| CompactLineBuffer::new(Vec::<u8>::new(), true));
+        let output = compactor.write(bytes);
+        if output.is_empty() {
+            Ok(())
+        } else {
+            write_tool_output_bytes(stream, &output)
+        }
+    }
+
+    fn finish_raw_tool_output(&mut self, tool_use_id: &str) -> Result<(), SError> {
+        let keys = self
+            .raw_tool_output_compactors
+            .keys()
+            .filter(|(id, _)| id == tool_use_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (id, stream) in keys {
+            if let Some(mut compactor) = self
+                .raw_tool_output_compactors
+                .remove(&(id, stream.clone()))
+            {
+                let output = compactor.finish();
+                if !output.is_empty() {
+                    write_tool_output_bytes(&stream, &output)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_all_raw_tool_output(&mut self) -> Result<(), SError> {
+        let keys = self
+            .raw_tool_output_compactors
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for (id, stream) in keys {
+            if let Some(mut compactor) = self
+                .raw_tool_output_compactors
+                .remove(&(id, stream.clone()))
+            {
+                let output = compactor.finish();
+                if !output.is_empty() {
+                    write_tool_output_bytes(&stream, &output)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -458,9 +528,10 @@ struct PromptRenderer {
 }
 
 impl PromptRenderer {
-    fn new(use_color: bool, interrupted: Arc<AtomicBool>) -> Self {
+    fn new(use_color: bool, interrupted: Arc<AtomicBool>, compact_tool_output: bool) -> Self {
         Self {
-            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted)
+                .with_compact_tool_output(compact_tool_output),
         }
     }
 }
@@ -569,6 +640,9 @@ struct SidArgs {
     #[arrrg(flag, "Run a JSONL protocol server on stdin/stdout")]
     raw: bool,
 
+    #[arrrg(flag, "Compact live tool output in terminal display")]
+    compact: bool,
+
     #[arrrg(
         optional,
         "Run a reconnectable JSONL protocol server on SPEC; implies --raw",
@@ -601,6 +675,7 @@ struct PreRuntimeSetup {
     prompt: Option<String>,
     raw: bool,
     listen: Option<String>,
+    compact: bool,
     resumed: bool,
 }
 
@@ -608,6 +683,7 @@ struct PreRuntimeSetup {
 struct ConnectSetup {
     spec: String,
     use_color: bool,
+    compact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1726,6 +1802,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         resume,
         prompt,
         raw,
+        compact,
         listen,
         connect,
     } = parse_sid_args()?;
@@ -1744,6 +1821,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         return Ok(StartupSetup::Connect(ConnectSetup {
             spec: connect,
             use_color: config.use_color,
+            compact,
         }));
     }
 
@@ -1820,6 +1898,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         prompt,
         raw,
         listen,
+        compact,
         resumed,
     })))
 }
@@ -1856,6 +1935,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         prompt,
         raw,
         listen,
+        compact,
         resumed,
     } = setup;
 
@@ -1865,7 +1945,8 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
 
     let agent =
         SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
-            .with_session(sid_session.clone());
+            .with_session(sid_session.clone())
+            .with_compact_tool_output(compact);
     let agent_id = agent.id().to_string();
     let startup_confirmation_required = agent.requires_confirmation();
     let use_color = agent.config().use_color;
@@ -1910,7 +1991,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
 
     if let Some(prompt) = prompt {
         let interrupted = Arc::new(AtomicBool::new(false));
-        let mut renderer = PromptRenderer::new(use_color, interrupted.clone());
+        let mut renderer = PromptRenderer::new(use_color, interrupted.clone(), compact);
         install_ctrlc_handler(interrupted)?;
 
         if startup_confirmation_required && !confirm_manual_agent(&mut renderer, &agent_id)? {
@@ -1940,6 +2021,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         use_color,
         interrupted.clone(),
         PathBuf::from(config_root.as_str()),
+        compact,
     )?;
     let context = ();
 
@@ -2284,6 +2366,7 @@ fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
         setup.use_color,
         interrupted.clone(),
         PathBuf::from(resolve_sid_home()?.as_str()),
+        setup.compact,
     )?;
     install_ctrlc_handler(interrupted.clone())?;
 
@@ -3179,6 +3262,7 @@ fn render_raw_event(event: RawEvent, terminal: &mut SidTerminal) -> Result<(), S
             tool_use_id,
             is_error,
         } => {
+            terminal.finish_raw_tool_output(&tool_use_id)?;
             let context = RemoteStreamContext { label, depth };
             terminal.start_tool_result(&context, &tool_use_id, is_error);
         }
@@ -3191,6 +3275,7 @@ fn render_raw_event(event: RawEvent, terminal: &mut SidTerminal) -> Result<(), S
             terminal.finish_tool_result(&context);
         }
         RawEvent::ResponseFinish { label, depth } => {
+            terminal.finish_all_raw_tool_output()?;
             let context = RemoteStreamContext { label, depth };
             terminal.finish_response(&context);
         }
@@ -3199,12 +3284,14 @@ fn render_raw_event(event: RawEvent, terminal: &mut SidTerminal) -> Result<(), S
             terminal.print_interrupted(&context);
         }
         RawEvent::ToolOutput {
+            tool_use_id,
             stream,
             text,
             data_b64,
             ..
         } => {
-            write_raw_tool_output(&stream, text.as_deref(), data_b64.as_deref())?;
+            let bytes = raw_tool_output_bytes(text.as_deref(), data_b64.as_deref())?;
+            terminal.write_raw_tool_output(&tool_use_id, &stream, &bytes)?;
         }
     }
     Ok(())
@@ -3223,11 +3310,7 @@ fn parse_raw_stop_reason(value: &str) -> Option<StopReason> {
     })
 }
 
-fn write_raw_tool_output(
-    stream: &str,
-    text: Option<&str>,
-    data_b64: Option<&str>,
-) -> Result<(), SError> {
+fn raw_tool_output_bytes(text: Option<&str>, data_b64: Option<&str>) -> Result<Vec<u8>, SError> {
     let bytes = match (text, data_b64) {
         (Some(text), _) => text.as_bytes().to_vec(),
         (None, Some(data_b64)) => BASE64_STANDARD.decode(data_b64).map_err(|err| {
@@ -3239,9 +3322,13 @@ fn write_raw_tool_output(
         })?,
         (None, None) => Vec::new(),
     };
+    Ok(bytes)
+}
+
+fn write_tool_output_bytes(stream: &str, bytes: &[u8]) -> Result<(), SError> {
     if stream == "stderr" {
         let mut stderr = io::stderr();
-        stderr.write_all(&bytes).map_err(|err| {
+        stderr.write_all(bytes).map_err(|err| {
             cli_error("io_error", "failed to write raw tool stderr")
                 .with_string_field("cause", &err.to_string())
         })?;
@@ -3251,7 +3338,7 @@ fn write_raw_tool_output(
         })?;
     } else {
         let mut stdout = io::stdout();
-        stdout.write_all(&bytes).map_err(|err| {
+        stdout.write_all(bytes).map_err(|err| {
             cli_error("io_error", "failed to write raw tool stdout")
                 .with_string_field("cause", &err.to_string())
         })?;
@@ -4644,6 +4731,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             PathBuf::from(root.as_str()),
+            false,
         )
         .unwrap();
 
@@ -4660,12 +4748,14 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             PathBuf::from(root.as_str()),
+            false,
         )
         .unwrap();
         let mut second = SidTerminal::new(
             false,
             Arc::new(AtomicBool::new(false)),
             PathBuf::from(root.as_str()),
+            false,
         )
         .unwrap();
 
@@ -4697,6 +4787,14 @@ mod tests {
         assert_eq!(status, 0, "unexpected parser status: {messages:?}");
         assert!(free.is_empty());
         assert!(args.raw);
+    }
+
+    #[test]
+    fn parse_args_accept_compact_option() {
+        let (args, free, status, messages) = parse_args(&["--compact"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert!(args.compact);
     }
 
     #[test]

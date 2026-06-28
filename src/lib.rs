@@ -152,6 +152,7 @@ pub struct SidAgent {
     tool_scope: SidToolScope,
     memory_depth: usize,
     auto_compact_tokens: Option<u64>,
+    compact_tool_output: bool,
     bash_session: Mutex<Option<BashPtySession>>,
     tool_cancellation_pending: AtomicBool,
     token_usage_totals: StdMutex<TokenUsageTotals>,
@@ -503,6 +504,7 @@ impl SidAgent {
             tool_scope,
             memory_depth,
             auto_compact_tokens,
+            compact_tool_output: false,
             bash_session: Mutex::new(None),
             tool_cancellation_pending: AtomicBool::new(false),
             token_usage_totals: StdMutex::new(TokenUsageTotals::default()),
@@ -529,6 +531,12 @@ impl SidAgent {
             self.memory_source = session.compaction_provenance().cloned();
         }
         self.session = Some(session);
+        self
+    }
+
+    /// Enable compact terminal display for live tool output.
+    pub fn with_compact_tool_output(mut self, compact_tool_output: bool) -> Self {
+        self.compact_tool_output = compact_tool_output;
         self
     }
 
@@ -893,6 +901,7 @@ impl SidAgent {
             writable_roots: &self.writable_roots,
             session: self.session.as_deref(),
             skills: &self.skills,
+            compact_tool_output: self.compact_tool_output,
         }
     }
 
@@ -2732,6 +2741,7 @@ async fn invoke_external_tool(
         writable_roots: &agent.writable_roots,
         session: agent.session.as_deref(),
         skills: &agent.skills,
+        compact_tool_output: agent.compact_tool_output,
     };
     match tool_runtime::invoke_rc_tool_text(
         &tool.name,
