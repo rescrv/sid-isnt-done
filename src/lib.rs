@@ -1071,7 +1071,8 @@ impl SidAgent {
                     view_range: Option<(u32, u32)>,
                 }
                 let args: ViewTool = serde_json::from_value(tool_use.input)?;
-                self.view(&args.path, args.view_range).await
+                let path = virtual_tool_path(&args.path)?;
+                self.view(&path, args.view_range).await
             }
             "str_replace" => {
                 #[derive(serde::Deserialize)]
@@ -1082,7 +1083,8 @@ impl SidAgent {
                 }
                 let args: StrReplaceTool = serde_json::from_value(tool_use.input)?;
                 let new_str = args.new_str.as_deref().unwrap_or("");
-                self.str_replace(&args.path, &args.old_str, new_str).await
+                let path = virtual_tool_path(&args.path)?;
+                self.str_replace(&path, &args.old_str, new_str).await
             }
             "insert" => {
                 #[derive(serde::Deserialize)]
@@ -1099,7 +1101,8 @@ impl SidAgent {
                         "missing insert_text field",
                     )
                 })?;
-                self.insert(&args.path, args.insert_line, &text).await
+                let path = virtual_tool_path(&args.path)?;
+                self.insert(&path, args.insert_line, &text).await
             }
             "create" => {
                 #[derive(serde::Deserialize)]
@@ -1108,7 +1111,8 @@ impl SidAgent {
                     file_text: String,
                 }
                 let args: CreateTool = serde_json::from_value(tool_use.input)?;
-                self.create(&args.path, &args.file_text).await
+                let path = virtual_tool_path(&args.path)?;
+                self.create(&path, &args.file_text).await
             }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -3240,6 +3244,34 @@ fn tool_user_cancelled_result(tool_use_id: &str) -> ToolResult {
     ControlFlow::Continue(user_cancelled_tool_result(tool_use_id))
 }
 
+fn virtual_tool_path(path: &str) -> Result<String, std::io::Error> {
+    let path = Path::from(path);
+    if path
+        .components()
+        .any(|component| matches!(component, utf8path::Component::AppDefined))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "viewing // paths is not supported",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, utf8path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            ".. path name prohibited",
+        ));
+    }
+    let path = path.as_str();
+    if path.starts_with('/') {
+        Ok(path.to_string())
+    } else {
+        Ok(format!("/{path}"))
+    }
+}
+
 /// Build the default writable roots for a workspace.
 ///
 /// Includes the workspace root itself and the system temp directory.  Paths are
@@ -3739,6 +3771,20 @@ mod tests {
         fn finish_tool_result(&mut self, _context: &dyn claudius::StreamContext) {}
 
         fn finish_response(&mut self, _context: &dyn claudius::StreamContext) {}
+    }
+
+    #[test]
+    fn virtual_tool_path_accepts_relative_paths_without_allowing_traversal() {
+        assert_eq!(virtual_tool_path("Cargo.toml").unwrap(), "/Cargo.toml");
+        assert_eq!(virtual_tool_path("/src/lib.rs").unwrap(), "/src/lib.rs");
+        assert_eq!(
+            virtual_tool_path("../outside").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            virtual_tool_path("//host/path").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
     }
 
     #[test]

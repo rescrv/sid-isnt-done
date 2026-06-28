@@ -447,6 +447,31 @@ fn normalize_editor_path(path: &str) -> String {
         .to_string()
 }
 
+fn virtual_editor_path(path: &str) -> Result<String, ToolFailure> {
+    let path = Path::from(path);
+    if path
+        .components()
+        .any(|component| matches!(component, utf8path::Component::AppDefined))
+    {
+        return Err(ToolFailure::new(
+            "unsupported",
+            "viewing // paths is not supported",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, utf8path::Component::ParentDir))
+    {
+        return Err(ToolFailure::new("unsupported", ".. path name prohibited"));
+    }
+    let path = path.as_str();
+    if path.starts_with('/') {
+        Ok(path.to_string())
+    } else {
+        Ok(format!("/{path}"))
+    }
+}
+
 fn sanitize_editor_path(workspace_root: &Path<'_>, path: &str) -> Result<PathBuf, ToolFailure> {
     let path = Path::from(path);
     if path
@@ -698,16 +723,18 @@ async fn execute_editor_command(
     match command.command.as_str() {
         "view" => {
             let request = parse_request_input::<ViewRequest>(input)?;
+            let path = virtual_editor_path(&request.path)?;
             filesystem
-                .view(&request.path, request.view_range)
+                .view(&path, request.view_range)
                 .await
                 .map_err(map_filesystem_error)
         }
         "str_replace" => {
             let request = parse_request_input::<StrReplaceRequest>(input)?;
+            let path = virtual_editor_path(&request.path)?;
             filesystem
                 .str_replace(
-                    &request.path,
+                    &path,
                     &request.old_str,
                     request.new_str.as_deref().unwrap_or(""),
                 )
@@ -716,19 +743,21 @@ async fn execute_editor_command(
         }
         "insert" => {
             let request = parse_request_input::<InsertRequest>(input)?;
+            let path = virtual_editor_path(&request.path)?;
             let text = request
                 .insert_text
                 .or(request.new_str)
                 .ok_or_else(|| ToolFailure::new("invalid_input", "missing insert_text field"))?;
             filesystem
-                .insert(&request.path, request.insert_line, &text)
+                .insert(&path, request.insert_line, &text)
                 .await
                 .map_err(map_filesystem_error)
         }
         "create" => {
             let request = parse_request_input::<CreateRequest>(input)?;
+            let path = virtual_editor_path(&request.path)?;
             filesystem
-                .create(&request.path, &request.file_text)
+                .create(&path, &request.file_text)
                 .await
                 .map_err(map_filesystem_error)
         }
@@ -1135,6 +1164,46 @@ mod tests {
             ))
             .expect("editor command should succeed");
         assert_eq!(output, "workspace foo\n\n");
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn editor_tool_accepts_relative_paths_with_mounted_filesystem() {
+        let root = unique_temp_dir("editor-tool");
+        fs::create_dir_all(root.as_str()).unwrap();
+        fs::write(root.join("file.txt").as_str(), "line one\nline two\n").unwrap();
+        let filesystem = build_editor_filesystem(&root, None).unwrap();
+
+        let view = json!({
+            "command": "view",
+            "path": "file.txt"
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let output = runtime
+            .block_on(execute_editor_command(
+                &filesystem,
+                view.as_object().expect("input must be an object"),
+            ))
+            .expect("relative view should succeed");
+        assert_eq!(output, "line one\nline two\n\n");
+
+        let replace = json!({
+            "command": "str_replace",
+            "path": "file.txt",
+            "old_str": "line two",
+            "new_str": "changed"
+        });
+        runtime
+            .block_on(execute_editor_command(
+                &filesystem,
+                replace.as_object().expect("input must be an object"),
+            ))
+            .expect("relative replace should succeed");
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt").as_str()).unwrap(),
+            "line one\nchanged\n"
+        );
 
         fs::remove_dir_all(root.as_str()).unwrap();
     }
