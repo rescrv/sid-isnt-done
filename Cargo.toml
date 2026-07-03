@@ -73,6 +73,10 @@ path = "src/bin/sidiff.rs"
 name = "sidreview"
 path = "src/bin/sidreview.rs"
 
+[[bin]]
+name = "sidrepo"
+path = "src/bin/sidrepo.rs"
+
 [profile.release]
 debug = true
 lto = true

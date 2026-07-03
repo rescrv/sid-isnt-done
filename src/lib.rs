@@ -36,6 +36,8 @@ pub mod seatbelt;
 pub mod session;
 /// Semantic diff rendering with syntax-aware annotations.
 pub mod sidiff;
+/// Repository snapshot renderer for `sidreview`.
+pub mod sidrepo;
 /// Terminal diff review pager.
 pub mod sidreview;
 /// Skill-reference injection into user messages.

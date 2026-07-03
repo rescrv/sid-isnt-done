@@ -687,11 +687,10 @@ impl Progress {
     }
 
     fn percent(self) -> usize {
-        if self.total == 0 {
-            0
-        } else {
-            self.current.saturating_mul(100) / self.total
-        }
+        self.current
+            .saturating_mul(100)
+            .checked_div(self.total)
+            .unwrap_or(0)
     }
 
     fn render(self) -> String {

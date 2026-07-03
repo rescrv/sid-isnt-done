@@ -665,19 +665,19 @@ fn should_start_plain_file(current_file: &Option<DiffFile>, current_hunk: &Optio
 }
 
 fn parse_diff_git_paths(line: &str) -> (Option<String>, Option<String>) {
-    let rest = line.strip_prefix("diff --git ").unwrap_or(line);
-    let mut parts = rest.split_whitespace();
-    let old = parts.next().map(clean_diff_path);
-    let new = parts.next().map(clean_diff_path);
+    let mut rest = line.strip_prefix("diff --git ").unwrap_or(line);
+    let old = take_diff_path_token(&mut rest).map(|path| clean_diff_path(&path));
+    let new = take_diff_path_token(&mut rest).map(|path| clean_diff_path(&path));
     (old, new)
 }
 
 fn parse_header_path(line: &str, prefix: &str) -> Option<String> {
-    let path = line.strip_prefix(prefix)?.split_whitespace().next()?;
+    let mut rest = line.strip_prefix(prefix)?;
+    let path = take_diff_path_token(&mut rest)?;
     if path == "/dev/null" {
         None
     } else {
-        Some(clean_diff_path(path))
+        Some(clean_diff_path(&path))
     }
 }
 
@@ -686,6 +686,65 @@ fn clean_diff_path(path: &str) -> String {
         .or_else(|| path.strip_prefix("b/"))
         .unwrap_or(path)
         .to_string()
+}
+
+fn take_diff_path_token(input: &mut &str) -> Option<String> {
+    let trimmed = (*input).trim_start();
+    *input = trimmed;
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(rest) = input.strip_prefix('"') {
+        let (path, remaining) = parse_quoted_diff_path(rest)?;
+        *input = remaining;
+        return Some(path);
+    }
+
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let token = input[..end].to_string();
+    *input = &input[end..];
+    Some(token)
+}
+
+fn parse_quoted_diff_path(input: &str) -> Option<(String, &str)> {
+    let mut path = String::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '"' => return Some((path, &input[idx + 1..])),
+            '\\' => path.push(parse_diff_path_escape(&mut chars)?),
+            ch => path.push(ch),
+        }
+    }
+    None
+}
+
+fn parse_diff_path_escape(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Option<char> {
+    let (_, ch) = chars.next()?;
+    match ch {
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        '\\' => Some('\\'),
+        '"' => Some('"'),
+        '0'..='7' => {
+            let mut value = ch.to_digit(8)?;
+            for _ in 0..2 {
+                let Some(&(_, next)) = chars.peek() else {
+                    break;
+                };
+                if !matches!(next, '0'..='7') {
+                    break;
+                }
+                chars.next();
+                value = value * 8 + next.to_digit(8)?;
+            }
+            char::from_u32(value)
+        }
+        ch => Some(ch),
+    }
 }
 
 fn parse_hunk_header(line: &str) -> Hunk {
