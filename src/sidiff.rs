@@ -17,6 +17,8 @@ use tree_sitter::{Language, Node, Parser};
 const DEFAULT_PAGER: &str = "less -R";
 const MOVE_MIN_LINES: usize = 3;
 const MAX_ROLE_GROUPS: usize = 8;
+const PURE_ADDITION_BAT_MAX_BYTES: usize = 512 * 1024;
+const PURE_ADDITION_BAT_MAX_LINES: usize = 10_000;
 const ROLE_GLYPHS: [&str; MAX_ROLE_GROUPS] = [
     "\u{2460}", "\u{2461}", "\u{2462}", "\u{2463}", "\u{2464}", "\u{2465}", "\u{2466}", "\u{2467}",
 ];
@@ -350,16 +352,22 @@ pub fn parse_unified_diff(input: &str) -> Diff {
     let mut diff = Diff::default();
     let mut current_file: Option<DiffFile> = None;
     let mut current_hunk: Option<Hunk> = None;
+    let mut current_hunk_old_seen = 0usize;
+    let mut current_hunk_new_seen = 0usize;
     let mut pending_header: Vec<String> = vec![];
 
     for raw in input.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw).to_string();
 
-        if current_hunk
-            .as_ref()
-            .is_some_and(|hunk| should_append_hunk_line(hunk, &line))
-        {
-            append_hunk_line(current_hunk.as_mut().expect("checked above"), &line);
+        if current_hunk.as_ref().is_some_and(|hunk| {
+            should_append_hunk_line(hunk, current_hunk_old_seen, current_hunk_new_seen, &line)
+        }) {
+            append_hunk_line(
+                current_hunk.as_mut().expect("checked above"),
+                &line,
+                &mut current_hunk_old_seen,
+                &mut current_hunk_new_seen,
+            );
             continue;
         }
         flush_hunk(&mut current_file, &mut current_hunk);
@@ -413,6 +421,8 @@ pub fn parse_unified_diff(input: &str) -> Diff {
             ensure_file(&mut current_file);
             flush_hunk(&mut current_file, &mut current_hunk);
             current_hunk = Some(parse_hunk_header(&line));
+            current_hunk_old_seen = 0;
+            current_hunk_new_seen = 0;
             continue;
         }
 
@@ -785,18 +795,7 @@ fn parse_range_part(part: &str, prefix: char) -> (usize, usize) {
     (start, count)
 }
 
-fn append_hunk_line(hunk: &mut Hunk, line: &str) {
-    let old_next = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Remove))
-        .count();
-    let new_next = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Add))
-        .count();
-
+fn append_hunk_line(hunk: &mut Hunk, line: &str, old_seen: &mut usize, new_seen: &mut usize) {
     if line.starts_with("\\ ") {
         hunk.lines.push(DiffLine {
             op: DiffOp::Note,
@@ -817,31 +816,31 @@ fn append_hunk_line(hunk: &mut Hunk, line: &str) {
         op,
         content: content.to_string(),
         old_lineno: match op {
-            DiffOp::Context | DiffOp::Remove => Some(hunk.old_start + old_next),
+            DiffOp::Context | DiffOp::Remove => Some(hunk.old_start + *old_seen),
             DiffOp::Add | DiffOp::Note => None,
         },
         new_lineno: match op {
-            DiffOp::Context | DiffOp::Add => Some(hunk.new_start + new_next),
+            DiffOp::Context | DiffOp::Add => Some(hunk.new_start + *new_seen),
             DiffOp::Remove | DiffOp::Note => None,
         },
     });
+    match op {
+        DiffOp::Context => {
+            *old_seen += 1;
+            *new_seen += 1;
+        }
+        DiffOp::Add => *new_seen += 1,
+        DiffOp::Remove => *old_seen += 1,
+        DiffOp::Note => {}
+    }
 }
 
-fn should_append_hunk_line(hunk: &Hunk, line: &str) -> bool {
-    line.starts_with("\\ ") || (!hunk_is_complete(hunk) && is_hunk_content_line(line))
+fn should_append_hunk_line(hunk: &Hunk, old_seen: usize, new_seen: usize, line: &str) -> bool {
+    line.starts_with("\\ ")
+        || (!hunk_is_complete(hunk, old_seen, new_seen) && is_hunk_content_line(line))
 }
 
-fn hunk_is_complete(hunk: &Hunk) -> bool {
-    let old_seen = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Remove))
-        .count();
-    let new_seen = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.op, DiffOp::Context | DiffOp::Add))
-        .count();
+fn hunk_is_complete(hunk: &Hunk, old_seen: usize, new_seen: usize) -> bool {
     old_seen >= hunk.old_count && new_seen >= hunk.new_count
 }
 
@@ -853,14 +852,26 @@ fn is_hunk_content_line(line: &str) -> bool {
 }
 
 fn analyze_diff(diff: &Diff) -> Analysis {
+    analyze_diff_with_filter(diff, |_, file| !file_is_pure_addition(file))
+}
+
+fn analyze_diff_with_filter(
+    diff: &Diff,
+    include_file: impl Fn(usize, &DiffFile) -> bool + Copy,
+) -> Analysis {
     let mut analysis = Analysis {
         lines: HashMap::new(),
         moves: vec![],
         chunk_roles: BTreeMap::new(),
-        syntax: syntax_maps(diff),
+        syntax: syntax_maps(diff, include_file),
     };
-    analyze_change_pairs(diff, &mut analysis.lines, &mut analysis.chunk_roles);
-    detect_moves(diff, &mut analysis);
+    analyze_change_pairs(
+        diff,
+        &mut analysis.lines,
+        &mut analysis.chunk_roles,
+        include_file,
+    );
+    detect_moves(diff, &mut analysis, include_file);
     analysis
 }
 
@@ -868,8 +879,12 @@ fn analyze_change_pairs(
     diff: &Diff,
     lines: &mut HashMap<LineId, LineAnalysis>,
     chunk_roles: &mut BTreeMap<ChunkId, Vec<RoleGroup>>,
+    include_file: impl Fn(usize, &DiffFile) -> bool + Copy,
 ) {
     for (file_idx, file) in diff.files.iter().enumerate() {
+        if !include_file(file_idx, file) {
+            continue;
+        }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             let mut index = 0usize;
             while index < hunk.lines.len() {
@@ -1383,8 +1398,12 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
-fn detect_moves(diff: &Diff, analysis: &mut Analysis) {
-    let runs = collect_runs(diff);
+fn detect_moves(
+    diff: &Diff,
+    analysis: &mut Analysis,
+    include_file: impl Fn(usize, &DiffFile) -> bool + Copy,
+) {
+    let runs = collect_runs(diff, include_file);
     let removes: Vec<&RunRef> = runs
         .iter()
         .filter(|run| run.op == DiffOp::Remove && run.len >= MOVE_MIN_LINES)
@@ -1438,9 +1457,15 @@ fn detect_moves(diff: &Diff, analysis: &mut Analysis) {
     }
 }
 
-fn collect_runs(diff: &Diff) -> Vec<RunRef> {
+fn collect_runs(
+    diff: &Diff,
+    include_file: impl Fn(usize, &DiffFile) -> bool + Copy,
+) -> Vec<RunRef> {
     let mut runs = vec![];
     for (file_idx, file) in diff.files.iter().enumerate() {
+        if !include_file(file_idx, file) {
+            continue;
+        }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             let mut index = 0usize;
             while index < hunk.lines.len() {
@@ -1580,6 +1605,9 @@ fn add_semantic_changed_lines_to_review_map(
         ..SidiffOptions::default()
     };
     for (file_idx, file) in diff.files.iter().enumerate() {
+        if file_is_pure_addition(file) {
+            continue;
+        }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             for (line_idx, line) in hunk.lines.iter().enumerate() {
                 if !matches!(line.op, DiffOp::Add | DiffOp::Remove) {
@@ -1868,9 +1896,15 @@ fn apply_roles_to_chunk(
     }
 }
 
-fn syntax_maps(diff: &Diff) -> HashMap<LineId, Vec<SyntaxRange>> {
+fn syntax_maps(
+    diff: &Diff,
+    include_file: impl Fn(usize, &DiffFile) -> bool + Copy,
+) -> HashMap<LineId, Vec<SyntaxRange>> {
     let mut maps = HashMap::new();
     for (file_idx, file) in diff.files.iter().enumerate() {
+        if !include_file(file_idx, file) {
+            continue;
+        }
         for side in [Side::Pre, Side::Post] {
             let path = match side {
                 Side::Pre => display_old_path(file),
@@ -2350,6 +2384,9 @@ pub(crate) fn render_pure_addition_file_with_bat(
     use_color: bool,
 ) -> io::Result<String> {
     let content = pure_addition_content(file);
+    if !use_color || pure_addition_is_too_large_for_bat(&content) {
+        return Ok(content);
+    }
     run_bat_filter(
         &display_new_path(file),
         &content,
@@ -2358,6 +2395,11 @@ pub(crate) fn render_pure_addition_file_with_bat(
             ..SidiffOptions::default()
         },
     )
+}
+
+fn pure_addition_is_too_large_for_bat(content: &str) -> bool {
+    content.len() > PURE_ADDITION_BAT_MAX_BYTES
+        || content.bytes().filter(|byte| *byte == b'\n').count() > PURE_ADDITION_BAT_MAX_LINES
 }
 
 fn pure_addition_content(file: &DiffFile) -> String {

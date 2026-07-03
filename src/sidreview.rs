@@ -1,5 +1,6 @@
 //! Terminal review pager for unified diffs.
 
+use std::cell::{Ref, RefCell};
 use std::cmp::min;
 use std::collections::BTreeSet;
 use std::fs;
@@ -81,14 +82,15 @@ fn render_review(frame: &mut Frame, app: &mut ReviewApp) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
     app.set_viewport(body_area.width as usize, body_area.height as usize);
 
-    let rows = app
-        .rows()
-        .into_iter()
+    let window = app.render_window();
+    let rows = window
+        .rows
+        .iter()
         .map(|row| render_row_line(row, app.selected))
         .collect::<Vec<_>>();
     let body = Paragraph::new(rows)
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
+        .scroll((window.scroll_offset.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(body, body_area);
 
     let footer = Paragraph::new(app.status_text()).style(
@@ -122,12 +124,12 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
     style
 }
 
-fn render_row_line(row: ReviewRow, selected: Option<usize>) -> Line<'static> {
-    let style = row_style(&row, selected);
+fn render_row_line(row: &ReviewRow, selected: Option<usize>) -> Line<'static> {
+    let style = row_style(row, selected);
     if row.kind == ReviewRowKind::Bat || row.text.contains('\x1b') {
         ansi_styled_line(&row.text, style)
     } else {
-        Line::styled(row.text, style)
+        Line::styled(row.text.clone(), style)
     }
 }
 
@@ -265,7 +267,7 @@ fn ansi_color(code: u16) -> Option<Color> {
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct ReviewApp {
     blocks: Vec<ReviewBlock>,
     selected: Option<usize>,
@@ -273,9 +275,23 @@ struct ReviewApp {
     viewport_width: usize,
     viewport_height: usize,
     should_quit: bool,
+    layout_cache: ReviewLayoutCache,
 }
 
 const DEFAULT_VIEWPORT_WIDTH: usize = u16::MAX as usize;
+
+impl PartialEq for ReviewApp {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+            && self.selected == other.selected
+            && self.scroll_top == other.scroll_top
+            && self.viewport_width == other.viewport_width
+            && self.viewport_height == other.viewport_height
+            && self.should_quit == other.should_quit
+    }
+}
+
+impl Eq for ReviewApp {}
 
 impl ReviewApp {
     #[cfg(test)]
@@ -299,6 +315,7 @@ impl ReviewApp {
             viewport_width: DEFAULT_VIEWPORT_WIDTH,
             viewport_height: 1,
             should_quit: false,
+            layout_cache: ReviewLayoutCache::default(),
         }
     }
 
@@ -472,14 +489,18 @@ impl ReviewApp {
     }
 
     fn block_start(&self, target: usize) -> usize {
-        self.rows()
-            .iter()
-            .take_while(|row| row.block.map(|block| block < target).unwrap_or(false))
-            .map(|row| self.row_height(row))
-            .sum()
+        self.layout()
+            .block_starts
+            .get(target)
+            .copied()
+            .unwrap_or_else(|| self.visible_height())
     }
 
     fn rows(&self) -> Vec<ReviewRow> {
+        self.build_rows()
+    }
+
+    fn build_rows(&self) -> Vec<ReviewRow> {
         if self.blocks.is_empty() {
             return vec![ReviewRow {
                 block: None,
@@ -511,6 +532,47 @@ impl ReviewApp {
             }));
         }
         rows
+    }
+
+    fn layout(&self) -> Ref<'_, ReviewLayout> {
+        if self.layout_cache.needs_rebuild(self) {
+            self.layout_cache.replace(ReviewLayout::build(self));
+        }
+        self.layout_cache.borrow()
+    }
+
+    fn render_window(&self) -> ReviewWindow {
+        let layout = self.layout();
+        if self.blocks.is_empty() {
+            return ReviewWindow {
+                rows: layout.rows.clone(),
+                scroll_offset: 0,
+            };
+        }
+
+        let total_height = layout.document_height;
+        if total_height == 0 {
+            return ReviewWindow {
+                rows: vec![],
+                scroll_offset: 0,
+            };
+        }
+
+        let top = self.scroll_top.min(total_height - 1);
+        let bottom = top.saturating_add(self.viewport_height).min(total_height);
+        let Some(start_idx) = layout.row_index_at(top) else {
+            return ReviewWindow {
+                rows: vec![],
+                scroll_offset: 0,
+            };
+        };
+        let mut end_idx = layout.row_starts.partition_point(|start| *start < bottom);
+        end_idx = end_idx.max(start_idx + 1).min(layout.rows.len());
+
+        ReviewWindow {
+            rows: layout.rows[start_idx..end_idx].to_vec(),
+            scroll_offset: top.saturating_sub(layout.row_starts[start_idx]),
+        }
     }
 
     fn status_text(&self) -> String {
@@ -558,10 +620,7 @@ impl ReviewApp {
     }
 
     fn visible_height(&self) -> usize {
-        if self.blocks.is_empty() {
-            return 0;
-        }
-        self.rows().iter().map(|row| self.row_height(row)).sum()
+        self.layout().document_height
     }
 
     fn viewport_end(&self, total_rows: usize) -> usize {
@@ -571,25 +630,9 @@ impl ReviewApp {
     }
 
     fn block_at_visible_row(&self, row: usize) -> Option<(usize, usize, &ReviewBlock)> {
-        let mut row_start = 0usize;
-        let mut block_start = 0usize;
-        let mut current_block = None;
-        for review_row in self.rows() {
-            let Some(block_index) = review_row.block else {
-                continue;
-            };
-            if current_block != Some(block_index) {
-                current_block = Some(block_index);
-                block_start = row_start;
-            }
-            let row_height = self.row_height(&review_row);
-            let row_end = row_start + row_height;
-            if row < row_end {
-                return Some((block_index, block_start, &self.blocks[block_index]));
-            }
-            row_start = row_end;
-        }
-        None
+        let found = self.layout().block_at_visible_row(row);
+        found
+            .map(|(block_index, block_start)| (block_index, block_start, &self.blocks[block_index]))
     }
 
     fn file_progress(&self, file_index: Option<usize>, viewport_end: usize) -> Progress {
@@ -600,8 +643,9 @@ impl ReviewApp {
         let mut block_start = 0usize;
         let mut file_total = 0usize;
         let mut file_current = 0usize;
+        let layout = self.layout();
         for (block_index, block) in self.blocks.iter().enumerate() {
-            let block_height = self.block_height(block_index);
+            let block_height = layout.block_heights.get(block_index).copied().unwrap_or(0);
             if block.file_index == Some(file_index) {
                 file_current += viewport_end.saturating_sub(block_start).min(block_height);
                 file_total += block_height;
@@ -617,19 +661,11 @@ impl ReviewApp {
     }
 
     fn block_height(&self, block_index: usize) -> usize {
-        self.rows()
-            .iter()
-            .filter(|row| row.block == Some(block_index))
-            .map(|row| self.row_height(row))
-            .sum()
-    }
-
-    fn row_height(&self, row: &ReviewRow) -> usize {
-        let line = render_row_line(row.clone(), None);
-        Paragraph::new(line)
-            .wrap(Wrap { trim: false })
-            .line_count(self.viewport_width.min(u16::MAX as usize) as u16)
-            .max(1)
+        self.layout()
+            .block_heights
+            .get(block_index)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -641,6 +677,137 @@ impl ReviewApp {
             .map(|row| row.text)
             .collect()
     }
+}
+
+#[derive(Default)]
+struct ReviewLayoutCache {
+    inner: RefCell<Option<ReviewLayout>>,
+}
+
+impl Clone for ReviewLayoutCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ReviewLayoutCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReviewLayoutCache")
+    }
+}
+
+impl ReviewLayoutCache {
+    fn needs_rebuild(&self, app: &ReviewApp) -> bool {
+        let cache = self.inner.borrow();
+        let Some(layout) = cache.as_ref() else {
+            return true;
+        };
+        layout.needs_rebuild(app)
+    }
+
+    fn replace(&self, layout: ReviewLayout) {
+        *self.inner.borrow_mut() = Some(layout);
+    }
+
+    fn borrow(&self) -> Ref<'_, ReviewLayout> {
+        Ref::map(self.inner.borrow(), |layout| {
+            layout
+                .as_ref()
+                .expect("review layout cache should be populated before borrow")
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReviewLayout {
+    viewport_width: usize,
+    folded: Vec<bool>,
+    rows: Vec<ReviewRow>,
+    row_starts: Vec<usize>,
+    block_starts: Vec<usize>,
+    block_heights: Vec<usize>,
+    document_height: usize,
+}
+
+impl ReviewLayout {
+    fn build(app: &ReviewApp) -> Self {
+        let rows = app.build_rows();
+        let folded = app
+            .blocks
+            .iter()
+            .map(|block| block.folded)
+            .collect::<Vec<_>>();
+        let mut row_starts = Vec::with_capacity(rows.len());
+        let mut block_starts = vec![0usize; app.blocks.len()];
+        let mut block_heights = vec![0usize; app.blocks.len()];
+        let mut block_seen = vec![false; app.blocks.len()];
+        let mut document_height = 0usize;
+
+        for row in &rows {
+            row_starts.push(document_height);
+            let row_height = measure_row_height(row, app.viewport_width);
+            if let Some(block_index) = row.block {
+                if !block_seen[block_index] {
+                    block_starts[block_index] = document_height;
+                    block_seen[block_index] = true;
+                }
+                block_heights[block_index] = block_heights[block_index].saturating_add(row_height);
+            }
+            document_height = document_height.saturating_add(row_height);
+        }
+
+        if app.blocks.is_empty() {
+            document_height = 0;
+        }
+
+        Self {
+            viewport_width: app.viewport_width,
+            folded,
+            rows,
+            row_starts,
+            block_starts,
+            block_heights,
+            document_height,
+        }
+    }
+
+    fn needs_rebuild(&self, app: &ReviewApp) -> bool {
+        self.viewport_width != app.viewport_width
+            || self.folded.len() != app.blocks.len()
+            || self
+                .folded
+                .iter()
+                .zip(&app.blocks)
+                .any(|(folded, block)| *folded != block.folded)
+    }
+
+    fn row_index_at(&self, row: usize) -> Option<usize> {
+        if self.row_starts.is_empty() {
+            return None;
+        }
+        let index = self.row_starts.partition_point(|start| *start <= row);
+        Some(index.saturating_sub(1).min(self.row_starts.len() - 1))
+    }
+
+    fn block_at_visible_row(&self, row: usize) -> Option<(usize, usize)> {
+        let row_index = self.row_index_at(row)?;
+        let block_index = self.rows.get(row_index)?.block?;
+        Some((block_index, self.block_starts[block_index]))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReviewWindow {
+    rows: Vec<ReviewRow>,
+    scroll_offset: usize,
+}
+
+fn measure_row_height(row: &ReviewRow, viewport_width: usize) -> usize {
+    let line = render_row_line(row, None);
+    Paragraph::new(line)
+        .wrap(Wrap { trim: false })
+        .line_count(viewport_width.min(u16::MAX as usize) as u16)
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -948,7 +1115,16 @@ fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
 }
 
 fn build_blocks_with_color(diff: &Diff, use_color: bool) -> Vec<ReviewBlock> {
-    let metadata = build_review_line_metadata(diff, use_color);
+    let needs_metadata = use_color
+        && diff
+            .files
+            .iter()
+            .any(|file| !file_is_pure_addition(file) && !file.hunks.is_empty());
+    let metadata = if needs_metadata {
+        build_review_line_metadata(diff, use_color)
+    } else {
+        Default::default()
+    };
     let mut blocks = Vec::new();
     if !diff.preamble.is_empty() {
         blocks.push(ReviewBlock::new(
@@ -1160,7 +1336,7 @@ diff --git a/a.txt b/a.txt
     #[test]
     fn diff_rows_parse_embedded_ansi_colors() {
         let line = render_row_line(
-            ReviewRow {
+            &ReviewRow {
                 block: Some(0),
                 kind: ReviewRowKind::Add,
                 text: "       1 + \x1b[38;2;1;2;3mfn main\x1b[0m".to_string(),
@@ -1193,7 +1369,7 @@ diff --git a/query.rs b/query.rs
         assert!(added.content.contains('\x1b'));
 
         let rendered = render_row_line(
-            ReviewRow {
+            &ReviewRow {
                 block: Some(0),
                 kind: added.kind,
                 text: added.render(),
@@ -1259,7 +1435,7 @@ diff --git a/a.txt b/a.txt
         assert_eq!(moved.render(), "        8 + moved alpha");
 
         let rendered = render_row_line(
-            ReviewRow {
+            &ReviewRow {
                 block: Some(1),
                 kind: moved.kind,
                 text: moved.render(),
@@ -1449,6 +1625,7 @@ diff --git a/a.txt b/a.txt
                 viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 4,
                 should_quit: false,
+                layout_cache: ReviewLayoutCache::default(),
             }
         );
         assert_eq!(
@@ -1487,6 +1664,7 @@ diff --git a/a.txt b/a.txt
                 viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 4,
                 should_quit: false,
+                layout_cache: ReviewLayoutCache::default(),
             }
         );
         assert_eq!(
@@ -1614,6 +1792,63 @@ diff --git a/a.txt b/a.txt
         }
         assert_eq!(app.scroll_top, app.max_scroll());
         assert!(app.max_scroll() > app.rows().len().saturating_sub(app.viewport_height));
+    }
+
+    #[test]
+    fn render_window_only_returns_rows_intersecting_the_viewport() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(4);
+
+        let window = app.render_window();
+        assert_eq!(window.scroll_offset, 0);
+        assert_eq!(
+            window
+                .rows
+                .iter()
+                .map(|row| row.text.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "v a.rs @@ -1,2 +1,2 @@".to_string(),
+                "     diff --git a/a.rs b/a.rs".to_string(),
+                "     --- a/a.rs".to_string(),
+                "     +++ b/a.rs".to_string(),
+            ]
+        );
+        assert!(window.rows.len() < app.rows().len());
+
+        app.handle_key(KeyCode::Char('j'));
+        let window = app.render_window();
+        assert_eq!(window.scroll_offset, 0);
+        assert_eq!(window.rows[0].text, "     diff --git a/a.rs b/a.rs");
+    }
+
+    #[test]
+    fn render_window_preserves_scroll_offset_inside_wrapped_rows() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,1 @@
+-old_one
++alpha beta gamma delta epsilon zeta eta theta iota kappa
+";
+        let mut app = ReviewApp::from_input(input);
+        app.set_viewport(24, 4);
+
+        let long_line_start = {
+            let layout = app.layout();
+            let long_line_idx = layout
+                .rows
+                .iter()
+                .position(|row| row.text.contains("alpha beta gamma"))
+                .unwrap();
+            layout.row_starts[long_line_idx]
+        };
+        app.scroll_top = long_line_start + 1;
+
+        let window = app.render_window();
+        assert_eq!(window.scroll_offset, 1);
+        assert!(window.rows[0].text.contains("alpha beta gamma"));
     }
 
     #[test]
@@ -1841,6 +2076,7 @@ diff --git a/a.txt b/a.txt
                 viewport_width: DEFAULT_VIEWPORT_WIDTH,
                 viewport_height: 1,
                 should_quit: false,
+                layout_cache: ReviewLayoutCache::default(),
             }
         );
         assert_eq!(render_plain(""), "no diff chunks\n".to_string());
