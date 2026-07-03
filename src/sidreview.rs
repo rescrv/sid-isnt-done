@@ -316,12 +316,20 @@ impl ReviewApp {
                 self.scroll_up_line();
                 ReviewAction::None
             }
-            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => {
+            KeyCode::Char('J') => {
                 self.select_next();
                 ReviewAction::None
             }
-            KeyCode::Char('K') | KeyCode::PageUp => {
+            KeyCode::Char('K') => {
                 self.select_previous();
+                ReviewAction::None
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.scroll_down_page();
+                ReviewAction::None
+            }
+            KeyCode::PageUp => {
+                self.scroll_up_page();
                 ReviewAction::None
             }
             KeyCode::Char('g') | KeyCode::Home => {
@@ -380,6 +388,19 @@ impl ReviewApp {
 
     fn scroll_up_line(&mut self) {
         self.scroll_top = self.scroll_top.saturating_sub(1);
+    }
+
+    fn scroll_down_page(&mut self) {
+        self.scroll_top = self.scroll_top.saturating_add(self.page_scroll_amount());
+        self.clamp_scroll();
+    }
+
+    fn scroll_up_page(&mut self) {
+        self.scroll_top = self.scroll_top.saturating_sub(self.page_scroll_amount());
+    }
+
+    fn page_scroll_amount(&self) -> usize {
+        self.viewport_height.saturating_mul(2).div_ceil(3).max(1)
     }
 
     fn select_first(&mut self) {
@@ -502,7 +523,7 @@ impl ReviewApp {
         );
         match progress.block_index {
             Some(block_index) => format!(
-                "{progress_text}  {}  j/k scroll  J/K folds  f fold  G end  q quit",
+                "{progress_text}  {}  j/k line  Space/PgDn/PgUp page  J/K folds  f fold  G end  q quit",
                 self.blocks[block_index].title
             ),
             None => format!("{progress_text}  no diff chunks  q quit"),
@@ -1385,7 +1406,7 @@ diff --git a/a.txt b/a.txt
 
         assert_eq!(
             app.status_text(),
-            "current-chunk 1/8 12%  current-file 1/13 7%  current-review 1/13 7%  a.rs @@ -1,2 +1,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+            "current-chunk 1/8 12%  current-file 1/13 7%  current-review 1/13 7%  a.rs @@ -1,2 +1,2 @@  j/k line  Space/PgDn/PgUp page  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1400,7 +1421,7 @@ diff --git a/a.txt b/a.txt
         assert_eq!(app.selected, Some(0));
         assert_eq!(
             app.status_text(),
-            "current-chunk 4/5 80%  current-file 12/13 92%  current-review 12/13 92%  a.rs @@ -10,2 +10,2 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+            "current-chunk 4/5 80%  current-file 12/13 92%  current-review 12/13 92%  a.rs @@ -10,2 +10,2 @@  j/k line  Space/PgDn/PgUp page  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1411,7 +1432,7 @@ diff --git a/a.txt b/a.txt
 
         assert_eq!(
             app.status_text(),
-            "current-chunk 1/7 14%  current-file 1/7 14%  current-review 8/14 57%  b.rs @@ -1,1 +1,1 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+            "current-chunk 1/7 14%  current-file 1/7 14%  current-review 8/14 57%  b.rs @@ -1,1 +1,1 @@  j/k line  Space/PgDn/PgUp page  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1480,7 +1501,7 @@ diff --git a/a.txt b/a.txt
         );
         assert_eq!(
             app.status_text(),
-            "current-chunk 11/11 100%  current-file 24/24 100%  current-review 24/24 100%  a.rs @@ -20,8 +20,8 @@  j/k scroll  J/K folds  f fold  G end  q quit"
+            "current-chunk 11/11 100%  current-file 24/24 100%  current-review 24/24 100%  a.rs @@ -20,8 +20,8 @@  j/k line  Space/PgDn/PgUp page  J/K folds  f fold  G end  q quit"
         );
     }
 
@@ -1504,6 +1525,51 @@ diff --git a/a.txt b/a.txt
 
         assert_eq!(app.handle_key(KeyCode::Char('k')), ReviewAction::None);
         assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 0);
+    }
+
+    #[test]
+    fn page_keys_and_space_scroll_two_thirds_of_the_viewport() {
+        let mut app = ReviewApp::from_input(THREE_HUNKS);
+        app.set_viewport_height(6);
+
+        assert_eq!(app.handle_key(KeyCode::PageDown), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 4);
+        assert_eq!(
+            app.visible_text(),
+            vec![
+                "     @@ -1,2 +1,2 @@".to_string(),
+                "   1      - old_one".to_string(),
+                "        1 + new_one".to_string(),
+                "   2    2   keep_one".to_string(),
+                "v a.rs @@ -10,2 +10,2 @@".to_string(),
+                "     @@ -10,2 +10,2 @@".to_string(),
+            ]
+        );
+
+        assert_eq!(app.handle_key(KeyCode::Char(' ')), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 8);
+        assert_eq!(
+            app.visible_text(),
+            vec![
+                "v a.rs @@ -10,2 +10,2 @@".to_string(),
+                "     @@ -10,2 +10,2 @@".to_string(),
+                "  10      - old_two".to_string(),
+                "       10 + new_two".to_string(),
+                "  11   11   keep_two".to_string(),
+                "v a.rs @@ -20,8 +20,8 @@".to_string(),
+            ]
+        );
+
+        assert_eq!(app.handle_key(KeyCode::PageUp), ReviewAction::None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_top, 4);
+
+        for _ in 0..100 {
+            app.handle_key(KeyCode::PageUp);
+        }
         assert_eq!(app.scroll_top, 0);
     }
 
