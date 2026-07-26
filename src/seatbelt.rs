@@ -463,6 +463,7 @@ const POLICY_AFTER_WRITE_RULES: &str = r#"
 (allow file-read* (subpath "/Applications"))
 
 ; Terminal device handles.
+(allow file-read-data (literal "/dev") (vnode-type DIRECTORY))
 (allow file-read* (regex "^/dev/fd/(0|1|2)$"))
 (allow file-write* (regex "^/dev/fd/(1|2)$"))
 (allow file-read* file-write* (literal "/dev/null"))
@@ -945,6 +946,15 @@ mod tests {
             build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
         assert!(policy.contains("(subpath \"/opt/homebrew\")"));
         assert!(policy.contains("(subpath \"/usr/local/bin\")"));
+    }
+
+    #[test]
+    fn build_policy_allows_tty_name_lookup() {
+        let policy =
+            build_policy_with_home(&WritableRoots::default(), Some(Path::new("/Users/tester")));
+        assert!(
+            policy.contains("(allow file-read-data (literal \"/dev\") (vnode-type DIRECTORY))")
+        );
     }
 
     #[test]
