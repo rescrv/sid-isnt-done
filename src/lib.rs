@@ -3627,6 +3627,7 @@ fn disabled_tool_error(agent: &str, tool: &str, enabled: SwitchPosition) -> SErr
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
+    use std::process::Command;
 
     use claudius::{
         KnownModel, MessageParamContent, ThinkingBlock, ToolBash20250124, ToolTextEditor20250728,
@@ -3639,6 +3640,51 @@ mod tests {
     use crate::test_support::{
         make_executable, temp_config_root, unique_temp_dir, write_default_tool_manifest,
     };
+
+    const ISOLATED_HOME_TEST_ENV: &str = "SID_ISOLATED_HOME_TEST";
+
+    struct IsolatedHome {
+        root: PathBuf,
+    }
+
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn rerun_test_with_isolated_home() -> bool {
+        let current_thread = std::thread::current();
+        let test_name = current_thread
+            .name()
+            .expect("test harness should name the current thread");
+        if std::env::var_os(ISOLATED_HOME_TEST_ENV).as_deref()
+            == Some(std::ffi::OsStr::new(test_name))
+        {
+            return false;
+        }
+
+        let isolated_home = IsolatedHome {
+            root: PathBuf::from(unique_temp_dir("isolated-home").as_str()),
+        };
+        fs::create_dir_all(&isolated_home.root).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("HOME", &isolated_home.root)
+            .env(ISOLATED_HOME_TEST_ENV, test_name)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "isolated-home child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
 
     struct ScriptedRenderer {
         lines: VecDeque<OperatorLine>,
@@ -4004,6 +4050,9 @@ build_PROMPT_MEMORY_EXPERT='agents/memory-expert.md'
     #[test]
     fn from_workspace_with_home_config_root_runs_external_tools() {
         if !seatbelt::sandbox_available() {
+            return;
+        }
+        if rerun_test_with_isolated_home() {
             return;
         }
 
@@ -4988,6 +5037,9 @@ esac
     #[test]
     fn user_instruction_hook_runs_from_home_config_root() {
         if !seatbelt::sandbox_available() {
+            return;
+        }
+        if rerun_test_with_isolated_home() {
             return;
         }
 
