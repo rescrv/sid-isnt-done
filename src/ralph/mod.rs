@@ -1,12 +1,13 @@
-//! ralph — a verified fixpoint loop for sid.
+//! ralph — a verified fixpoint loop over sid agents.
 //!
-//! A mostly-POSIX shell (mxsh) embedded in sid is the orchestrator, with sid
-//! agents as subroutines.  The shell provides control flow and the exit-code
-//! protocol; the LLM appears in exactly two roles — repairer (when `./ci`
-//! fails) and judge (when it passes).  The judge never self-reports prose; it
-//! emits a structured verdict through a mandated tool, and that verdict is
-//! the work order for the next agent.  State lives in files, git, and
-//! journals — never in any single context window.
+//! A mostly-POSIX shell (mxsh) is the orchestrator, with sid agents as
+//! subroutines; the `ralph` binary interprets scripts directly (usable from a
+//! `#!/usr/bin/env ralph` shebang).  The shell provides control flow and the
+//! exit-code protocol; the LLM appears in exactly two roles — repairer (when
+//! `./ci` fails) and judge (when it passes).  The judge never self-reports
+//! prose; it emits a structured verdict through a mandated tool, and that
+//! verdict is the work order for the next agent.  State lives in files, git,
+//! and journals — never in any single context window.
 //!
 //! Exit-code protocol (§3 of the plan):
 //!

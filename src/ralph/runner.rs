@@ -3,9 +3,9 @@
 //!
 //! `agent` and `judge` appear to the script as ordinary commands (so pipes
 //! and redirections behave exactly like POSIX), implemented by a tiny shim
-//! (`sid-ralph-shim`) that forwards argv plus stdin over a unix socket to the
-//! in-process [`RunnerCore`].  The shim prints whatever the core says and
-//! exits with the protocol's exit code.
+//! (the `ralph` binary under its `agent`/`judge` symlinks) that forwards argv
+//! plus stdin over a unix socket to the in-process [`RunnerCore`].  The shim
+//! prints whatever the core says and exits with the protocol's exit code.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -30,7 +30,7 @@ pub const RUN_DIR_ENV: &str = "RUN_DIR";
 /// Environment variable carrying the run id into the script.
 pub const RUN_ID_ENV: &str = "RALPH_RUN_ID";
 /// Environment variable overriding the shim binary location.
-pub const SHIM_PATH_ENV: &str = "SID_RALPH_SHIM";
+pub const SHIM_PATH_ENV: &str = "RALPH_SHIM";
 
 /// Request sent by the shim over the control socket.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -176,6 +176,8 @@ pub struct RunnerOptions {
     pub budget_tokens: Option<u64>,
     /// Replay the journal to the last completed step before going live.
     pub resume: bool,
+    /// Arguments to the script, exposed as positional parameters `$1`, `$2`, ….
+    pub script_args: Vec<String>,
 }
 
 /// The runner's mutable state, shared between the socket server and the
@@ -812,7 +814,7 @@ pub fn serve_control_dir(control_dir: &Path, core: Arc<Mutex<RunnerCore>>, stop:
     let _ = fs::write(control_dir.join(CONTROL_CLOSED_MARKER), b"closed\n");
 }
 
-/// Client side of the control spool, used by `sid-ralph-shim`.
+/// Client side of the control spool, used by the `ralph` binary in shim mode.
 pub fn call_control_dir(control_dir: &Path, request: &ShimRequest) -> Result<ShimResponse, String> {
     let id = format!(
         "{}-{}",
@@ -842,8 +844,9 @@ pub fn call_control_dir(control_dir: &Path, request: &ShimRequest) -> Result<Shi
     }
 }
 
-/// Locate the `sid-ralph-shim` binary: `$SID_RALPH_SHIM` override first, then
-/// a sibling of the current executable.
+/// Locate the shim binary (the `ralph` executable): `$RALPH_SHIM` override
+/// first, then the current executable itself when it is named `ralph`, then a
+/// sibling of the current executable.
 pub fn locate_shim() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var(SHIM_PATH_ENV) {
         let path = PathBuf::from(path);
@@ -857,13 +860,19 @@ pub fn locate_shim() -> Result<PathBuf, String> {
     }
     let current = std::env::current_exe()
         .map_err(|err| format!("failed to locate current executable: {err}"))?;
+    let is_ralph = current
+        .file_name()
+        .map(|name| name == "ralph")
+        .unwrap_or(false);
+    if is_ralph {
+        return Ok(current);
+    }
     let sibling = current
         .parent()
-        .map(|dir| dir.join("sid-ralph-shim"))
+        .map(|dir| dir.join("ralph"))
         .filter(|path| path.is_file());
-    sibling.ok_or_else(|| {
-        "sid-ralph-shim not found next to the sid executable; set SID_RALPH_SHIM".to_string()
-    })
+    sibling
+        .ok_or_else(|| "ralph not found next to the current executable; set RALPH_SHIM".to_string())
 }
 
 /// The final result of driving a script.
@@ -874,29 +883,21 @@ pub struct ScriptOutcome {
 }
 
 /// Run `script_text` under embedded mxsh with `agent`/`judge` wired to
-/// `core`.  Returns the script's exit status.
-pub fn run_script(
-    core: Arc<Mutex<RunnerCore>>,
-    script_text: &str,
-    extra_env: &[(String, String)],
-) -> Result<ScriptOutcome, String> {
-    run_script_with_output(core, script_text, extra_env, None)
-}
-
-/// Run `script_text` under embedded mxsh, optionally forwarding script
-/// stdout/stderr through `output_sink`.
+/// `core`, optionally forwarding script stdout/stderr through `output_sink`.
+/// Returns the script's exit status.
 pub fn run_script_with_output(
     core: Arc<Mutex<RunnerCore>>,
     script_text: &str,
     extra_env: &[(String, String)],
     output_sink: Option<Arc<dyn ScriptOutputSink>>,
 ) -> Result<ScriptOutcome, String> {
-    let (run_dir, run_id, workspace_root) = {
+    let (run_dir, run_id, workspace_root, script_args) = {
         let core = core.lock().expect("runner core poisoned");
         (
             core.options.run_dir.clone(),
             core.options.run_id.clone(),
             core.options.workspace_root.clone(),
+            core.options.script_args.clone(),
         )
     };
 
@@ -950,6 +951,9 @@ pub fn run_script_with_output(
         });
     for (key, value) in extra_env {
         builder = builder.env(key, value, mxsh::embed::VariableAttributes::EXPORT);
+    }
+    if !script_args.is_empty() {
+        builder = builder.positional_parameters(script_args.iter().cloned());
     }
     if let Some(workspace_root) = workspace_root.as_ref() {
         // Scripts run from the workspace root: `./ci` means the workspace's ci.
@@ -1163,6 +1167,7 @@ mod tests {
             max_iters: None,
             budget_tokens: None,
             resume: false,
+            script_args: Vec::new(),
         }
     }
 
@@ -1287,7 +1292,7 @@ mod tests {
 
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = temp_dir("script-output");
-        let shim = dir.join("sid-ralph-shim");
+        let shim = dir.join("ralph");
         fs::write(&shim, "#!/bin/sh\nexit 99\n").unwrap();
         let previous_shim = std::env::var_os(SHIM_PATH_ENV);
         // SAFETY: this test serializes all mutations of this process-global

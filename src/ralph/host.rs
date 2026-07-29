@@ -165,15 +165,6 @@ impl SidRalphHost {
         }
     }
 
-    /// Replace the renderer factory used for child sessions.
-    pub fn with_renderer_factory(
-        mut self,
-        renderer_factory: Arc<dyn RalphRendererFactory>,
-    ) -> Self {
-        self.renderer_factory = renderer_factory;
-        self
-    }
-
     fn interrupted(&self) -> bool {
         self.interrupted.load(Ordering::Relaxed)
     }

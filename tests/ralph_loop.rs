@@ -1,5 +1,5 @@
 //! End-to-end tests for the ralph runner: real embedded mxsh, the real
-//! `sid-ralph-shim` on PATH, real pipes — and a scripted stub host instead of
+//! `ralph` shim on PATH, real pipes — and a scripted stub host instead of
 //! LLM inference.
 
 use std::collections::VecDeque;
@@ -22,7 +22,7 @@ fn ensure_shim_env() {
         // Safety: called exactly once before any threads depend on the value;
         // every test that reads it goes through this function first.
         unsafe {
-            std::env::set_var(SHIM_PATH_ENV, env!("CARGO_BIN_EXE_sid-ralph-shim"));
+            std::env::set_var(SHIM_PATH_ENV, env!("CARGO_BIN_EXE_ralph"));
         }
     });
 }
@@ -50,6 +50,7 @@ fn options(name: &str, workspace: &Path) -> (RunnerOptions, PathBuf) {
             max_iters: None,
             budget_tokens: None,
             resume: false,
+            script_args: Vec::new(),
         },
         run_dir,
     )

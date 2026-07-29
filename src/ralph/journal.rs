@@ -288,11 +288,10 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    /// Render the single synthetic paste-style turn injected into the parent
-    /// transcript (§5).
-    pub fn parent_summary(&self, script: &str) -> String {
+    /// Render the human-readable end-of-run summary (§5).
+    pub fn summary(&self, script: &str) -> String {
         let mut out = String::new();
-        out.push_str(&format!("Ran /run {script} (run {}).\n", self.run_id));
+        out.push_str(&format!("Ran {script} (run {}).\n", self.run_id));
         let counts = if self.agent_counts.is_empty() {
             "no agent invocations".to_string()
         } else {
@@ -485,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_summary_matches_plan_shape() {
+    fn summary_matches_plan_shape() {
         let report = RunReport {
             run_id: "2026-06-10T14-22-07".to_string(),
             run_dir: PathBuf::from("/sessions/abc/runs/2026-06-10T14-22-07"),
@@ -497,8 +496,8 @@ mod tests {
             suggestions_entries: 3,
             interrupted: false,
         };
-        let text = report.parent_summary("ralph.sid");
-        assert!(text.starts_with("Ran /run ralph.sid (run 2026-06-10T14-22-07).\n"));
+        let text = report.summary("ralph.sid");
+        assert!(text.starts_with("Ran ralph.sid (run 2026-06-10T14-22-07).\n"));
         assert!(
             text.contains("Exit 0 after 4 iterations (2 fix, 2 task), judge passed soak 5/5.\n")
         );
@@ -508,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_summary_notes_interrupt() {
+    fn summary_notes_interrupt() {
         let report = RunReport {
             run_id: "r".to_string(),
             run_dir: PathBuf::from("/r"),
@@ -520,7 +519,7 @@ mod tests {
             suggestions_entries: 0,
             interrupted: true,
         };
-        let text = report.parent_summary("ralph.sid");
+        let text = report.summary("ralph.sid");
         assert!(text.contains("interrupted by SIGINT"));
         assert!(!text.contains("Final verdict"));
     }

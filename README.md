@@ -51,7 +51,7 @@ Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
 mode the process owns session state and emits accepted request markers, typed
 events, prompts, and terminal results instead of the human-oriented terminal UI.
 Requests are semantic operations such as user turns, agent switches,
-compaction, ralph runs, and config updates.  Raw mode is intended for
+compaction, and config updates.  Raw mode is intended for
 alternative frontends and local automation.
 Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
 of stdin/stdout.  `SPEC` is `tcp://HOST:PORT`, `vsock://CID:PORT` on Linux,
@@ -192,9 +192,6 @@ warning.
 : Connect the normal terminal UI to a reconnectable JSONL protocol server.
   `SPEC` accepts the same URL forms as `--listen`; for `vsock://PORT`,
   `vsock://any:PORT`, and `vsock://-1:PORT`, connect mode targets the host CID.
-  `/run SCRIPT.sid` and `! SCRIPT` execute in the listening server's session,
-  resolving scripts against the server workspace/config roots and streaming
-  ralph output back over the raw event stream.
   `--connect` is mutually exclusive with `--raw`, `--listen`, `--prompt`,
   `--resume`, and `--bash-debug`.
 
@@ -1042,30 +1039,41 @@ preserving `format` as the model-visible tool name.
 
 ralph - verified fixpoint loops
 
+## SYNOPSIS
+
+```text
+ralph SCRIPT [--max-iters N] [--budget TOKENS] [--resume RUN_ID] [--] [ARGS...]
+```
+
 ## DESCRIPTION
+
+`ralph` is a standalone interpreter for ralph scripts, usable directly or
+from a `#!/usr/bin/env ralph` shebang.  Scripts run against the agents
+configured under `${SID_HOME}`; runs journal under `.ralph/runs/` in the
+current workspace.
 
 `ralph.sid` runs a plan to completion: a shell loop runs `./ci`, hands
 failures to a fresh `fix` agent, and when CI passes asks a persistent
-`judge` — seeded with the conversation that launched it — whether the plan
-is done.  The judge must answer through a mandated `verdict` tool; its
-structured findings become the work order for a fresh `task` agent.  Exit
-codes carry the protocol: 0 done, 1 keep working, 3 a human is wanted,
-≥4 the machinery broke.  `--soak N` demands N consecutive passing verdicts;
-`--jury N` demands N independent ones.  Suggestions that don't block accrue
-in a per-run ledger and are triaged once at the end.  Everything streams to
-your terminal as if you were prompting by hand, and everything is journaled
-so `--resume` picks up where SIGINT left off.  When used through
-`sid --connect`, the run happens in the listening server process and streams
-through the reconnectable raw protocol, so reconnecting clients replay the
-accepted `/run` request and subsequent ralph events.
+`judge` whether the plan is done.  The judge must answer through a mandated
+`verdict` tool; its structured findings become the work order for a fresh
+`task` agent.  Exit codes carry the protocol: 0 done, 1 keep working, 3 a
+human is wanted, ≥4 the machinery broke.  `--soak N` demands N consecutive
+passing verdicts; `--jury N` demands N independent ones.  Suggestions that
+don't block accrue in a per-run ledger and are triaged once at the end.
+Everything streams to your terminal as if you were prompting by hand, and
+everything is journaled so `--resume` picks up where SIGINT left off.
+
+Scripts call `agent` and `judge` as ordinary shell commands — ralph wires
+them into the script's PATH as symlinks to itself — so pipes and
+redirections behave exactly like POSIX: `printf '%s' "$out" | agent fix
+"Make CI pass."`  Extra words after the script name become the script's
+positional parameters; use `--` before any that look like ralph flags.
 
 ## EXAMPLES
 
 ```console
-$ sid
-> Grill me about this feature, then stop before implementation.
-...design conversation...
-> /run ralph.sid --max-iters 25
+$ ralph ralph.sid --max-iters 25
+$ chmod +x ralph.sid && ./ralph.sid -- --flag-for-the-script
 ```
 
 ## SEE ALSO

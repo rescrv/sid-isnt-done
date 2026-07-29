@@ -1,6 +1,6 @@
-#!/usr/bin/env mxsh
+#!/usr/bin/env ralph
 # ralph.sid — verified fixpoint: ./ci is the verifier, the judge is the examiner.
-# Invoke:  /run ralph.sid [--max-iters N]
+# Invoke:  ralph ralph.sid [--max-iters N]
 # Vars:    PLAN (default PLAN.md), SOAK (default 3)
 
 PLAN=${PLAN:-PLAN.md}

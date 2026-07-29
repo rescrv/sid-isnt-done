@@ -1,5 +1,5 @@
-//! Argument parsing for the `agent` and `judge` builtins and the `/run`
-//! command.
+//! Argument parsing for the `agent` and `judge` builtins and the `ralph`
+//! command line.
 //!
 //! stdin is context, argv is instruction: both builtins accept a service name
 //! and an optional instruction string.  The judge additionally accepts
@@ -170,10 +170,11 @@ fn parse_count(flag: &str, value: &str) -> Result<u32, String> {
     Ok(count)
 }
 
-/// Parsed `/run SCRIPT.sid [--max-iters N] [--budget TOKENS] [--resume RUN_ID]`.
+/// Parsed `ralph SCRIPT [--max-iters N] [--budget TOKENS] [--resume RUN_ID] [-- ARGS...]`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunArgs {
-    /// Path to the script, relative to the workspace root.
+    /// Path to the script, resolved against the workspace then the
+    /// configuration root.
     pub script: String,
     /// Cap on agent invocations across the run.
     pub max_iters: Option<u64>,
@@ -181,21 +182,34 @@ pub struct RunArgs {
     pub budget: Option<u64>,
     /// Resume an interrupted run by id.
     pub resume: Option<String>,
+    /// Arguments for the script, exposed as positional parameters `$1`, `$2`, ….
+    pub script_args: Vec<String>,
 }
 
 impl RunArgs {
-    /// Parse the argument string following `/run`.
-    pub fn parse(rest: &str) -> Result<RunArgs, String> {
-        const USAGE: &str =
-            "usage: /run SCRIPT.sid [--max-iters N] [--budget TOKENS] [--resume RUN_ID]";
-        let tokens: Vec<&str> = rest.split_whitespace().collect();
+    /// Parse the `ralph` command line (excluding argv[0]).  Flags may appear
+    /// anywhere; the first positional is the script and later positionals are
+    /// passed through to it.  `--` stops flag parsing.
+    pub fn parse(args: &[String]) -> Result<RunArgs, String> {
+        const USAGE: &str = "usage: ralph SCRIPT [--max-iters N] [--budget TOKENS] [--resume RUN_ID] [--] [ARGS...]";
         let mut script = None;
         let mut max_iters = None;
         let mut budget = None;
         let mut resume = None;
-        let mut iter = tokens.iter().peekable();
+        let mut script_args = Vec::new();
+        let mut flags_done = false;
+        let mut iter = args.iter();
         while let Some(token) = iter.next() {
-            match *token {
+            if flags_done {
+                if script.is_none() {
+                    script = Some(token.clone());
+                } else {
+                    script_args.push(token.clone());
+                }
+                continue;
+            }
+            match token.as_str() {
+                "--" => flags_done = true,
                 "--max-iters" => {
                     let value = iter.next().ok_or("--max-iters requires a count")?;
                     max_iters = Some(parse_u64("--max-iters", value)?);
@@ -218,13 +232,13 @@ impl RunArgs {
                     resume = Some(other["--resume=".len()..].to_string());
                 }
                 other if other.starts_with("--") => {
-                    return Err(format!("unknown /run flag {other:?}\n{USAGE}"));
+                    return Err(format!("unknown ralph flag {other:?}\n{USAGE}"));
                 }
                 _ => {
                     if script.is_none() {
-                        script = Some(token.to_string());
+                        script = Some(token.clone());
                     } else {
-                        return Err(format!("too many arguments\n{USAGE}"));
+                        script_args.push(token.clone());
                     }
                 }
             }
@@ -235,6 +249,7 @@ impl RunArgs {
             max_iters,
             budget,
             resume,
+            script_args,
         })
     }
 }
@@ -348,24 +363,59 @@ mod tests {
 
     #[test]
     fn run_args_parse() {
-        let parsed = RunArgs::parse("ralph.sid --max-iters 25 --budget 1000000").unwrap();
+        let parsed = RunArgs::parse(&strings(&[
+            "ralph.sid",
+            "--max-iters",
+            "25",
+            "--budget",
+            "1000000",
+        ]))
+        .unwrap();
         assert_eq!(parsed.script, "ralph.sid");
         assert_eq!(parsed.max_iters, Some(25));
         assert_eq!(parsed.budget, Some(1_000_000));
         assert_eq!(parsed.resume, None);
+        assert!(parsed.script_args.is_empty());
     }
 
     #[test]
     fn run_args_resume_equals_form() {
-        let parsed = RunArgs::parse("ralph.sid --resume=2026-06-10T14-22-07").unwrap();
+        let parsed =
+            RunArgs::parse(&strings(&["ralph.sid", "--resume=2026-06-10T14-22-07"])).unwrap();
         assert_eq!(parsed.resume.as_deref(), Some("2026-06-10T14-22-07"));
     }
 
     #[test]
+    fn run_args_collects_script_args() {
+        let parsed =
+            RunArgs::parse(&strings(&["ralph.sid", "PLAN.md", "--max-iters", "5"])).unwrap();
+        assert_eq!(parsed.script, "ralph.sid");
+        assert_eq!(parsed.max_iters, Some(5));
+        assert_eq!(parsed.script_args, vec!["PLAN.md".to_string()]);
+    }
+
+    #[test]
+    fn run_args_double_dash_stops_flag_parsing() {
+        let parsed = RunArgs::parse(&strings(&["ralph.sid", "--", "--max-iters", "5"])).unwrap();
+        assert_eq!(parsed.script, "ralph.sid");
+        assert_eq!(parsed.max_iters, None);
+        assert_eq!(
+            parsed.script_args,
+            vec!["--max-iters".to_string(), "5".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_args_double_dash_still_yields_script() {
+        let parsed = RunArgs::parse(&strings(&["--", "ralph.sid", "arg"])).unwrap();
+        assert_eq!(parsed.script, "ralph.sid");
+        assert_eq!(parsed.script_args, vec!["arg".to_string()]);
+    }
+
+    #[test]
     fn run_args_require_script() {
-        assert!(RunArgs::parse("").is_err());
-        assert!(RunArgs::parse("--max-iters 3").is_err());
-        assert!(RunArgs::parse("a.sid b.sid").is_err());
-        assert!(RunArgs::parse("a.sid --frobnicate").is_err());
+        assert!(RunArgs::parse(&strings(&[])).is_err());
+        assert!(RunArgs::parse(&strings(&["--max-iters", "3"])).is_err());
+        assert!(RunArgs::parse(&strings(&["a.sid", "--frobnicate"])).is_err());
     }
 }

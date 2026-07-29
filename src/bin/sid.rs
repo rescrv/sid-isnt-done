@@ -36,16 +36,7 @@ use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 use sid_isnt_done::config::{
     AGENTS_CONF_FILE, AnthropicConfig, COMPACTION_PROMPT_ID, Config as SidConfig, TOOLS_CONF_FILE,
 };
-use sid_isnt_done::ralph::args::RunArgs;
-use sid_isnt_done::ralph::host::{RalphRendererFactory, SidRalphHost};
-use sid_isnt_done::ralph::journal::{RunReport, generate_run_id};
-use sid_isnt_done::ralph::runner::{
-    RunnerOptions, ScriptOutputSink, run_ralph, run_ralph_with_output,
-};
-use sid_isnt_done::raw_mode::{
-    RawEventRenderer, RawInput, RawScriptOutputSink, RawServer, RawToolOutputObserver,
-    RawUsageReportObserver, SharedOutput,
-};
+use sid_isnt_done::raw_mode::{RawInput, RawServer, RawToolOutputObserver, RawUsageReportObserver};
 use sid_isnt_done::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawEvent, RawHello, RawPrompt, RawRequest, RawRequestEnvelope,
     RawResultEnvelope, RawServerMessage, install_tool_output_observer,
@@ -701,10 +692,6 @@ enum SidCommand {
     AgentList,
     SwitchAgent(String),
     Compact,
-    /// `/run SCRIPT.sid [--max-iters N] [--budget TOKENS] [--resume RUN_ID]`
-    Run(RunArgs),
-    /// `! <script text>` — inline mxsh with `agent`/`judge` bound.
-    Bang(String),
     Invalid(String),
 }
 
@@ -1298,250 +1285,6 @@ impl SidRuntimeSession {
             new_session_id: next_sid_session.id().to_string(),
             new_session_root: next_sid_session.root().display().to_string(),
         })
-    }
-
-    /// `/run SCRIPT.sid [--max-iters N] [--budget TOKENS] [--resume RUN_ID]`:
-    /// run a script file through the ralph runner.
-    async fn run_ralph_file(
-        &mut self,
-        args: RunArgs,
-        interrupted: Arc<AtomicBool>,
-    ) -> Result<String, SError> {
-        let script_path = self.resolve_ralph_script(&args.script)?;
-        let script_text = std::fs::read_to_string(&script_path).map_err(|err| {
-            cli_error("ralph_script_unreadable", "failed to read /run script")
-                .with_string_field("path", &script_path.display().to_string())
-                .with_string_field("cause", &err.to_string())
-        })?;
-        self.ralph_run_script(
-            args.script.clone(),
-            script_text,
-            args.max_iters,
-            args.budget,
-            args.resume,
-            interrupted,
-        )
-        .await
-    }
-
-    /// `! <script text>`: run inline mxsh with `agent`/`judge` bound.
-    async fn run_ralph_inline(
-        &mut self,
-        script: String,
-        interrupted: Arc<AtomicBool>,
-    ) -> Result<String, SError> {
-        self.ralph_run_script("!".to_string(), script, None, None, None, interrupted)
-            .await
-    }
-
-    /// Resolve a `/run` script: absolute paths as-is, otherwise relative to
-    /// the workspace root, then to the configuration root (where sid-init
-    /// installs the reference `ralph.sid`).
-    fn resolve_ralph_script(&self, script: &str) -> Result<std::path::PathBuf, SError> {
-        let raw = std::path::PathBuf::from(script);
-        let candidates = if raw.is_absolute() {
-            vec![raw]
-        } else {
-            vec![
-                std::path::PathBuf::from(self.workspace_root.as_str()).join(script),
-                std::path::PathBuf::from(self.config_root.as_str()).join(script),
-            ]
-        };
-        for candidate in &candidates {
-            if candidate.is_file() {
-                return Ok(candidate.clone());
-            }
-        }
-        Err(cli_error("ralph_script_missing", "no such /run script")
-            .with_string_field("script", script))
-    }
-
-    /// Drive one ralph run end to end: journal, script, report, and the
-    /// single synthetic paste-style turn injected into this transcript.
-    async fn ralph_run_script(
-        &mut self,
-        script_label: String,
-        script_text: String,
-        max_iters: Option<u64>,
-        budget: Option<u64>,
-        resume: Option<String>,
-        interrupted: Arc<AtomicBool>,
-    ) -> Result<String, SError> {
-        let (host, options) =
-            self.prepare_ralph_run(max_iters, budget, resume, interrupted.clone())?;
-        let report: RunReport = tokio::task::spawn_blocking(move || {
-            run_ralph(Box::new(host), options, &script_text, &[], interrupted)
-        })
-        .await
-        .map_err(|err| {
-            cli_error("ralph_join_failed", "ralph runner thread panicked")
-                .with_string_field("cause", &err.to_string())
-        })?
-        .map_err(|err| {
-            cli_error("ralph_run_failed", "ralph run failed").with_string_field("cause", &err)
-        })?;
-
-        let (summary, _) = self.record_ralph_report(&script_label, report)?;
-        Ok(summary)
-    }
-
-    async fn run_ralph_file_raw<R, W>(
-        &mut self,
-        args: RunArgs,
-        request_id: String,
-        server: &RawServer<R, W>,
-    ) -> Result<Value, SError>
-    where
-        R: RawInput,
-        W: Write + Send + 'static,
-    {
-        let script_path = self.resolve_ralph_script(&args.script)?;
-        let script_text = std::fs::read_to_string(&script_path).map_err(|err| {
-            cli_error("ralph_script_unreadable", "failed to read /run script")
-                .with_string_field("path", &script_path.display().to_string())
-                .with_string_field("cause", &err.to_string())
-        })?;
-        self.run_ralph_raw(
-            args.script,
-            script_text,
-            args.max_iters,
-            args.budget,
-            args.resume,
-            request_id,
-            server,
-        )
-        .await
-    }
-
-    async fn run_ralph_inline_raw<R, W>(
-        &mut self,
-        script: String,
-        request_id: String,
-        server: &RawServer<R, W>,
-    ) -> Result<Value, SError>
-    where
-        R: RawInput,
-        W: Write + Send + 'static,
-    {
-        self.run_ralph_raw(
-            "!".to_string(),
-            script,
-            None,
-            None,
-            None,
-            request_id,
-            server,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_ralph_raw<R, W>(
-        &mut self,
-        script_label: String,
-        script_text: String,
-        max_iters: Option<u64>,
-        budget: Option<u64>,
-        resume: Option<String>,
-        request_id: String,
-        server: &RawServer<R, W>,
-    ) -> Result<Value, SError>
-    where
-        R: RawInput,
-        W: Write + Send + 'static,
-    {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let (host, options) =
-            self.prepare_ralph_run(max_iters, budget, resume, interrupted.clone())?;
-        let renderer_factory = Arc::new(RawRalphRendererFactory {
-            output: server.output(),
-            request_id: request_id.clone(),
-        });
-        let host = host.with_renderer_factory(renderer_factory);
-        let tool_output_observer = Arc::new(RawToolOutputObserver::new(server.output()));
-        let _tool_output_observer = install_tool_output_observer(Some(tool_output_observer));
-        let output_sink: Arc<dyn ScriptOutputSink> =
-            Arc::new(RawScriptOutputSink::new(server.output(), request_id));
-        let run_interrupted = interrupted.clone();
-        let join = tokio::task::spawn_blocking(move || {
-            run_ralph_with_output(
-                Box::new(host),
-                options,
-                &script_text,
-                &[],
-                run_interrupted,
-                Some(output_sink),
-            )
-        });
-        let report = wait_for_raw_ralph(server, interrupted, join).await?;
-        let (summary, report) = self.record_ralph_report(&script_label, report)?;
-        Ok(ralph_report_json(&report, &summary))
-    }
-
-    fn prepare_ralph_run(
-        &mut self,
-        max_iters: Option<u64>,
-        budget: Option<u64>,
-        resume: Option<String>,
-        interrupted: Arc<AtomicBool>,
-    ) -> Result<(SidRalphHost, RunnerOptions), SError> {
-        let runs_root = self.sid_session.root().join("runs");
-        std::fs::create_dir_all(&runs_root).map_err(|err| {
-            cli_error("ralph_run_dir_failed", "failed to create runs directory")
-                .with_string_field("path", &runs_root.display().to_string())
-                .with_string_field("cause", &err.to_string())
-        })?;
-        let (run_id, resume_flag) = match resume {
-            Some(id) => {
-                if !runs_root.join(&id).is_dir() {
-                    return Err(cli_error("ralph_unknown_run", "no such run to --resume")
-                        .with_string_field("run_id", &id));
-                }
-                (id, true)
-            }
-            None => (generate_run_id(&runs_root), false),
-        };
-        let run_dir = runs_root.join(&run_id);
-
-        let host = SidRalphHost::new(
-            self.workspace_root.clone().into_owned(),
-            self.config_root.clone().into_owned(),
-            self.fallback_config.clone(),
-            run_dir.clone(),
-            self.chat.clone_messages(),
-            self.sid_session.id().to_string(),
-            tokio::runtime::Handle::current(),
-            interrupted.clone(),
-        );
-        let options = RunnerOptions {
-            run_id,
-            run_dir,
-            workspace_root: Some(std::path::PathBuf::from(self.workspace_root.as_str())),
-            max_iters,
-            budget_tokens: budget,
-            resume: resume_flag,
-        };
-        Ok((host, options))
-    }
-
-    fn record_ralph_report(
-        &mut self,
-        script_label: &str,
-        report: RunReport,
-    ) -> Result<(String, RunReport), SError> {
-        let summary = report.parent_summary(script_label);
-        self.inject_user_note(&summary)?;
-        Ok((summary, report))
-    }
-
-    /// Append one synthetic user-style turn to the transcript — as if the
-    /// operator pasted it — and persist.  The parent agent answers deeper
-    /// questions by `read`-ing the journal the note points at.
-    fn inject_user_note(&mut self, text: &str) -> Result<(), SError> {
-        let mut messages = self.chat.clone_messages();
-        messages.push(claudius::MessageParam::user(text));
-        self.chat.replace_messages(messages);
-        self.persist_transcript()
     }
 
     fn roll_up_current_stats(&mut self) {
@@ -2157,18 +1900,6 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                             ),
                             Err(err) => terminal.print_error(&context, &err.to_string()),
                         },
-                        SidCommand::Run(args) => {
-                            match session.run_ralph_file(args, interrupted.clone()).await {
-                                Ok(report) => terminal.print_info(&context, &report),
-                                Err(err) => terminal.print_error(&context, &err.to_string()),
-                            }
-                        }
-                        SidCommand::Bang(script) => {
-                            match session.run_ralph_inline(script, interrupted.clone()).await {
-                                Ok(report) => terminal.print_info(&context, &report),
-                                Err(err) => terminal.print_error(&context, &err.to_string()),
-                            }
-                        }
                         SidCommand::Invalid(message) => {
                             terminal.print_error(&context, &message);
                         }
@@ -2635,29 +2366,6 @@ impl RawTerminalClient {
                             json_str(&data, "new_session_root").unwrap_or("?")
                         ),
                     );
-                }
-            }
-            SidCommand::Run(args) => {
-                if let Some(data) = self.send_request_data(
-                    "ralph",
-                    RawRequest::RunRalphFile {
-                        script: args.script,
-                        max_iters: args.max_iters,
-                        budget: args.budget,
-                        resume: args.resume,
-                    },
-                    terminal,
-                )? {
-                    print_remote_ralph_report(&data, terminal);
-                }
-            }
-            SidCommand::Bang(script) => {
-                if let Some(data) = self.send_request_data(
-                    "ralph",
-                    RawRequest::RunRalphInline { script },
-                    terminal,
-                )? {
-                    print_remote_ralph_report(&data, terminal);
                 }
             }
             SidCommand::Invalid(message) => {
@@ -3154,33 +2862,6 @@ impl Drop for RawInterruptWatcher {
     }
 }
 
-struct RawRalphRendererFactory<W>
-where
-    W: Write + Send + 'static,
-{
-    output: SharedOutput<W>,
-    request_id: String,
-}
-
-impl<W> RalphRendererFactory for RawRalphRendererFactory<W>
-where
-    W: Write + Send + 'static,
-{
-    fn renderer(
-        &self,
-        label: &str,
-        _use_color: bool,
-        interrupted: Arc<AtomicBool>,
-    ) -> Box<dyn Renderer + Send + 'static> {
-        Box::new(RawEventRenderer::new(
-            self.output.clone(),
-            self.request_id.clone(),
-            label.to_string(),
-            interrupted,
-        ))
-    }
-}
-
 struct RemoteStreamContext {
     label: Option<String>,
     depth: usize,
@@ -3360,14 +3041,6 @@ fn raw_result_message(result: &RawResultEnvelope) -> String {
 
 fn parse_sid_command(input: &str) -> Option<SidCommand> {
     let input = input.trim();
-    if let Some(script) = input.strip_prefix('!') {
-        let script = script.trim();
-        return Some(if script.is_empty() {
-            SidCommand::Invalid("! requires a script, e.g. `! echo hello`".to_string())
-        } else {
-            SidCommand::Bang(script.to_string())
-        });
-    }
     if !input.starts_with('/') {
         return None;
     }
@@ -3375,12 +3048,6 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
     let mut parts = input[1..].splitn(2, ' ');
     let command = parts.next()?.to_ascii_lowercase();
     let argument = parts.next().map(str::trim).filter(|s| !s.is_empty());
-    if command == "run" {
-        return Some(match RunArgs::parse(argument.unwrap_or_default()) {
-            Ok(args) => SidCommand::Run(args),
-            Err(err) => SidCommand::Invalid(err),
-        });
-    }
     if command == "compact" {
         return if argument.is_some() {
             Some(SidCommand::Invalid(
@@ -3430,10 +3097,6 @@ fn print_help() {
     println!("      /agent                Show the current agent");
     println!("      /agent list           List configured agents");
     println!("      /agent switch <name>  Switch to another agent in this session");
-    println!(
-        "      /run <script>.sid     Run a ralph fixpoint script [--max-iters N] [--budget TOKENS] [--resume RUN_ID]"
-    );
-    println!("      ! <script>            Run inline mxsh with agent/judge builtins bound");
 }
 
 fn load_agent_summaries(
@@ -3602,85 +3265,6 @@ enum RequestDisposition {
     Shutdown(Option<Value>),
 }
 
-async fn wait_for_raw_ralph<R, W>(
-    server: &RawServer<R, W>,
-    interrupted: Arc<AtomicBool>,
-    join: tokio::task::JoinHandle<Result<RunReport, String>>,
-) -> Result<RunReport, SError>
-where
-    R: RawInput,
-    W: Write + Send + 'static,
-{
-    while !join.is_finished() {
-        while let Some(request) = server
-            .try_read_request()
-            .map_err(|err| raw_io_error("failed to poll raw request", &err))?
-        {
-            handle_busy_raw_request(server, &interrupted, request)?;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    join.await
-        .map_err(|err| {
-            cli_error("ralph_join_failed", "ralph runner thread panicked")
-                .with_string_field("cause", &err.to_string())
-        })?
-        .map_err(|err| {
-            cli_error("ralph_run_failed", "ralph run failed").with_string_field("cause", &err)
-        })
-}
-
-fn handle_busy_raw_request<R, W>(
-    server: &RawServer<R, W>,
-    interrupted: &Arc<AtomicBool>,
-    request: Result<RawRequestEnvelope, sid_isnt_done::raw_mode::ParsedRequestError>,
-) -> Result<(), SError>
-where
-    R: RawInput,
-    W: Write + Send + 'static,
-{
-    let request = match request {
-        Ok(request) => request,
-        Err(err) => {
-            server
-                .write_error_result(&err.request_id, err.code.as_deref(), &err.message)
-                .map_err(|io_err| raw_io_error("failed to write raw parse error", &io_err))?;
-            return Ok(());
-        }
-    };
-    if request.protocol_version != RAW_PROTOCOL_VERSION {
-        server
-            .write_error_result(
-                &request.request_id,
-                Some("unsupported_protocol_version"),
-                &format!(
-                    "unsupported raw protocol version {}",
-                    request.protocol_version
-                ),
-            )
-            .map_err(|err| raw_io_error("failed to write raw protocol error", &err))?;
-        return Ok(());
-    }
-    match request.request {
-        RawRequest::Interrupt => {
-            interrupted.store(true, Ordering::Relaxed);
-            server
-                .write_ok_result(&request.request_id, None)
-                .map_err(|err| raw_io_error("failed to write raw interrupt result", &err))?;
-        }
-        _ => {
-            server
-                .write_error_result(
-                    &request.request_id,
-                    Some("busy"),
-                    "server is busy running ralph",
-                )
-                .map_err(|err| raw_io_error("failed to write raw busy error", &err))?;
-        }
-    }
-    Ok(())
-}
-
 async fn handle_raw_request<R, W>(
     session: &mut SidRuntimeSession,
     server: &mut RawServer<R, W>,
@@ -3752,32 +3336,6 @@ where
                 "new_session_root": result.new_session_root,
                 "current_agent": session.current_agent_id(),
             }))))
-        }
-        RawRequest::RunRalphFile {
-            script,
-            max_iters,
-            budget,
-            resume,
-        } => {
-            let data = session
-                .run_ralph_file_raw(
-                    RunArgs {
-                        script,
-                        max_iters,
-                        budget,
-                        resume,
-                    },
-                    request.request_id,
-                    server,
-                )
-                .await?;
-            Ok(RequestDisposition::Continue(Some(data)))
-        }
-        RawRequest::RunRalphInline { script } => {
-            let data = session
-                .run_ralph_inline_raw(script, request.request_id, server)
-                .await?;
-            Ok(RequestDisposition::Continue(Some(data)))
         }
         RawRequest::Clear => {
             session.clear()?;
@@ -3918,31 +3476,6 @@ fn session_identity_json(session: &SidRuntimeSession) -> Value {
     })
 }
 
-fn ralph_report_json(report: &RunReport, summary: &str) -> Value {
-    json!({
-        "summary": summary,
-        "run_id": &report.run_id,
-        "run_dir": report.run_dir.display().to_string(),
-        "exit": report.exit,
-        "iterations": report.iterations,
-        "agent_counts": report
-            .agent_counts
-            .iter()
-            .map(|(service, count)| json!({
-                "service": service,
-                "count": count,
-            }))
-            .collect::<Vec<_>>(),
-        "final_verdict_summary": &report.final_verdict_summary,
-        "final_soak": report.final_soak.map(|(passes, target)| json!({
-            "passes": passes,
-            "target": target,
-        })),
-        "suggestions_entries": report.suggestions_entries,
-        "interrupted": report.interrupted,
-    })
-}
-
 fn stats_json(stats: &SessionStats) -> Value {
     json!({
         "model": stats.model.to_string(),
@@ -4072,13 +3605,6 @@ fn print_remote_agent_list(data: &Value) {
             line.push_str(&format!(" - {description}"));
         }
         println!("{line}");
-    }
-}
-
-fn print_remote_ralph_report(data: &Value, terminal: &mut SidTerminal) {
-    match json_str(data, "summary") {
-        Some(summary) => terminal.print_info(&(), summary),
-        None => terminal.print_info(&(), "ralph run completed"),
     }
 }
 
@@ -4595,7 +4121,7 @@ fn invoke_external_editor() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer, RunArgs,
+        AgentSummary, AgentSwitchResult, DEFAULT_SYSTEM_PROMPT, QuietRenderer,
         SANDBOX_UNAVAILABLE_WARNING, SidArgs, SidCommand, SidRuntimeSession, SidTerminal,
         SpendTurnClamp, SwitchPosition, build_anthropic_client, dollars_to_micro_cents,
         handle_raw_request, history_entry, parse_confirmation, parse_history_file,
@@ -4612,7 +4138,6 @@ mod tests {
     use serde::Deserialize;
     use serde_json::json;
     use sid_isnt_done::config::AnthropicConfig;
-    use sid_isnt_done::ralph::runner::SHIM_PATH_ENV;
     use sid_isnt_done::raw_mode::RawServer;
     use sid_isnt_done::raw_protocol::{RAW_PROTOCOL_VERSION, RawRequest, RawRequestEnvelope};
     use sid_isnt_done::{SidAgent, append_resumed_bash_reset_marker, session::SidSession};
@@ -4972,46 +4497,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ralph_commands() {
-        assert_eq!(
-            parse_sid_command("/run ralph.sid --max-iters 25"),
-            Some(SidCommand::Run(RunArgs {
-                script: "ralph.sid".to_string(),
-                max_iters: Some(25),
-                budget: None,
-                resume: None,
-            }))
-        );
-        assert_eq!(
-            parse_sid_command("/run ralph.sid --resume 2026-06-10T14-22-07 --budget 1000"),
-            Some(SidCommand::Run(RunArgs {
-                script: "ralph.sid".to_string(),
-                max_iters: None,
-                budget: Some(1000),
-                resume: Some("2026-06-10T14-22-07".to_string()),
-            }))
-        );
-        assert!(matches!(
-            parse_sid_command("/run"),
-            Some(SidCommand::Invalid(_))
-        ));
-        assert!(matches!(
-            parse_sid_command("/run a.sid --frobnicate"),
-            Some(SidCommand::Invalid(_))
-        ));
-        assert_eq!(
-            parse_sid_command("! echo hello"),
-            Some(SidCommand::Bang("echo hello".to_string()))
-        );
-        assert_eq!(
-            parse_sid_command("!echo hello"),
-            Some(SidCommand::Bang("echo hello".to_string()))
-        );
-        assert!(matches!(
-            parse_sid_command("!"),
-            Some(SidCommand::Invalid(_))
-        ));
-        // Ordinary chat lines are untouched.
+    fn parse_chat_lines_are_untouched() {
         assert_eq!(parse_sid_command("hello there"), None);
     }
 
@@ -5324,68 +4810,6 @@ mod tests {
         );
         assert_eq!(stats["spend_used_micro_cents"].as_u64(), Some(0));
 
-        fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn raw_ralph_inline_runs_server_side_and_records_summary() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-        let _guard = ENV_LOCK.lock().await;
-        let root = unique_workspace_root("raw-ralph-inline");
-        let shim = root.join("sid-ralph-shim");
-        fs::write(shim.as_str(), "#!/bin/sh\nexit 99\n").unwrap();
-        let previous_shim = std::env::var_os(SHIM_PATH_ENV);
-        // SAFETY: this test serializes all mutations of this process-global
-        // environment variable with ENV_LOCK and restores it before releasing.
-        unsafe {
-            std::env::set_var(SHIM_PATH_ENV, shim.as_str());
-        }
-
-        let sid_session = test_sid_session(&root);
-        let mut session = new_runtime_session(&root, &root, sid_session, None);
-        let mut server = RawServer::new(BufReader::new(Cursor::new(Vec::new())), Vec::new());
-
-        let data = match handle_raw_request(
-            &mut session,
-            &mut server,
-            RawRequestEnvelope {
-                protocol_version: RAW_PROTOCOL_VERSION,
-                request_id: "ralph-inline".to_string(),
-                request: RawRequest::RunRalphInline {
-                    script: "echo raw hello".to_string(),
-                },
-            },
-        )
-        .await
-        .unwrap()
-        {
-            super::RequestDisposition::Continue(Some(data)) => data,
-            _ => panic!("unexpected raw disposition"),
-        };
-
-        assert_eq!(data["exit"].as_i64(), Some(0));
-        assert_eq!(data["iterations"].as_u64(), Some(0));
-        assert!(
-            data["summary"].as_str().unwrap().contains("Ran /run !"),
-            "summary: {}",
-            data["summary"]
-        );
-        assert!(
-            session
-                .clone_messages()
-                .iter()
-                .any(|message| format!("{message:?}").contains("Ran /run !")),
-            "expected ralph summary injected into parent transcript"
-        );
-        match previous_shim {
-            Some(value) => unsafe {
-                std::env::set_var(SHIM_PATH_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(SHIM_PATH_ENV);
-            },
-        }
         fs::remove_dir_all(PathBuf::from(root.as_str())).unwrap();
     }
 

@@ -7,11 +7,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use claudius::{OperatorLine, Renderer, StopReason, StreamContext};
 
-use crate::ralph::runner::ScriptOutputSink;
 use crate::raw_protocol::{
     RAW_PROTOCOL_VERSION, RawAcceptedRequest, RawEvent, RawEventEnvelope, RawPrompt, RawPromptAck,
     RawRequest, RawRequestEnvelope, RawResultEnvelope, RawServerError, RawServerMessage,
@@ -492,188 +489,6 @@ where
     }
 }
 
-/// A renderer that writes model stream events to a raw JSONL output sink.
-///
-/// Unlike [`RawServer`], this renderer does not own request input.  It is used
-/// by work running on helper threads, where a separate owner polls the raw
-/// input and flips the shared interrupt flag.
-pub struct RawEventRenderer<W>
-where
-    W: Write + Send + 'static,
-{
-    output: SharedOutput<W>,
-    request_id: String,
-    label: String,
-    interrupted: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl<W> RawEventRenderer<W>
-where
-    W: Write + Send + 'static,
-{
-    /// Create a renderer for events associated with `request_id`.
-    pub fn new(
-        output: SharedOutput<W>,
-        request_id: impl Into<String>,
-        label: impl Into<String>,
-        interrupted: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self {
-            output,
-            request_id: request_id.into(),
-            label: label.into(),
-            interrupted,
-        }
-    }
-
-    fn emit_event(&self, event: RawEvent) {
-        let _ = self
-            .output
-            .write_message(&RawServerMessage::Event(RawEventEnvelope {
-                protocol_version: RAW_PROTOCOL_VERSION,
-                sequence: 0,
-                request_id: self.request_id.clone(),
-                event,
-            }));
-    }
-
-    fn label(&self, context: &dyn StreamContext) -> Option<String> {
-        context
-            .label()
-            .map(str::to_string)
-            .or_else(|| Some(self.label.clone()))
-    }
-}
-
-impl<W> Renderer for RawEventRenderer<W>
-where
-    W: Write + Send + 'static,
-{
-    fn start_agent(&mut self, context: &dyn StreamContext) {
-        self.emit_event(RawEvent::AgentStart {
-            label: self.label(context),
-            depth: context.depth(),
-        });
-    }
-
-    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
-        self.emit_event(RawEvent::AgentFinish {
-            label: self.label(context),
-            depth: context.depth(),
-            stop_reason: stop_reason.map(|reason| format!("{reason:?}")),
-        });
-    }
-
-    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
-        self.emit_event(RawEvent::AssistantTextDelta {
-            label: self.label(context),
-            depth: context.depth(),
-            text: text.to_string(),
-        });
-    }
-
-    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
-        self.emit_event(RawEvent::ThinkingDelta {
-            label: self.label(context),
-            depth: context.depth(),
-            text: text.to_string(),
-        });
-    }
-
-    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
-        self.emit_event(RawEvent::Error {
-            label: self.label(context),
-            depth: context.depth(),
-            message: error.to_string(),
-        });
-    }
-
-    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
-        self.emit_event(RawEvent::Info {
-            label: self.label(context),
-            depth: context.depth(),
-            message: info.to_string(),
-        });
-    }
-
-    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
-        self.emit_event(RawEvent::ToolUseStart {
-            label: self.label(context),
-            depth: context.depth(),
-            name: name.to_string(),
-            tool_use_id: id.to_string(),
-        });
-    }
-
-    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
-        self.emit_event(RawEvent::ToolInputDelta {
-            label: self.label(context),
-            depth: context.depth(),
-            partial_json: partial_json.to_string(),
-        });
-    }
-
-    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
-        self.emit_event(RawEvent::ToolUseEnd {
-            label: self.label(context),
-            depth: context.depth(),
-        });
-    }
-
-    fn start_tool_result(
-        &mut self,
-        context: &dyn StreamContext,
-        tool_use_id: &str,
-        is_error: bool,
-    ) {
-        self.emit_event(RawEvent::ToolResultStart {
-            label: self.label(context),
-            depth: context.depth(),
-            tool_use_id: tool_use_id.to_string(),
-            is_error,
-        });
-    }
-
-    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
-        self.emit_event(RawEvent::ToolResultTextDelta {
-            label: self.label(context),
-            depth: context.depth(),
-            text: text.to_string(),
-        });
-    }
-
-    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
-        self.emit_event(RawEvent::ToolResultEnd {
-            label: self.label(context),
-            depth: context.depth(),
-        });
-    }
-
-    fn finish_response(&mut self, context: &dyn StreamContext) {
-        self.emit_event(RawEvent::ResponseFinish {
-            label: self.label(context),
-            depth: context.depth(),
-        });
-    }
-
-    fn print_interrupted(&mut self, context: &dyn StreamContext) {
-        self.emit_event(RawEvent::Interrupted {
-            label: self.label(context),
-            depth: context.depth(),
-        });
-    }
-
-    fn should_interrupt(&self) -> bool {
-        self.interrupted.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn read_operator_line(&mut self, _prompt: &str) -> io::Result<Option<OperatorLine>> {
-        // Ralph child-session renderers do not own operator input; the raw
-        // request owner handles top-level prompts.
-        Ok(None)
-    }
-}
-
 /// Tool-output observer that forwards chunks onto the raw JSONL stream.
 pub struct RawToolOutputObserver<W>
 where
@@ -709,54 +524,6 @@ where
                     stream: event.stream.clone(),
                     text: event.text.clone(),
                     data_b64: event.data_b64.clone(),
-                },
-            }));
-    }
-}
-
-/// Sink that forwards ralph shell stdout/stderr onto the raw JSONL stream.
-pub struct RawScriptOutputSink<W>
-where
-    W: Write + Send + 'static,
-{
-    output: SharedOutput<W>,
-    request_id: String,
-}
-
-impl<W> RawScriptOutputSink<W>
-where
-    W: Write + Send + 'static,
-{
-    /// Create a script-output sink associated with `request_id`.
-    pub fn new(output: SharedOutput<W>, request_id: impl Into<String>) -> Self {
-        Self {
-            output,
-            request_id: request_id.into(),
-        }
-    }
-}
-
-impl<W> ScriptOutputSink for RawScriptOutputSink<W>
-where
-    W: Write + Send + 'static,
-{
-    fn on_script_output(&self, stream: &str, data: &[u8]) {
-        let (text, data_b64) = match std::str::from_utf8(data) {
-            Ok(text) => (Some(text.to_string()), None),
-            Err(_) => (None, Some(BASE64_STANDARD.encode(data))),
-        };
-        let _ = self
-            .output
-            .write_message(&RawServerMessage::Event(RawEventEnvelope {
-                protocol_version: RAW_PROTOCOL_VERSION,
-                sequence: 0,
-                request_id: self.request_id.clone(),
-                event: RawEvent::ToolOutput {
-                    tool_name: "ralph".to_string(),
-                    tool_use_id: "ralph-script".to_string(),
-                    stream: stream.to_string(),
-                    text,
-                    data_b64,
                 },
             }));
     }
@@ -961,31 +728,6 @@ mod tests {
         assert_eq!(value["request_id"], "turn-1");
         assert_eq!(value["op"], "user_turn");
         assert_eq!(value["text"], "hello replay");
-    }
-
-    #[test]
-    fn write_accepted_request_emits_ralph_marker() {
-        let input = BufReader::new([].as_slice());
-        let output = Vec::new();
-        let server = RawServer::new(input, output);
-        server
-            .write_accepted_request(&RawRequestEnvelope {
-                protocol_version: RAW_PROTOCOL_VERSION,
-                request_id: "ralph-1".to_string(),
-                request: RawRequest::RunRalphInline {
-                    script: "echo done".to_string(),
-                },
-            })
-            .unwrap();
-
-        let text = server
-            .output
-            .with_writer(|writer| String::from_utf8_lossy(writer).into_owned());
-        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(value["type"], "request");
-        assert_eq!(value["request_id"], "ralph-1");
-        assert_eq!(value["op"], "run_ralph_inline");
-        assert_eq!(value["script"], "echo done");
     }
 
     #[test]
@@ -1396,41 +1138,6 @@ mod tests {
         assert_eq!(value["tool_use_id"], "tu-1");
         assert_eq!(value["stream"], "stdout");
         assert_eq!(value["text"], "hello\n");
-    }
-
-    #[test]
-    fn raw_script_output_sink_emits_tool_output_event() {
-        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
-        let sink = RawScriptOutputSink::new(output.clone(), "ralph-1");
-
-        ScriptOutputSink::on_script_output(&sink, "stderr", b"ralph says hi\n");
-
-        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
-        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(value["type"], "event");
-        assert_eq!(value["event"], "tool_output");
-        assert_eq!(value["request_id"], "ralph-1");
-        assert_eq!(value["tool_name"], "ralph");
-        assert_eq!(value["tool_use_id"], "ralph-script");
-        assert_eq!(value["stream"], "stderr");
-        assert_eq!(value["text"], "ralph says hi\n");
-    }
-
-    #[test]
-    fn raw_event_renderer_emits_labeled_text_event() {
-        let output: SharedOutput<Vec<u8>> = SharedOutput::new(Vec::new());
-        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut renderer = RawEventRenderer::new(output.clone(), "ralph-2", "fix", interrupted);
-
-        renderer.print_text(&(), "working");
-
-        let text = output.with_writer(|w| String::from_utf8_lossy(w).into_owned());
-        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(value["type"], "event");
-        assert_eq!(value["event"], "assistant_text_delta");
-        assert_eq!(value["request_id"], "ralph-2");
-        assert_eq!(value["label"], "fix");
-        assert_eq!(value["text"], "working");
     }
 
     #[test]

@@ -62,8 +62,8 @@ name = "sid-init"
 path = "src/bin/sid-init.rs"
 
 [[bin]]
-name = "sid-ralph-shim"
-path = "src/bin/sid-ralph-shim.rs"
+name = "ralph"
+path = "src/bin/ralph.rs"
 
 [[bin]]
 name = "sidiff"
