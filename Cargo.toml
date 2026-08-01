@@ -30,7 +30,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 arrrg = "^0.10"
 arrrg_derive = "^0.10"
 claudius = { version = "^0.33" }
-mxsh = { path = "../mxsh", default-features = false, features = ["embed", "unix-runtime", "test-support"] }
+mxsh = { path = "../mxsh/mxsh", default-features = false, features = ["embed", "unix-runtime"] }
 handled = { version = "^0.7" }
 rc_conf = { version = "^0.18", default-features = false }
 setsum = "^0.9"

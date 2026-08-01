@@ -1,6 +1,6 @@
 //! ralph — a verified fixpoint loop over sid agents.
 //!
-//! A mostly-POSIX shell (mxsh) is the orchestrator, with sid agents as
+//! A dash-exact POSIX shell (mxsh) is the orchestrator, with sid agents as
 //! subroutines; the `ralph` binary interprets scripts directly (usable from a
 //! `#!/usr/bin/env ralph` shebang).  The shell provides control flow and the
 //! exit-code protocol; the LLM appears in exactly two roles — repairer (when

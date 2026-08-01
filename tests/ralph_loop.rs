@@ -1,4 +1,4 @@
-//! End-to-end tests for the ralph runner: real embedded mxsh, the real
+//! End-to-end tests for the ralph runner: real embedded mxsh2, the real
 //! `ralph` shim on PATH, real pipes — and a scripted stub host instead of
 //! LLM inference.
 

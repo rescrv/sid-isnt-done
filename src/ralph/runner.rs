@@ -925,53 +925,145 @@ pub fn run_script_with_output(
         bin_dir.to_string_lossy(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let devnull =
-        fs::File::open("/dev/null").map_err(|err| format!("failed to open /dev/null: {err}"))?;
 
-    use std::os::fd::AsRawFd as _;
+    // mxsh wired the configured stdio stdin (here /dev/null) into every
+    // external child; mxsh leaves an unredirected, unpiped external
+    // command's stdin inherited from the host's fd 0.  The shims read stdin
+    // to EOF unconditionally, so host stdin must not leak into the script.
+    install_devnull_stdin();
+
     let mut output_handles = ScriptOutputHandles::new(output_sink.as_ref().map(Arc::clone))?;
+
+    // mxsh imported the host environment by default; mxsh starts empty, so
+    // pass the host env explicitly, then ralph's overrides (later entries
+    // win).  `./ci` and the shims see the same environment as before.
+    // Non-UTF-8 variables are skipped: the builder API takes Strings (and
+    // `std::env::vars()` would panic on them).
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(
+            |(key, value)| match (key.into_string(), value.into_string()) {
+                (Ok(key), Ok(value)) => Some((key, value)),
+                _ => None,
+            },
+        )
+        .collect();
+    env.push((
+        RUN_DIR_ENV.to_string(),
+        run_dir.to_string_lossy().into_owned(),
+    ));
+    env.push((RUN_ID_ENV.to_string(), run_id));
+    env.push((
+        CONTROL_DIR_ENV.to_string(),
+        control_dir.to_string_lossy().into_owned(),
+    ));
+    env.push(("PATH".to_string(), path));
+    for (key, value) in extra_env {
+        env.push((key.clone(), value.clone()));
+    }
+
     let mut builder = mxsh::ShellBuilder::new()
-        .shell_name("mxsh")
-        .env(
-            RUN_DIR_ENV,
-            run_dir.to_string_lossy(),
-            mxsh::embed::VariableAttributes::EXPORT,
-        )
-        .env(RUN_ID_ENV, &run_id, mxsh::embed::VariableAttributes::EXPORT)
-        .env(
-            CONTROL_DIR_ENV,
-            control_dir.to_string_lossy(),
-            mxsh::embed::VariableAttributes::EXPORT,
-        )
-        .env("PATH", path, mxsh::embed::VariableAttributes::EXPORT)
+        .identity(mxsh::policy::ShellIdentity {
+            name: "mxsh".to_string(),
+        })
+        .env(env)
         .stdio(mxsh::embed::StdioConfig {
-            stdin: mxsh::runtime::fd::FileDescriptor::new(devnull.as_raw_fd()),
+            stdin: mxsh::runtime::FileDescriptor::STDIN,
             stdout: output_handles.stdout_fd(),
             stderr: output_handles.stderr_fd(),
-        });
-    for (key, value) in extra_env {
-        builder = builder.env(key, value, mxsh::embed::VariableAttributes::EXPORT);
-    }
-    if !script_args.is_empty() {
-        builder = builder.positional_parameters(script_args.iter().cloned());
-    }
+        })
+        // mxsh wrote builtin output straight to the configured fds; mxsh
+        // buffers into the RunOutcome unless told to stream.
+        .stream_stdio(true);
     if let Some(workspace_root) = workspace_root.as_ref() {
         // Scripts run from the workspace root: `./ci` means the workspace's ci.
-        builder = builder.current_dir(workspace_root);
+        builder = builder.cwd(workspace_root);
     }
+    // SAFETY: ralph's host process is multi-threaded (the control server and
+    // output forwarders), which the POSIX fork-safety contract permits when
+    // the child calls only async-signal-safe functions before exec; mxsh's
+    // forked children run exactly such a trampoline and never touch host
+    // locks or the allocator.  This is the same in-process fork model the
+    // mxsh embed used.
+    let token = unsafe { mxsh::DirectForkModeToken::new() };
     let mut shell = builder
-        .build(mxsh::runtime::unix::UnixRuntime::new())
+        .build_with_runtime(mxsh::runtime::unix::UnixRuntime::new(), token)
         .map_err(|err| format!("failed to build shell: {err}"))?;
 
-    let outcome = shell.run(script_text);
+    // mxsh had a builder-level positional-parameter API; mxsh does not, so
+    // seed `$1..` with a `set --` prologue.  The session stays reusable, so
+    // the main script observes the parameters.
+    if !script_args.is_empty() {
+        let prologue = positional_prologue(&script_args);
+        let outcome = shell
+            .run(&prologue)
+            .map_err(|err| format!("failed to set positional parameters: {err}"))?;
+        if !outcome.status.is_success() {
+            return Err(format!(
+                "failed to set positional parameters: status {}",
+                outcome.status.code()
+            ));
+        }
+    }
+
+    let outcome = shell
+        .run(script_text)
+        .map_err(|err| format!("shell run failed: {err}"))?;
     drop(shell);
-    drop(devnull);
     output_handles.close();
 
     control_server.stop();
 
-    let status = outcome.exit_code.unwrap_or(outcome.status);
-    Ok(ScriptOutcome { status })
+    if outcome.is_not_implemented() {
+        let detail = outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "the script hit an unimplemented mxsh feature: {detail}"
+        ));
+    }
+    Ok(ScriptOutcome {
+        status: outcome.status.code(),
+    })
+}
+
+/// Point the process's fd 0 at /dev/null, once.  See the call site for why:
+/// mxsh inherits the host's fd 0 into external commands that neither pipe
+/// nor redirect stdin, and the ralph protocol expects script commands to see
+/// `/dev/null` there.  The ralph interpreter and its test harness never read
+/// their own stdin.
+fn install_devnull_stdin() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(devnull) = fs::File::open("/dev/null") else {
+            eprintln!("ralph: failed to open /dev/null; stdin left unchanged");
+            return;
+        };
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: dup2 atomically retargets fd 0 onto the /dev/null open file
+        // description; no aliasing or lifetime invariants are involved.
+        let rc = unsafe { libc::dup2(devnull.as_raw_fd(), 0) };
+        if rc < 0 {
+            eprintln!(
+                "ralph: failed to point stdin at /dev/null: {}",
+                io::Error::last_os_error()
+            );
+        }
+    });
+}
+
+/// Render `set -- ...` with each argument single-quoted (POSIX escaping:
+/// `'` becomes `'\''`), the byte-safe way to pass arbitrary argv through a
+/// shell script.
+fn positional_prologue(args: &[String]) -> String {
+    let quoted = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("set -- {quoted}")
 }
 
 struct ControlServerGuard {
@@ -1011,8 +1103,11 @@ impl Drop for ControlServerGuard {
 }
 
 struct ScriptOutputHandles {
-    stdout_fd: mxsh::runtime::fd::FileDescriptor,
-    stderr_fd: mxsh::runtime::fd::FileDescriptor,
+    // Write ends handed to the shell's stdio config; `OwnedFd` closes them on
+    // drop (mxsh's `FileDescriptor` is a non-owning numeric identity, so
+    // ownership stays here).
+    stdout_fd: Option<std::os::fd::OwnedFd>,
+    stderr_fd: Option<std::os::fd::OwnedFd>,
     forwarders: Vec<std::thread::JoinHandle<()>>,
     enabled: bool,
 }
@@ -1021,41 +1116,43 @@ impl ScriptOutputHandles {
     fn new(sink: Option<Arc<dyn ScriptOutputSink>>) -> Result<Self, String> {
         let Some(sink) = sink else {
             return Ok(Self {
-                stdout_fd: mxsh::runtime::fd::FileDescriptor::STDOUT,
-                stderr_fd: mxsh::runtime::fd::FileDescriptor::STDERR,
+                stdout_fd: None,
+                stderr_fd: None,
                 forwarders: Vec::new(),
                 enabled: false,
             });
         };
 
-        let stdout_pipe = mxsh::runtime::fd::OsPipe::new()
-            .map_err(|err| format!("failed to create ralph stdout pipe: {err}"))?;
-        let stderr_pipe = match mxsh::runtime::fd::OsPipe::new() {
-            Ok(pipe) => pipe,
-            Err(err) => {
-                stdout_pipe.read_fd.close();
-                stdout_pipe.write_fd.close();
-                return Err(format!("failed to create ralph stderr pipe: {err}"));
-            }
-        };
+        let (stdout_read, stdout_write) =
+            std::io::pipe().map_err(|err| format!("failed to create ralph stdout pipe: {err}"))?;
+        let (stderr_read, stderr_write) =
+            std::io::pipe().map_err(|err| format!("failed to create ralph stderr pipe: {err}"))?;
         let forwarders = vec![
-            spawn_script_output_forwarder(stdout_pipe.read_fd, "stdout", Arc::clone(&sink)),
-            spawn_script_output_forwarder(stderr_pipe.read_fd, "stderr", sink),
+            spawn_script_output_forwarder(stdout_read.into(), "stdout", Arc::clone(&sink)),
+            spawn_script_output_forwarder(stderr_read.into(), "stderr", sink),
         ];
         Ok(Self {
-            stdout_fd: stdout_pipe.write_fd,
-            stderr_fd: stderr_pipe.write_fd,
+            stdout_fd: Some(stdout_write.into()),
+            stderr_fd: Some(stderr_write.into()),
             forwarders,
             enabled: true,
         })
     }
 
-    fn stdout_fd(&self) -> mxsh::runtime::fd::FileDescriptor {
-        self.stdout_fd
+    fn stdout_fd(&self) -> mxsh::runtime::FileDescriptor {
+        use std::os::fd::AsRawFd as _;
+        match self.stdout_fd.as_ref() {
+            Some(fd) => mxsh::runtime::FileDescriptor(fd.as_raw_fd()),
+            None => mxsh::runtime::FileDescriptor::STDOUT,
+        }
     }
 
-    fn stderr_fd(&self) -> mxsh::runtime::fd::FileDescriptor {
-        self.stderr_fd
+    fn stderr_fd(&self) -> mxsh::runtime::FileDescriptor {
+        use std::os::fd::AsRawFd as _;
+        match self.stderr_fd.as_ref() {
+            Some(fd) => mxsh::runtime::FileDescriptor(fd.as_raw_fd()),
+            None => mxsh::runtime::FileDescriptor::STDERR,
+        }
     }
 
     fn close(&mut self) {
@@ -1063,8 +1160,9 @@ impl ScriptOutputHandles {
             return;
         }
         self.enabled = false;
-        self.stdout_fd.close();
-        self.stderr_fd.close();
+        // Dropping the write ends lets the forwarders read to EOF.
+        self.stdout_fd.take();
+        self.stderr_fd.take();
         for forwarder in self.forwarders.drain(..) {
             let _ = forwarder.join();
         }
@@ -1078,16 +1176,19 @@ impl Drop for ScriptOutputHandles {
 }
 
 fn spawn_script_output_forwarder(
-    fd: mxsh::runtime::fd::FileDescriptor,
+    fd: std::os::fd::OwnedFd,
     stream: &'static str,
     sink: Arc<dyn ScriptOutputSink>,
 ) -> std::thread::JoinHandle<()> {
+    use std::os::fd::AsRawFd as _;
     std::thread::spawn(move || {
         let mut chunk = [0u8; 4096];
         loop {
+            // SAFETY: `fd` is a live pipe read end owned by this thread; the
+            // buffer is valid for the full length passed.
             let n = unsafe {
                 libc::read(
-                    fd.into_raw_fd(),
+                    fd.as_raw_fd(),
                     chunk.as_mut_ptr() as *mut libc::c_void,
                     chunk.len(),
                 )
@@ -1104,7 +1205,7 @@ fn spawn_script_output_forwarder(
             }
             sink.on_script_output(stream, &chunk[..n as usize]);
         }
-        fd.close();
+        // The OwnedFd drops here, closing the read end.
     })
 }
 
