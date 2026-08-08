@@ -76,56 +76,6 @@ const INIT_FILES: &[InitFile] = &[
         executable: true,
     },
     InitFile {
-        path: "tools/git-diff",
-        contents: include_str!("../../init/tools/git-diff"),
-        executable: true,
-    },
-    InitFile {
-        path: "tools/git-diff.json",
-        contents: include_str!("../../init/tools/git-diff.json"),
-        executable: false,
-    },
-    InitFile {
-        path: "tools/git-status",
-        contents: include_str!("../../init/tools/git-status"),
-        executable: true,
-    },
-    InitFile {
-        path: "tools/git-status.json",
-        contents: include_str!("../../init/tools/git-status.json"),
-        executable: false,
-    },
-    InitFile {
-        path: "tools/glob",
-        contents: include_str!("../../init/tools/glob"),
-        executable: true,
-    },
-    InitFile {
-        path: "tools/glob.json",
-        contents: include_str!("../../init/tools/glob.json"),
-        executable: false,
-    },
-    InitFile {
-        path: "tools/read",
-        contents: include_str!("../../init/tools/read"),
-        executable: true,
-    },
-    InitFile {
-        path: "tools/read.json",
-        contents: include_str!("../../init/tools/read.json"),
-        executable: false,
-    },
-    InitFile {
-        path: "tools/search",
-        contents: include_str!("../../init/tools/search"),
-        executable: true,
-    },
-    InitFile {
-        path: "tools/search.json",
-        contents: include_str!("../../init/tools/search.json"),
-        executable: false,
-    },
-    InitFile {
         path: "tools/verdict",
         contents: include_str!("../../init/tools/verdict"),
         executable: true,
