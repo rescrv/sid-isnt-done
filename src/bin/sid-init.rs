@@ -16,6 +16,11 @@ const INIT_FILES: &[InitFile] = &[
         executable: false,
     },
     InitFile {
+        path: "models.conf",
+        contents: include_str!("../../init/models.conf"),
+        executable: false,
+    },
+    InitFile {
         path: "tools.conf",
         contents: include_str!("../../init/tools.conf"),
         executable: false,

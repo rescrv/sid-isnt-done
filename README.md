@@ -73,8 +73,8 @@ cargo install sid-isnt-done
 SID_HOME=~/.sid sid-init
 ```
 
-`sid-init` copies the bundled starter configuration (agents, tools, and
-prompts) into `SID_HOME`.  It requires `SID_HOME` to be set.  Files that
+`sid-init` copies the bundled starter configuration (agents, models, tools,
+and prompts) into `SID_HOME`.  It requires `SID_HOME` to be set.  Files that
 already exist are skipped, so it is safe to re-run after upgrading.
 
 Start a session:
@@ -118,13 +118,13 @@ cargo install --path .
 
 Interactive sessions use the Anthropic client from `claudius`.  Set
 `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`, or set
-per-agent `<agent>_API_KEY` in `agents.conf`.  Values that begin with
-`file://` are treated by `claudius` as paths to files containing the API key.
-A `file://` value naming a relative path is resolved against the directory
-containing `agents.conf`; absolute `file://` paths are used as-is.
-Set per-agent `<agent>_BASE_URL` in `agents.conf` to use an
-Anthropic-compatible endpoint; omit the `/v1` suffix because the client appends
-it to request URLs.
+per-agent `<agent>_API_KEY` in `agents.conf` or a selected model's
+`<model>_API_KEY` in `models.conf`.  Values that begin with `file://` are
+treated by `claudius` as paths to files containing the API key.  A `file://`
+value naming a relative path is resolved against the config directory; absolute
+`file://` paths are used as-is.  Set `<agent>_BASE_URL` or a selected model's
+`<model>_BASE_URL` to use an Anthropic-compatible endpoint; omit the `/v1`
+suffix because the client appends it to request URLs.
 
 macOS is the only platform where `sid` can use `/usr/bin/sandbox-exec`.  On
 other systems, or on macOS systems where that program is unavailable, `sid`
@@ -213,16 +213,22 @@ agent with `<agent>_MODEL`, or changed during a session with `/model MODEL`.
 Run `sid --help` to see the compiled default model.  Use `/help` inside a
 session to see the current chat commands.
 
-`sid` passes model names through to `claudius`; it does not maintain a separate
-registry of available model names.  Prefer provider documentation or the
-Anthropic models API for the current model list.
+Startup and runtime model overrides are passed through to `claudius`.  When
+optional `models.conf` exists, an agent's `<agent>_MODEL` first resolves as an
+enabled model service or alias from that file.  If it matches, `sid` absorbs
+that model's provider and chat defaults, then applies explicit agent fields as
+overrides.  If it does not match, the value remains a literal provider-facing
+model name.  If it names a known disabled, manual, or abstract model service,
+configuration loading fails instead of falling back.  Prefer provider
+documentation or the Anthropic models API for the current model list.
 
 ## CONFIGURATION
 
-Configuration uses two required files when configuration is present:
+Configuration uses two required files and one optional model file:
 
 ```text
 agents.conf
+models.conf  # optional
 tools.conf
 ```
 
@@ -235,6 +241,41 @@ The bundled starter configuration is in `init/`:
 ```sh
 SID_HOME=init sid
 ```
+
+## MODELS
+
+`models.conf` is an optional rc-conf file for reusable model presets.  Model
+services may use rc-conf aliases and inheritance.  A preset must be
+`ENABLED=YES` before an agent can select it; `NO`, `MANUAL`, or a missing
+`ENABLED` makes direct selection fail.  Disabled services can still be abstract
+bases for inherited provider settings.
+
+```sh
+anthropic_ENABLED="NO"
+anthropic_API_KEY="file://anthropic.key"
+anthropic_BASE_URL="https://api.anthropic.com"
+
+claude_opus_4_8_ENABLED="YES"
+claude_opus_4_8_INHERIT="YES"
+claude_opus_4_8_ALIASES="anthropic"
+claude_opus_4_8_MODEL="claude-opus-4-8"
+
+fireworks_ENABLED="NO"
+fireworks_API_KEY="file://fireworks.key"
+fireworks_BASE_URL="https://api.fireworks.ai/inference"
+
+glm_5p2_ENABLED="YES"
+glm_5p2_INHERIT="YES"
+glm_5p2_ALIASES="fireworks"
+glm_5p2_MODEL="accounts/fireworks/models/glm-5p2"
+glm_5p2_MAX_TOKENS="128000"
+```
+
+Model presets may define `API_KEY`, `BASE_URL`, `MODEL`, `MAX_TOKENS`,
+`TEMPERATURE`, `TOP_P`, `TOP_K`, `STOP_SEQUENCES`, `THINKING`, `USE_COLOR`,
+`NO_COLOR`, `SESSION_SPEND`, and `CACHING_ENABLED`.  `SYSTEM` and other
+agent identity or workflow fields are ignored for model presets.  A selected
+preset must resolve to a non-empty `MODEL`.
 
 ## AGENTS
 
@@ -259,10 +300,10 @@ build_THINKING="on"
 `<agent>_API_KEY`, `<agent>_BASE_URL`
 : Optional per-agent Anthropic-compatible client settings.  `API_KEY` is passed
   to `claudius` and supports `file://` key files.  A `file://` value with a
-  relative path is resolved against the directory containing `agents.conf`,
-  while absolute `file://` paths are used unchanged.  `BASE_URL` should be the
-  provider root without `/v1`.  Values are resolved through the agent's
-  `rc_conf` variable provider.
+  relative path is resolved against the config directory, while absolute
+  `file://` paths are used unchanged.  `BASE_URL` should be the provider root
+  without `/v1`.  Values are resolved through the agent's `rc_conf` variable
+  provider and override any selected model preset.
 
   For Fireworks' Anthropic-compatible endpoint, use
   `https://api.fireworks.ai/inference`, not a `/v1/responses` or
@@ -287,7 +328,10 @@ build_THINKING="on"
 : Space-split list of skills to mount.  Use `*` to mount every loaded skill.
 
 `<agent>_MODEL`, `<agent>_SYSTEM`, `<agent>_MAX_TOKENS`
-: Optional model, inline system-prompt override, and response-token overrides.
+: Optional model selector, inline system-prompt override, and response-token
+  overrides.  With `models.conf`, `<agent>_MODEL` resolves through enabled
+  model presets before falling back to a literal provider-facing model string.
+  Agent chat fields override selected model defaults.
 
 `<agent>_PROMPT`
 : Optional colon-separated list of markdown files.  Relative paths are resolved
@@ -316,8 +360,8 @@ build_THINKING="on"
 `<agent>_USE_COLOR`, `<agent>_NO_COLOR`
 : Optional terminal color controls.
 
-`<agent>_SESSION_BUDGET`
-: Optional token budget for the session.
+`<agent>_SESSION_SPEND`
+: Optional dollar spend budget for the session.
 
 `<agent>_CACHING_ENABLED`
 : Optional prompt-cache toggle.
@@ -892,11 +936,14 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 ## FILES
 
 `agents.conf`
-: Agent services, default-agent selection, and optional per-agent `API_KEY` and
-  `BASE_URL` client settings.
+: Agent services, default-agent selection, and per-agent overrides.
 
 `agents/<agent>.md`
 : Agent prompt markdown.
+
+`models.conf`
+: Optional model services, provider/client defaults, and aliases selected by
+  `<agent>_MODEL`.
 
 `tools.conf`
 : Tool services, enable states, and aliases.
@@ -934,7 +981,8 @@ sid-seatbelt --writable-roots "$PWD:/tmp" -- make test
 
 `API key not provided and ANTHROPIC_API_KEY environment variable not set`
 : Set `CLAUDIUS_API_KEY` or `ANTHROPIC_API_KEY` before starting `sid`, or set
-  per-agent `<agent>_API_KEY` in `agents.conf`.
+  per-agent `<agent>_API_KEY` in `agents.conf` or a selected model preset's
+  `<model>_API_KEY` in `models.conf`.
 
 `agent references an undefined tool`
 : The agent listed a name in `<agent>_TOOLS` that does not have a matching

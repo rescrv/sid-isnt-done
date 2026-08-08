@@ -1,10 +1,11 @@
 //! Configuration loading for sid workspaces.
 //!
-//! A sid workspace keeps its configuration in a directory tree with two rc.conf
-//! files ([`AGENTS_CONF_FILE`] and [`TOOLS_CONF_FILE`]) and companion
-//! subdirectories for agent prompts, tool executables, and skill markdown
-//! files.  [`Config::load`] reads these files and produces a strongly typed
-//! configuration that the rest of the agent runtime consumes.
+//! A sid workspace keeps its configuration in a directory tree with two
+//! required rc.conf files ([`AGENTS_CONF_FILE`] and [`TOOLS_CONF_FILE`]), an
+//! optional [`MODELS_CONF_FILE`], and companion subdirectories for agent
+//! prompts, tool executables, and skill markdown files.  [`Config::load`] reads
+//! these files and produces a strongly typed configuration that the rest of the
+//! agent runtime consumes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,7 +16,7 @@ use std::time::Duration;
 use claudius::chat::ChatConfig;
 use claudius::{Model, ThinkingConfig};
 use handled::SError;
-use rc_conf::{RcConf, SwitchPosition};
+use rc_conf::{RcConf, SwitchPosition, var_name_from_service, var_prefix_from_service};
 use serde::Deserialize;
 use shvar::VariableProvider;
 use utf8path::Path;
@@ -24,6 +25,8 @@ use utf8path::Path;
 pub const DEFAULT_THINKING_BUDGET: u32 = 1024;
 /// Filename for the agent declarations rc.conf file.
 pub const AGENTS_CONF_FILE: &str = "agents.conf";
+/// Filename for the optional model declarations rc.conf file.
+pub const MODELS_CONF_FILE: &str = "models.conf";
 /// Filename for the tool declarations rc.conf file.
 pub const TOOLS_CONF_FILE: &str = "tools.conf";
 /// Subdirectory that holds per-agent prompt and configuration files.
@@ -76,7 +79,7 @@ const KNOWN_TOOL_PROMPTS: &[KnownPromptField] = &[KnownPromptField {
 /// Fully resolved workspace configuration.
 ///
 /// Contains all agents, tools, and skills discovered during [`Config::load`],
-/// together with the parsed rc.conf backing stores.
+/// together with the parsed agent and tool rc.conf backing stores.
 #[derive(Debug)]
 pub struct Config {
     /// Root directory from which the configuration was loaded.
@@ -96,9 +99,9 @@ pub struct Config {
 impl Config {
     /// Load a workspace configuration from `root`.
     ///
-    /// Reads `agents.conf` and `tools.conf` from the given directory, resolves
-    /// every agent, tool, and skill referenced in those files, and validates
-    /// tool manifests and executables.
+    /// Reads `agents.conf`, optional `models.conf`, and `tools.conf` from the
+    /// given directory, resolves every agent, tool, and skill referenced in
+    /// those files, and validates tool manifests and executables.
     ///
     /// # Errors
     ///
@@ -108,12 +111,18 @@ impl Config {
     pub fn load(root: &Path) -> Result<Self, SError> {
         let root = root.clone().into_owned();
         let agents_conf_path = root.join(AGENTS_CONF_FILE);
+        let models_conf_path = root.join(MODELS_CONF_FILE);
         let tools_conf_path = root.join(TOOLS_CONF_FILE);
 
         require_file(&agents_conf_path, AGENTS_CONF_FILE)?;
         require_file(&tools_conf_path, TOOLS_CONF_FILE)?;
 
         let agents_rc_conf = parse_rc_conf(&agents_conf_path)?;
+        let models_rc_conf = if path_exists(&models_conf_path) {
+            Some(parse_rc_conf(&models_conf_path)?)
+        } else {
+            None
+        };
         let tools_rc_conf = parse_rc_conf(&tools_conf_path)?;
         let agent_names = collect_names_from_rc_conf(&agents_rc_conf)?;
         let tool_names = collect_names_from_rc_conf(&tools_rc_conf)?;
@@ -123,6 +132,7 @@ impl Config {
             root,
             agents_rc_conf,
             &agent_names,
+            models_rc_conf,
             tools_rc_conf,
             &tool_names,
             skills,
@@ -133,6 +143,7 @@ impl Config {
         root: Path<'static>,
         agents_rc_conf: RcConf,
         agent_names: &[String],
+        models_rc_conf: Option<RcConf>,
         tools_rc_conf: RcConf,
         tool_names: &[String],
         skills: BTreeMap<String, SkillConfig>,
@@ -144,7 +155,13 @@ impl Config {
 
         let mut agents = BTreeMap::new();
         for agent_name in agent_names {
-            let agent = AgentConfig::from_rc_conf(&root, &agents_dir, &agents_rc_conf, agent_name)?;
+            let agent = AgentConfig::from_rc_conf(
+                &root,
+                &agents_dir,
+                &agents_rc_conf,
+                models_rc_conf.as_ref(),
+                agent_name,
+            )?;
             agents.insert(agent_name.clone(), agent);
         }
 
@@ -185,22 +202,37 @@ impl std::fmt::Debug for AnthropicConfig {
 }
 
 impl AnthropicConfig {
-    fn from_provider(
+    fn from_providers(
         config_root: &Path,
-        provider: &impl VariableProvider,
+        models_rc_conf: Option<&RcConf>,
+        model: Option<&str>,
+        agent_provider: &impl VariableProvider,
         agent: &str,
     ) -> Result<Self, SError> {
-        let api_key = lookup_nonempty_field(provider, agent, "API_KEY")?
-            .map(|value| rewrite_relative_file_api_key(config_root, value));
-        Ok(Self {
-            api_key,
-            base_url: lookup_nonempty_field(provider, agent, "BASE_URL")?,
-        })
+        let mut api_key = None;
+        let mut base_url = None;
+
+        if let (Some(models_rc_conf), Some(model)) = (models_rc_conf, model) {
+            let model_provider = model_variable_provider(models_rc_conf, model)?;
+            api_key = lookup_nonempty_field(&model_provider, model, "API_KEY")?
+                .map(|value| rewrite_relative_file_api_key(config_root, value));
+            base_url = lookup_nonempty_field(&model_provider, model, "BASE_URL")?;
+        }
+
+        if let Some(value) = lookup_expanded(agent_provider, agent, "API_KEY")? {
+            api_key =
+                nonempty(value).map(|value| rewrite_relative_file_api_key(config_root, value));
+        }
+        if let Some(value) = lookup_expanded(agent_provider, agent, "BASE_URL")? {
+            base_url = nonempty(value);
+        }
+
+        Ok(Self { api_key, base_url })
     }
 }
 
 /// Rewrites a `file://`-prefixed API key that names a relative path so it points
-/// at the directory containing `agents.conf`.
+/// at the configuration root.
 ///
 /// Keys that do not begin with `file://`, or whose path is already absolute, are
 /// returned unchanged.
@@ -266,6 +298,7 @@ impl AgentConfig {
         config_root: &Path,
         agents_dir: &Path,
         rc_conf: &RcConf,
+        models_rc_conf: Option<&RcConf>,
         agent: &str,
     ) -> Result<Self, SError> {
         let provider = rc_conf.variable_provider_for(agent).map_err(|err| {
@@ -288,7 +321,14 @@ impl AgentConfig {
         let agents_md_path = lookup_nonempty_field(&provider, agent, "AGENTS_MD_PATH")?;
         let user_instructions_hook =
             lookup_nonempty_field(&provider, agent, "USER_INSTRUCTIONS_HOOK")?;
-        let anthropic = AnthropicConfig::from_provider(config_root, &provider, agent)?;
+        let model_selection = resolve_agent_model_selection(models_rc_conf, &provider, agent)?;
+        let anthropic = AnthropicConfig::from_providers(
+            config_root,
+            models_rc_conf,
+            model_selection.as_deref(),
+            &provider,
+            agent,
+        )?;
         let auto_compact_tokens = match lookup_expanded(&provider, agent, "AUTO_COMPACT")? {
             Some(value) => Some(parse_u64_field(agent, "AUTO_COMPACT", &value)?),
             None => None,
@@ -325,7 +365,15 @@ impl AgentConfig {
         if let Some(prompt) = prompt_markdown.as_ref() {
             chat_config.set_system_prompt(Some(prompt.clone()));
         }
-        apply_chat_config_overrides(&mut chat_config, &provider, agent)?;
+        if let (Some(models_rc_conf), Some(model)) = (models_rc_conf, model_selection.as_deref()) {
+            apply_model_chat_config_overrides(&mut chat_config, models_rc_conf, model)?;
+        }
+        apply_agent_chat_config_overrides(
+            &mut chat_config,
+            &provider,
+            agent,
+            model_selection.is_some(),
+        )?;
 
         Ok(Self {
             id: agent.to_string(),
@@ -735,39 +783,191 @@ fn load_skills(dirs: &[Path<'static>]) -> Result<BTreeMap<String, SkillConfig>, 
     Ok(skills)
 }
 
-fn apply_chat_config_overrides(
+fn resolve_agent_model_selection(
+    models_rc_conf: Option<&RcConf>,
+    agent_provider: &impl VariableProvider,
+    agent: &str,
+) -> Result<Option<String>, SError> {
+    let Some(models_rc_conf) = models_rc_conf else {
+        return Ok(None);
+    };
+    let Some(selector) = lookup_expanded(agent_provider, agent, "MODEL")? else {
+        return Ok(None);
+    };
+    let selector = selector.trim();
+    let Some(model) = resolve_existing_model_service(models_rc_conf, selector) else {
+        return Ok(None);
+    };
+
+    let enabled = models_rc_conf.service_switch(&model);
+    if enabled != SwitchPosition::Yes {
+        return Err(SError::new("config")
+            .with_code("disabled_model_selected")
+            .with_message("agent MODEL names a models.conf service that is not enabled")
+            .with_string_field("agent", agent)
+            .with_string_field("model", &model)
+            .with_string_field("enabled", &format!("{enabled:?}")));
+    }
+
+    let provider = model_variable_provider(models_rc_conf, &model)?;
+    let concrete = lookup_expanded(&provider, &model, "MODEL")?;
+    if concrete
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        Ok(Some(model))
+    } else {
+        Err(SError::new("config")
+            .with_code("abstract_model_selected")
+            .with_message("agent MODEL names a models.conf service without a concrete MODEL")
+            .with_string_field("agent", agent)
+            .with_string_field("model", &model))
+    }
+}
+
+fn resolve_existing_model_service(models_rc_conf: &RcConf, selector: &str) -> Option<String> {
+    if selector.is_empty() {
+        return None;
+    }
+
+    let var_name = var_name_from_service(selector);
+    let mut candidates = vec![selector.to_string()];
+    if var_name != selector {
+        candidates.push(var_name);
+    }
+
+    candidates
+        .iter()
+        .find(|candidate| model_service_has_alias(models_rc_conf, candidate))
+        .cloned()
+        .or_else(|| {
+            candidates
+                .into_iter()
+                .find(|candidate| model_service_has_direct_field(models_rc_conf, candidate))
+        })
+}
+
+fn model_service_has_alias(models_rc_conf: &RcConf, service: &str) -> bool {
+    models_rc_conf.alias_lookup_order(service).0.len() > 1
+}
+
+fn model_service_has_direct_field(models_rc_conf: &RcConf, service: &str) -> bool {
+    const MODEL_FIELDS: &[&str] = &[
+        "ENABLED",
+        "ALIASES",
+        "INHERIT",
+        "API_KEY",
+        "BASE_URL",
+        "MODEL",
+        "MAX_TOKENS",
+        "TEMPERATURE",
+        "TOP_P",
+        "TOP_K",
+        "STOP_SEQUENCES",
+        "THINKING",
+        "USE_COLOR",
+        "NO_COLOR",
+        "SESSION_SPEND",
+        "CACHING_ENABLED",
+    ];
+
+    let prefix = var_prefix_from_service(service);
+    MODEL_FIELDS
+        .iter()
+        .any(|field| models_rc_conf.lookup(&format!("{prefix}{field}")).is_some())
+}
+
+fn model_variable_provider<'a>(
+    models_rc_conf: &'a RcConf,
+    model: &str,
+) -> Result<impl VariableProvider + 'a, SError> {
+    models_rc_conf.variable_provider_for(model).map_err(|err| {
+        SError::new("config")
+            .with_code("rc_conf_error")
+            .with_message("failed to derive model config from rc_conf")
+            .with_string_field("model", model)
+            .with_string_field("cause", &format!("{err:?}"))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ChatConfigOverrideOptions {
+    model: bool,
+    system: bool,
+}
+
+fn apply_model_chat_config_overrides(
+    chat_config: &mut ChatConfig,
+    models_rc_conf: &RcConf,
+    model: &str,
+) -> Result<(), SError> {
+    let provider = model_variable_provider(models_rc_conf, model)?;
+    apply_chat_config_overrides(
+        chat_config,
+        &provider,
+        model,
+        ChatConfigOverrideOptions {
+            model: true,
+            system: false,
+        },
+    )
+}
+
+fn apply_agent_chat_config_overrides(
     chat_config: &mut ChatConfig,
     provider: &impl VariableProvider,
     agent: &str,
+    model_selected: bool,
 ) -> Result<(), SError> {
-    if let Some(model) = lookup_expanded(provider, agent, "MODEL")? {
+    apply_chat_config_overrides(
+        chat_config,
+        provider,
+        agent,
+        ChatConfigOverrideOptions {
+            model: !model_selected,
+            system: true,
+        },
+    )
+}
+
+fn apply_chat_config_overrides(
+    chat_config: &mut ChatConfig,
+    provider: &impl VariableProvider,
+    scope: &str,
+    options: ChatConfigOverrideOptions,
+) -> Result<(), SError> {
+    if options.model
+        && let Some(model) = lookup_expanded(provider, scope, "MODEL")?
+    {
         let model = model
             .parse()
             .unwrap_or_else(|_| Model::Custom(model.clone()));
         chat_config.set_model(model);
     }
-    if let Some(system_prompt) = lookup_expanded(provider, agent, "SYSTEM")? {
+    if options.system
+        && let Some(system_prompt) = lookup_expanded(provider, scope, "SYSTEM")?
+    {
         chat_config.set_system_prompt(Some(system_prompt));
     }
-    if let Some(max_tokens) = lookup_expanded(provider, agent, "MAX_TOKENS")? {
-        chat_config.set_max_tokens(parse_u32_field(agent, "MAX_TOKENS", &max_tokens)?);
+    if let Some(max_tokens) = lookup_expanded(provider, scope, "MAX_TOKENS")? {
+        chat_config.set_max_tokens(parse_u32_field(scope, "MAX_TOKENS", &max_tokens)?);
     }
-    if let Some(temperature) = lookup_expanded(provider, agent, "TEMPERATURE")? {
+    if let Some(temperature) = lookup_expanded(provider, scope, "TEMPERATURE")? {
         chat_config.set_temperature(Some(parse_unit_interval_field(
-            agent,
+            scope,
             "TEMPERATURE",
             &temperature,
         )?));
     }
-    if let Some(top_p) = lookup_expanded(provider, agent, "TOP_P")? {
-        chat_config.set_top_p(Some(parse_unit_interval_field(agent, "TOP_P", &top_p)?));
+    if let Some(top_p) = lookup_expanded(provider, scope, "TOP_P")? {
+        chat_config.set_top_p(Some(parse_unit_interval_field(scope, "TOP_P", &top_p)?));
     }
-    if let Some(top_k) = lookup_expanded(provider, agent, "TOP_K")? {
-        chat_config.set_top_k(Some(parse_u32_field(agent, "TOP_K", &top_k)?));
+    if let Some(top_k) = lookup_expanded(provider, scope, "TOP_K")? {
+        chat_config.set_top_k(Some(parse_u32_field(scope, "TOP_K", &top_k)?));
     }
-    if let Some(stop_sequences) = lookup_expanded(provider, agent, "STOP_SEQUENCES")? {
+    if let Some(stop_sequences) = lookup_expanded(provider, scope, "STOP_SEQUENCES")? {
         let stop_sequences = shvar::split(&stop_sequences).map_err(|err| {
-            invalid_config_field(agent, "STOP_SEQUENCES", &stop_sequences, format!("{err:?}"))
+            invalid_config_field(scope, "STOP_SEQUENCES", &stop_sequences, format!("{err:?}"))
         })?;
         if stop_sequences.is_empty() {
             chat_config.template.stop_sequences = None;
@@ -775,24 +975,24 @@ fn apply_chat_config_overrides(
             chat_config.template.stop_sequences = Some(stop_sequences);
         }
     }
-    if let Some(thinking) = lookup_expanded(provider, agent, "THINKING")? {
-        chat_config.template.thinking = parse_thinking_budget(agent, "THINKING", &thinking)?;
+    if let Some(thinking) = lookup_expanded(provider, scope, "THINKING")? {
+        chat_config.template.thinking = parse_thinking_budget(scope, "THINKING", &thinking)?;
     }
-    if let Some(use_color) = lookup_expanded(provider, agent, "USE_COLOR")? {
-        chat_config.use_color = parse_bool_field(agent, "USE_COLOR", &use_color)?;
+    if let Some(use_color) = lookup_expanded(provider, scope, "USE_COLOR")? {
+        chat_config.use_color = parse_bool_field(scope, "USE_COLOR", &use_color)?;
     }
-    if let Some(no_color) = lookup_expanded(provider, agent, "NO_COLOR")? {
-        chat_config.use_color = !parse_bool_field(agent, "NO_COLOR", &no_color)?;
+    if let Some(no_color) = lookup_expanded(provider, scope, "NO_COLOR")? {
+        chat_config.use_color = !parse_bool_field(scope, "NO_COLOR", &no_color)?;
     }
-    if let Some(session_spend) = lookup_expanded(provider, agent, "SESSION_SPEND")? {
+    if let Some(session_spend) = lookup_expanded(provider, scope, "SESSION_SPEND")? {
         chat_config.set_session_spend(Some(parse_f64_field(
-            agent,
+            scope,
             "SESSION_SPEND",
             &session_spend,
         )?));
     }
-    if let Some(caching_enabled) = lookup_expanded(provider, agent, "CACHING_ENABLED")? {
-        chat_config.caching_enabled = parse_bool_field(agent, "CACHING_ENABLED", &caching_enabled)?;
+    if let Some(caching_enabled) = lookup_expanded(provider, scope, "CACHING_ENABLED")? {
+        chat_config.caching_enabled = parse_bool_field(scope, "CACHING_ENABLED", &caching_enabled)?;
     }
 
     Ok(())
@@ -1063,10 +1263,12 @@ fn lookup_nonempty_field(
     scope: &str,
     key: &str,
 ) -> Result<Option<String>, SError> {
-    Ok(lookup_expanded(provider, scope, key)?.and_then(|value| {
-        let value = value.trim().to_string();
-        (!value.is_empty()).then_some(value)
-    }))
+    Ok(lookup_expanded(provider, scope, key)?.and_then(nonempty))
+}
+
+fn nonempty(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn lookup_ps1_field(
@@ -1545,6 +1747,219 @@ format_ALIASES="fmt"
         assert!(!bash.confirm_preview);
         assert!(bash.executable_path.is_none());
         assert_eq!(bash.timeout, Some(DEFAULT_TOOL_TIMEOUT));
+    }
+
+    #[test]
+    fn selected_model_defaults_are_absorbed_before_agent_overrides() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+ROLE='principal engineer'
+
+build_ENABLED=YES
+build_MODEL='glm-5p2'
+build_API_KEY='file://secrets/agent.key'
+build_MAX_TOKENS=64000
+build_TOP_P=0.7
+build_SYSTEM='You are ${ROLE}'
+
+literal_ENABLED=YES
+literal_MODEL='glm-unknown'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            r#"
+fireworks_ENABLED=NO
+fireworks_API_KEY='file://secrets/fireworks.key'
+fireworks_BASE_URL='https://api.fireworks.ai/inference'
+fireworks_TEMPERATURE=0.2
+fireworks_SYSTEM='model system should not apply'
+
+glm_5p2_ENABLED=YES
+glm_5p2_INHERIT=YES
+glm_5p2_ALIASES=fireworks
+glm_5p2_MODEL='accounts/fireworks/models/glm-5p2'
+glm_5p2_MAX_TOKENS=128000
+glm_5p2_TOP_P=0.8
+glm_5p2_STOP_SEQUENCES='DONE "two words"'
+glm_5p2_THINKING=on
+glm_5p2_CACHING_ENABLED=off
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let config = Config::load(&root).unwrap();
+
+        let build = config.agents.get("build").unwrap();
+        assert_eq!(
+            build.anthropic,
+            AnthropicConfig {
+                api_key: Some(format!("file://{}/secrets/agent.key", root.as_str())),
+                base_url: Some("https://api.fireworks.ai/inference".to_string()),
+            }
+        );
+        assert_eq!(
+            build.chat_config.model(),
+            Model::Custom("accounts/fireworks/models/glm-5p2".to_string())
+        );
+        assert_eq!(
+            build.chat_config.system_prompt_text(),
+            Some("You are principal engineer")
+        );
+        assert_eq!(build.chat_config.max_tokens(), 64000);
+        assert_eq!(build.chat_config.template.temperature, Some(0.2));
+        assert_eq!(build.chat_config.template.top_p, Some(0.7));
+        assert_eq!(
+            build.chat_config.stop_sequences(),
+            &["DONE".to_string(), "two words".to_string()]
+        );
+        assert_eq!(
+            build.chat_config.thinking_budget(),
+            Some(DEFAULT_THINKING_BUDGET)
+        );
+        assert!(!build.chat_config.caching_enabled);
+
+        let literal = config.agents.get("literal").unwrap();
+        assert_eq!(
+            literal.chat_config.model(),
+            Model::Custom("glm-unknown".to_string())
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn empty_agent_client_fields_clear_selected_model_defaults() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            r#"
+build_ENABLED=YES
+build_MODEL='glm-5p2'
+build_API_KEY=''
+build_BASE_URL=''
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            r#"
+glm_5p2_ENABLED=YES
+glm_5p2_MODEL='accounts/fireworks/models/glm-5p2'
+glm_5p2_API_KEY='file://secrets/fireworks.key'
+glm_5p2_BASE_URL='https://api.fireworks.ai/inference'
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let build = config.agents.get("build").unwrap();
+        assert_eq!(build.anthropic, AnthropicConfig::default());
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn disabled_model_selection_is_rejected_without_literal_fallback() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "judge_ENABLED=YES\njudge_MODEL='claude-opus-4-8'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            "claude_opus_4_8_ENABLED=NO\nclaude_opus_4_8_MODEL='claude-opus-4-8'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let err = Config::load(&root).unwrap_err().to_string();
+        assert!(err.contains("disabled_model_selected"));
+        assert!(err.contains("claude-opus-4-8"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn manual_model_selection_is_rejected() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "judge_ENABLED=YES\njudge_MODEL='manual-model'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            "manual_model_ENABLED=MANUAL\nmanual_model_MODEL='provider/manual-model'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let err = Config::load(&root).unwrap_err().to_string();
+        assert!(err.contains("disabled_model_selected"));
+        assert!(err.contains("Manual"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn abstract_model_selection_is_rejected() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_MODEL=fireworks\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            "fireworks_ENABLED=YES\nfireworks_BASE_URL='https://api.fireworks.ai/inference'\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let err = Config::load(&root).unwrap_err().to_string();
+        assert!(err.contains("abstract_model_selected"));
+        assert!(err.contains("fireworks"));
+
+        fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[test]
+    fn unused_invalid_model_fields_are_not_validated() {
+        let root = unique_temp_dir("config");
+        fs::create_dir_all(root.join("agents").as_str()).unwrap();
+        fs::write(
+            root.join("agents.conf").as_str(),
+            "build_ENABLED=YES\nbuild_MODEL='literal-model'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("models.conf").as_str(),
+            "bad_ENABLED=YES\nbad_MODEL='provider/bad'\nbad_TEMPERATURE=wat\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools.conf").as_str(), "").unwrap();
+
+        let config = Config::load(&root).unwrap();
+        let build = config.agents.get("build").unwrap();
+        assert_eq!(
+            build.chat_config.model(),
+            Model::Custom("literal-model".to_string())
+        );
+
+        fs::remove_dir_all(root.as_str()).unwrap();
     }
 
     #[test]
