@@ -628,6 +628,9 @@ struct SidArgs {
     #[arrrg(optional, "Run one prompt non-interactively and exit", "PROMPT")]
     prompt: Option<String>,
 
+    #[arrrg(optional, "Start the session using the named agent", "AGENT")]
+    agent: Option<String>,
+
     #[arrrg(flag, "Run a JSONL protocol server on stdin/stdout")]
     raw: bool,
 
@@ -664,6 +667,7 @@ struct PreRuntimeSetup {
     session_display: String,
     bash_debug: Option<String>,
     prompt: Option<String>,
+    agent: Option<String>,
     raw: bool,
     listen: Option<String>,
     compact: bool,
@@ -688,9 +692,6 @@ struct AgentSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidCommand {
-    ShowAgent,
-    AgentList,
-    SwitchAgent(String),
     Compact,
     Invalid(String),
 }
@@ -1544,6 +1545,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         bash_debug,
         resume,
         prompt,
+        agent,
         raw,
         compact,
         listen,
@@ -1639,6 +1641,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         },
         bash_debug,
         prompt,
+        agent,
         raw,
         listen,
         compact,
@@ -1677,6 +1680,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
         bash_debug,
         prompt,
         raw,
+        agent: agent_id_override,
         listen,
         compact,
         resumed,
@@ -1686,10 +1690,19 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
 
     warn_if_sandbox_unavailable();
 
-    let agent =
-        SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
-            .with_session(sid_session.clone())
-            .with_compact_tool_output(compact);
+    let agent = match agent_id_override.as_deref() {
+        Some(agent_id) => SidAgent::from_workspace_agent_with_config_root(
+            &workspace_root,
+            &config_root,
+            agent_id,
+            config.clone(),
+        )?,
+        None => {
+            SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
+        }
+    }
+    .with_session(sid_session.clone())
+    .with_compact_tool_output(compact);
     let agent_id = agent.id().to_string();
     let startup_confirmation_required = agent.requires_confirmation();
     let use_color = agent.config().use_color;
@@ -1848,46 +1861,6 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
 
                 if let Some(cmd) = parse_sid_command(line) {
                     match cmd {
-                        SidCommand::ShowAgent => match session.current_agent_summary() {
-                            Ok(summary) => print_agent_summary(&summary, session.config()),
-                            Err(err) => terminal.print_error(&context, &err.to_string()),
-                        },
-                        SidCommand::AgentList => match session.list_agents() {
-                            Ok(agents) => print_agent_list(&agents),
-                            Err(err) => terminal.print_error(&context, &err.to_string()),
-                        },
-                        SidCommand::SwitchAgent(agent_name) => {
-                            match session.agent_summary(&agent_name) {
-                                Ok(Some(summary)) if summary.enabled == SwitchPosition::Manual => {
-                                    if !confirm_manual_agent(&mut terminal, &summary.id)? {
-                                        terminal.print_info(&context, "Agent switch cancelled.");
-                                        continue;
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    terminal.print_error(&context, &err.to_string());
-                                    continue;
-                                }
-                            }
-
-                            match session.switch_agent(&agent_name) {
-                                Ok(AgentSwitchResult::NoChange) => terminal.print_info(
-                                    &context,
-                                    &format!("Already using agent: {agent_name}"),
-                                ),
-                                Ok(AgentSwitchResult::Switched(summary)) => {
-                                    terminal.print_info(
-                                        &context,
-                                        &format!(
-                                            "Switched to agent: {}",
-                                            format_agent_label(&summary)
-                                        ),
-                                    );
-                                }
-                                Err(err) => terminal.print_error(&context, &err.to_string()),
-                            }
-                        }
                         SidCommand::Compact => match session.compact().await {
                             Ok(result) => terminal.print_info(
                                 &context,
@@ -2320,39 +2293,6 @@ impl RawTerminalClient {
         terminal: &mut SidTerminal,
     ) -> Result<(), SError> {
         match cmd {
-            SidCommand::ShowAgent => {
-                if let Some(data) =
-                    self.send_request_data("agent", RawRequest::ShowAgent, terminal)?
-                {
-                    print_remote_agent_summary(&data);
-                }
-            }
-            SidCommand::AgentList => {
-                if let Some(data) =
-                    self.send_request_data("agents", RawRequest::ListAgents, terminal)?
-                {
-                    print_remote_agent_list(&data);
-                }
-            }
-            SidCommand::SwitchAgent(agent) => {
-                let already_current = self.current_agent.as_deref() == Some(agent.as_str());
-                if let Some(data) = self.send_request_data(
-                    "switch-agent",
-                    RawRequest::SwitchAgent {
-                        agent: agent.clone(),
-                    },
-                    terminal,
-                )? {
-                    if already_current {
-                        terminal.print_info(&(), &format!("Already using agent: {agent}"));
-                    } else {
-                        terminal.print_info(
-                            &(),
-                            &format!("Switched to agent: {}", format_remote_agent_label(&data)),
-                        );
-                    }
-                }
-            }
             SidCommand::Compact => {
                 if let Some(data) =
                     self.send_request_data("compact", RawRequest::Compact, terminal)?
@@ -3057,34 +2997,7 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
             Some(SidCommand::Compact)
         };
     }
-    if command != "agent" && command != "agents" {
-        return None;
-    }
-
-    let Some(argument) = argument else {
-        return Some(match command.as_str() {
-            "agents" => SidCommand::AgentList,
-            _ => SidCommand::ShowAgent,
-        });
-    };
-
-    let mut parts = argument.splitn(2, ' ');
-    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
-    match action.as_str() {
-        "show" | "current" => Some(SidCommand::ShowAgent),
-        "list" => Some(SidCommand::AgentList),
-        "switch" => {
-            let Some(agent) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
-                return Some(SidCommand::Invalid(
-                    "/agent switch requires an agent name".to_string(),
-                ));
-            };
-            Some(SidCommand::SwitchAgent(agent.to_string()))
-        }
-        _ => Some(SidCommand::Invalid(
-            "Use /agent, /agent list, or /agent switch <name>.".to_string(),
-        )),
-    }
+    None
 }
 
 fn print_help() {
@@ -3094,9 +3007,6 @@ fn print_help() {
     println!(
         "      /compact              Summarize the session and continue in a new child session"
     );
-    println!("      /agent                Show the current agent");
-    println!("      /agent list           List configured agents");
-    println!("      /agent switch <name>  Switch to another agent in this session");
 }
 
 fn load_agent_summaries(
@@ -3130,13 +3040,6 @@ fn load_agent_summaries(
             current: agent.id == current_agent_id,
         })
         .collect())
-}
-
-fn format_agent_label(summary: &AgentSummary) -> String {
-    match summary.display_name.as_deref() {
-        Some(name) => format!("{} ({name})", summary.id),
-        None => summary.id.clone(),
-    }
 }
 
 /// Trigger compaction automatically when the output token threshold is reached.
@@ -3534,90 +3437,6 @@ fn effort_name(effort: Effort) -> &'static str {
 
 fn raw_io_error(context: &str, err: &io::Error) -> SError {
     cli_error("io_error", context).with_string_field("cause", &err.to_string())
-}
-
-fn print_agent_summary(summary: &AgentSummary, config: &ChatConfig) {
-    println!("    Agent: {}", format_agent_label(summary));
-    println!(
-        "      Status: {}{}",
-        describe_agent_enabled(summary.enabled),
-        if summary.current { " (current)" } else { "" }
-    );
-    println!("      Model: {}", config.model());
-    if let Some(description) = summary.description.as_deref() {
-        println!("      Description: {description}");
-    }
-}
-
-fn print_agent_list(agents: &[AgentSummary]) {
-    println!("    Agents:");
-    for agent in agents {
-        let marker = if agent.current { "*" } else { " " };
-        let mut line = format!(
-            "      {marker} {} [{}]",
-            format_agent_label(agent),
-            describe_agent_enabled(agent.enabled)
-        );
-        if let Some(description) = agent.description.as_deref() {
-            line.push_str(&format!(" - {description}"));
-        }
-        println!("{line}");
-    }
-}
-
-fn print_remote_agent_summary(agent: &Value) {
-    println!("    Agent: {}", format_remote_agent_label(agent));
-    println!(
-        "      Status: {}{}",
-        json_str(agent, "enabled").unwrap_or("?"),
-        if json_bool(agent, "current").unwrap_or(false) {
-            " (current)"
-        } else {
-            ""
-        }
-    );
-    if let Some(model) = json_str(agent, "model") {
-        println!("      Model: {model}");
-    }
-    if let Some(description) = json_str(agent, "description") {
-        println!("      Description: {description}");
-    }
-}
-
-fn print_remote_agent_list(data: &Value) {
-    println!("    Agents:");
-    let Some(agents) = data.get("agents").and_then(Value::as_array) else {
-        println!("      (unavailable)");
-        return;
-    };
-    for agent in agents {
-        let marker = if json_bool(agent, "current").unwrap_or(false) {
-            "*"
-        } else {
-            " "
-        };
-        let mut line = format!(
-            "      {marker} {} [{}]",
-            format_remote_agent_label(agent),
-            json_str(agent, "enabled").unwrap_or("?")
-        );
-        if let Some(description) = json_str(agent, "description") {
-            line.push_str(&format!(" - {description}"));
-        }
-        println!("{line}");
-    }
-}
-
-fn format_remote_agent_label(agent: &Value) -> String {
-    match (
-        json_str(agent, "id"),
-        json_str(agent, "display_name").filter(|name| !name.is_empty()),
-    ) {
-        (Some(id), Some(name)) => format!("{id} ({name})"),
-        (Some(id), None) => id.to_string(),
-        (None, Some(name)) => name.to_string(),
-        (None, None) => "?".to_string(),
-    }
 }
 
 fn describe_agent_enabled(enabled: SwitchPosition) -> &'static str {
@@ -4471,23 +4290,10 @@ mod tests {
 
     #[test]
     fn parse_agent_commands() {
-        assert_eq!(parse_sid_command("/agent"), Some(SidCommand::ShowAgent));
-        assert_eq!(parse_sid_command("/agents"), Some(SidCommand::AgentList));
+        assert_eq!(parse_sid_command("/agent"), None);
+        assert_eq!(parse_sid_command("/agents"), None);
+        assert_eq!(parse_sid_command("/agent switch review"), None);
         assert_eq!(parse_sid_command("/compact"), Some(SidCommand::Compact));
-        assert_eq!(
-            parse_sid_command("/agent list"),
-            Some(SidCommand::AgentList)
-        );
-        assert_eq!(
-            parse_sid_command("/agent switch review"),
-            Some(SidCommand::SwitchAgent("review".to_string()))
-        );
-        assert_eq!(
-            parse_sid_command("/agent switch"),
-            Some(SidCommand::Invalid(
-                "/agent switch requires an agent name".to_string()
-            ))
-        );
         assert_eq!(
             parse_sid_command("/compact now"),
             Some(SidCommand::Invalid(
