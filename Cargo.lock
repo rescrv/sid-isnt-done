@@ -1696,6 +1696,7 @@ dependencies = [
  "tree-sitter-bash",
  "tree-sitter-python",
  "tree-sitter-rust",
+ "unicode-width",
  "utf8path",
 ]
 

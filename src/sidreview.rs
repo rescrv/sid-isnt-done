@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthChar;
 
 use crate::sidiff::{
     Diff, DiffFile, DiffLine, DiffOp, build_review_line_metadata, file_is_pure_addition,
@@ -126,11 +127,51 @@ fn row_style(row: &ReviewRow, selected: Option<usize>) -> Style {
 
 fn render_row_line(row: &ReviewRow, selected: Option<usize>) -> Line<'static> {
     let style = row_style(row, selected);
-    if row.kind == ReviewRowKind::Bat || row.text.contains('\x1b') {
-        ansi_styled_line(&row.text, style)
+    let text = expand_tabs_preserving_ansi(&row.text);
+    if row.kind == ReviewRowKind::Bat || text.contains('\x1b') {
+        ansi_styled_line(&text, style)
     } else {
-        Line::styled(row.text.clone(), style)
+        Line::styled(text, style)
     }
+}
+
+fn expand_tabs_preserving_ansi(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0usize;
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < text.len() {
+        if bytes[index] == b'\x1b'
+            && let Some(end) = csi_sequence_end(text, index)
+        {
+            out.push_str(&text[index..end]);
+            index = end;
+            continue;
+        }
+
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("index should remain on a char boundary");
+        index += ch.len_utf8();
+        if ch == '\t' {
+            let spaces = REVIEW_TAB_WIDTH - (column % REVIEW_TAB_WIDTH);
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(ch);
+            if ch == '\n' {
+                column = 0;
+            } else {
+                column += UnicodeWidthChar::width(ch).unwrap_or(0);
+            }
+        }
+    }
+    out
 }
 
 fn ansi_styled_line(text: &str, base: Style) -> Line<'static> {
@@ -279,6 +320,7 @@ struct ReviewApp {
 }
 
 const DEFAULT_VIEWPORT_WIDTH: usize = u16::MAX as usize;
+const REVIEW_TAB_WIDTH: usize = 8;
 
 impl PartialEq for ReviewApp {
     fn eq(&self, other: &Self) -> bool {
@@ -502,11 +544,7 @@ impl ReviewApp {
 
     fn build_rows(&self) -> Vec<ReviewRow> {
         if self.blocks.is_empty() {
-            return vec![ReviewRow {
-                block: None,
-                kind: ReviewRowKind::Empty,
-                text: "no diff chunks".to_string(),
-            }];
+            return vec![ReviewRow::new(None, ReviewRowKind::Empty, "no diff chunks")];
         }
 
         let mut rows = Vec::new();
@@ -517,19 +555,20 @@ impl ReviewApp {
             } else {
                 String::new()
             };
-            rows.push(ReviewRow {
-                block: Some(block_idx),
-                kind: ReviewRowKind::Title,
-                text: format!("{prefix} {}{folded}", block.title),
-            });
+            rows.push(ReviewRow::new(
+                Some(block_idx),
+                ReviewRowKind::Title,
+                format!("{prefix} {}{folded}", block.title),
+            ));
             if block.folded {
                 continue;
             }
-            rows.extend(block.lines.iter().map(|line| ReviewRow {
-                block: Some(block_idx),
-                kind: line.kind,
-                text: line.render(),
-            }));
+            rows.extend(
+                block
+                    .lines
+                    .iter()
+                    .map(|line| ReviewRow::new(Some(block_idx), line.kind, line.render())),
+            );
         }
         rows
     }
@@ -1109,6 +1148,13 @@ struct ReviewRow {
     text: String,
 }
 
+impl ReviewRow {
+    fn new(block: Option<usize>, kind: ReviewRowKind, text: impl Into<String>) -> Self {
+        let text = expand_tabs_preserving_ansi(&text.into());
+        Self { block, kind, text }
+    }
+}
+
 #[cfg(test)]
 fn build_blocks(diff: &Diff) -> Vec<ReviewBlock> {
     build_blocks_with_color(diff, false)
@@ -1347,6 +1393,43 @@ diff --git a/a.txt b/a.txt
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[0].content, "       1 + ");
         assert_eq!(line.spans[1].content, "fn main");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn review_rows_expand_tabs_to_terminal_tab_stops() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+-\told
++\tnew
+ \tkeep
+";
+
+        let rendered = render_plain(input);
+
+        assert!(!rendered.contains('\t'));
+        assert!(rendered.contains("   1      -     old\n"));
+        assert!(rendered.contains("        1 +     new\n"));
+        assert!(rendered.contains("   2    2       keep\n"));
+    }
+
+    #[test]
+    fn ansi_styled_tabs_expand_without_counting_escape_sequences() {
+        let line = render_row_line(
+            &ReviewRow {
+                block: Some(0),
+                kind: ReviewRowKind::Add,
+                text: "        1 + \x1b[38;2;1;2;3m\tindented\x1b[0m".to_string(),
+            },
+            None,
+        );
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "        1 + ");
+        assert_eq!(line.spans[1].content, "    indented");
         assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(1, 2, 3)));
     }
 
