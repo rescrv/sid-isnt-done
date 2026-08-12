@@ -700,6 +700,9 @@ enum SidCommand {
     /// Summarize the session and continue in a new child session.
     Compact,
 
+    /// Insert a system message into the conversation transcript.
+    System(String),
+
     /// Set a per-session dollar spend limit.
     Spend(f64),
 
@@ -997,6 +1000,11 @@ impl SidRuntimeSession {
 
     fn clear(&mut self) -> Result<(), SError> {
         self.chat.clear();
+        self.persist_transcript()
+    }
+
+    fn insert_system_message(&mut self, message: String) -> Result<(), SError> {
+        self.chat.insert_system_message(message);
         self.persist_transcript()
     }
 
@@ -1794,6 +1802,15 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                             Ok(()) => terminal.print_info(&context, "Conversation cleared."),
                             Err(err) => terminal.print_error(&context, &err.to_string()),
                         },
+                        SidCommand::System(prompt) => {
+                            match session.insert_system_message(prompt.clone()) {
+                                Ok(()) => terminal.print_info(
+                                    &context,
+                                    &format!("System message inserted: {prompt}"),
+                                ),
+                                Err(err) => terminal.print_error(&context, &err.to_string()),
+                            }
+                        }
                         SidCommand::Help => {
                             print_help();
                         }
@@ -2118,6 +2135,20 @@ impl RawTerminalClient {
                     .is_some()
                 {
                     terminal.print_info(&(), "Conversation cleared.");
+                }
+            }
+            SidCommand::System(prompt) => {
+                if self
+                    .send_request_data(
+                        "system",
+                        RawRequest::InsertSystemMessage {
+                            text: prompt.clone(),
+                        },
+                        terminal,
+                    )?
+                    .is_some()
+                {
+                    terminal.print_info(&(), &format!("System message inserted: {prompt}"));
                 }
             }
             SidCommand::Help => {
@@ -2580,6 +2611,10 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
             Some(_) => SidCommand::Invalid("/compact does not take any arguments".to_string()),
             None => SidCommand::Compact,
         },
+        "system" => match argument {
+            Some(arg) => SidCommand::System(arg.to_string()),
+            None => SidCommand::Invalid("/system requires a message".to_string()),
+        },
         "help" | "?" => SidCommand::Help,
         "quit" | "exit" | "q" => SidCommand::Quit,
         "stats" | "status" => SidCommand::Stats,
@@ -2612,6 +2647,7 @@ fn help_text() -> &'static str {
   /clear                 Clear conversation history
   /compact               Summarize the session and continue in a new child session
   /edit                  Compose a message in an external editor
+  /system <prompt>       Insert a system message into the conversation
   /spend <dollars>       Set session spend limit in dollars (or 'clear')
   /save <file>           Save the current transcript immediately
   /load <file>           Load a transcript from disk
@@ -2804,6 +2840,12 @@ where
                 .await
                 .map_err(|err| cli_error("send_message_failed", &err.to_string()))?;
             maybe_auto_compact(session, server, &()).await;
+            Ok(RequestDisposition::Continue(Some(session_identity_json(
+                session,
+            ))))
+        }
+        RawRequest::InsertSystemMessage { text } => {
+            session.insert_system_message(text)?;
             Ok(RequestDisposition::Continue(Some(session_identity_json(
                 session,
             ))))
@@ -3873,6 +3915,10 @@ mod tests {
             parse_sid_command("/load /tmp/t.md"),
             Some(SidCommand::LoadTranscript("/tmp/t.md".to_string()))
         );
+        assert_eq!(
+            parse_sid_command("/system be terse"),
+            Some(SidCommand::System("be terse".to_string()))
+        );
     }
 
     #[test]
@@ -3895,13 +3941,18 @@ mod tests {
                 "/save requires a file path".to_string()
             ))
         );
+        assert_eq!(
+            parse_sid_command("/system"),
+            Some(SidCommand::Invalid(
+                "/system requires a message".to_string()
+            ))
+        );
     }
 
     #[test]
     fn parse_model_param_commands_are_rejected() {
         for input in [
             "/model claude-sonnet-4-0",
-            "/system be terse",
             "/max_tokens 8192",
             "/temperature 0.5",
             "/top_p 0.5",

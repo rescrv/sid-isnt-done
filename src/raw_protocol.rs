@@ -35,6 +35,11 @@ pub enum RawRequest {
         /// User-visible message text.
         text: String,
     },
+    /// Insert a system message into the conversation transcript.
+    InsertSystemMessage {
+        /// System message text.
+        text: String,
+    },
     /// Reply to an outstanding server prompt.
     PromptResponse {
         /// Prompt identifier emitted by the server.
@@ -187,7 +192,7 @@ impl RawAcceptedRequest {
     /// reconstruction.
     pub fn from_envelope(envelope: &RawRequestEnvelope) -> Option<Self> {
         match &envelope.request {
-            RawRequest::UserTurn { .. } => Some(Self {
+            RawRequest::UserTurn { .. } | RawRequest::InsertSystemMessage { .. } => Some(Self {
                 protocol_version: RAW_PROTOCOL_VERSION,
                 sequence: 0,
                 request_id: envelope.request_id.clone(),
@@ -1107,6 +1112,25 @@ mod tests {
             request.request,
             RawRequest::UserTurn {
                 text: "what did I ask?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepted_request_from_envelope_keeps_inserted_system_message_text() {
+        let envelope = RawRequestEnvelope {
+            protocol_version: RAW_PROTOCOL_VERSION,
+            request_id: "system-1".to_string(),
+            request: RawRequest::InsertSystemMessage {
+                text: "pin this instruction".to_string(),
+            },
+        };
+        let request = RawAcceptedRequest::from_envelope(&envelope).unwrap();
+        assert_eq!(request.request_id, "system-1");
+        assert_eq!(
+            request.request,
+            RawRequest::InsertSystemMessage {
+                text: "pin this instruction".to_string(),
             }
         );
     }

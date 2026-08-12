@@ -36,8 +36,9 @@ loaded from `SID_HOME`.
 
 The interactive prompt accepts ordinary user messages and slash commands.  Use
 `/help` inside a running session for the builtin commands: compacting the
-conversation into a new child session, saving or loading transcripts, setting
-a session spend limit, clearing context, and printing session stats.  Use
+conversation into a new child session, inserting a system message into the
+conversation, saving or loading transcripts, setting a session spend limit,
+clearing context, and printing session stats.  Use
 `--resume <session-id-or-dir>` to reopen an earlier session directory,
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
