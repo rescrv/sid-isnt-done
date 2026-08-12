@@ -8,8 +8,8 @@ sid - run a small, rc-configured coding agent in the current workspace
 
 ```text
 sid [OPTIONS]
-sid --prompt PROMPT [OPTIONS]
-sid --resume SESSION [OPTIONS]
+sid --new --prompt PROMPT [OPTIONS]
+sid --resume SESSION [--prompt PROMPT] [OPTIONS]
 sid --raw [--resume SESSION] [OPTIONS]
 sid --listen SPEC [--resume SESSION] [OPTIONS]
 sid --connect SPEC [OPTIONS]
@@ -44,9 +44,9 @@ reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
 
 Use `--prompt <text>` to run one non-interactive user turn, print the assistant
-response, and exit.  In prompt mode `sid` resumes the most recently started
-session for the current working directory by default; use `--resume` to target
-a specific session instead.
+response, and exit.  Prompt mode must name its session explicitly: pass `--new`
+to start a fresh session or `--resume <session-id-or-dir>` to continue a
+specific session.
 
 Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
 mode the process owns session state and emits accepted request markers, typed
@@ -86,10 +86,10 @@ export CLAUDIUS_API_KEY="..."
 SID_HOME=~/.sid sid
 ```
 
-Run one prompt and continue the latest session for the current directory:
+Run one prompt in a fresh session and exit:
 
 ```sh
-SID_HOME=~/.sid sid --prompt "Summarize the pending changes"
+SID_HOME=~/.sid sid --new --prompt "Summarize the pending changes"
 ```
 
 Run one bash command through the configured bash tool and exit:
@@ -165,11 +165,17 @@ warning.
 : Run `COMMAND` through the configured built-in bash tool and exit.  This is
   useful for checking tool configuration without starting an interactive chat.
 
+`--new`
+: Start a fresh session instead of resuming one.  This is the default for
+  interactive, `--raw`, and `--listen` sessions; the flag exists so `--prompt`
+  sessions can state explicitly that they must not continue an earlier
+  conversation.  `--new` cannot be combined with `--resume` or `--connect`.
+
 `--prompt PROMPT`
 : Run one non-interactive user turn, print the assistant response, and exit.
-  Unless `--resume` is supplied, prompt mode resumes the most recently started
-  session recorded for the current working directory.  If no matching session
-  exists, `sid` creates a new one.
+  Prompt mode requires an explicit session choice: `--new` runs the turn in a
+  freshly created session, while `--resume SESSION` appends the turn to that
+  session's transcript.
 
 `--raw`
 : Run a JSONL protocol server on stdin/stdout instead of the interactive
@@ -195,7 +201,7 @@ warning.
   `SPEC` accepts the same URL forms as `--listen`; for `vsock://PORT`,
   `vsock://any:PORT`, and `vsock://-1:PORT`, connect mode targets the host CID.
   `--connect` is mutually exclusive with `--raw`, `--listen`, `--prompt`,
-  `--resume`, and `--bash-debug`.
+  `--resume`, `--new`, and `--bash-debug`.
 
 `--resume SESSION`
 : Resume an existing session by timestamp id or by session directory path.
@@ -725,10 +731,10 @@ new one.  `sid` reloads `transcript.json`, appends a `session_resume` record to
 synthetic bash `{"restart": true}` tool/result pair to `transcript.json`, and
 starts the next real PTY-backed bash command from a fresh shell.
 
-Starting `sid --prompt <text>` without `--resume` scans the sessions root for
-the most recently started session whose recorded `workspace_root` matches the
-current directory, resumes that transcript, appends the new turn, and exits
-after printing the response.
+Starting `sid --new --prompt <text>` creates a fresh session directory, runs
+the single turn there, and exits after printing the response.  Starting
+`sid --resume <session> --prompt <text>` instead appends the turn to the
+resumed session's transcript.  `sid --prompt` with neither flag is an error.
 
 Running `/compact` creates a fresh session directory instead of mutating the
 current one.  The new `session.json` records which prior session it came from

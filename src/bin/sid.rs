@@ -622,6 +622,9 @@ struct SidArgs {
     #[arrrg(optional, "Resume an existing session by ID or directory", "SESSION")]
     resume: Option<String>,
 
+    #[arrrg(flag, "Start a fresh session instead of resuming one")]
+    new: bool,
+
     #[arrrg(optional, "Run one prompt non-interactively and exit", "PROMPT")]
     prompt: Option<String>,
 
@@ -1463,6 +1466,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
         param,
         bash_debug,
         resume,
+        new,
         prompt,
         agent,
         raw,
@@ -1475,6 +1479,7 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
             raw,
             listen.as_deref(),
             resume.as_deref(),
+            new,
             bash_debug.as_deref(),
             prompt.as_deref(),
         )?;
@@ -1514,21 +1519,10 @@ fn pre_runtime_setup() -> Result<StartupSetup, SError> {
     })?
     .into_owned();
     let config_root = resolve_sid_home()?;
-    let (sid_session, resumed) = match (resume.as_deref(), prompt.as_ref()) {
-        (Some(session), _) => (Arc::new(SidSession::resume(&config_root, session)?), true),
-        (None, Some(_)) => {
-            match SidSession::find_latest_for_workspace(&config_root, &workspace_root)? {
-                Some(session) => (Arc::new(session), true),
-                None => (
-                    Arc::new(SidSession::create_with_workspace(
-                        &config_root,
-                        &workspace_root,
-                    )?),
-                    false,
-                ),
-            }
-        }
-        (None, None) => (
+    validate_session_selection(new, resume.as_deref(), prompt.as_deref())?;
+    let (sid_session, resumed) = match resume.as_deref() {
+        Some(session) => (Arc::new(SidSession::resume(&config_root, session)?), true),
+        None => (
             Arc::new(SidSession::create_with_workspace(
                 &config_root,
                 &workspace_root,
@@ -3131,10 +3125,31 @@ fn validate_runtime_mode(
     Ok(())
 }
 
+fn validate_session_selection(
+    new: bool,
+    resume: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<(), SError> {
+    if new && resume.is_some() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--new cannot be combined with --resume",
+        ));
+    }
+    if prompt.is_some() && !new && resume.is_none() {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--prompt requires --new or --resume to select a session",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_connect_mode(
     raw: bool,
     listen: Option<&str>,
     resume: Option<&str>,
+    new: bool,
     bash_debug: Option<&str>,
     prompt: Option<&str>,
 ) -> Result<(), SError> {
@@ -3154,6 +3169,12 @@ fn validate_connect_mode(
         return Err(cli_error(
             "invalid_cli_args",
             "--connect cannot be combined with --resume",
+        ));
+    }
+    if new {
+        return Err(cli_error(
+            "invalid_cli_args",
+            "--connect cannot be combined with --new",
         ));
     }
     if bash_debug.is_some() {
@@ -3525,7 +3546,7 @@ mod tests {
         handle_raw_request, history_entry, parse_confirmation, parse_history_file,
         parse_sid_command, resolve_sid_home_from_env, rewind_interrupted_messages,
         rewind_trailing_incomplete_messages, validate_connect_mode, validate_no_free_args,
-        validate_runtime_mode, write_history_file,
+        validate_runtime_mode, validate_session_selection, write_history_file,
     };
     use arrrg::{CommandLine, NoExitCommandLine};
     use claudius::chat::{ChatConfig, ChatSession};
@@ -4577,11 +4598,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accept_new_option() {
+        let (args, free, status, messages) = parse_args(&["--new"]);
+        assert_eq!(status, 0, "unexpected parser status: {messages:?}");
+        assert!(free.is_empty());
+        assert!(args.new);
+    }
+
+    #[test]
+    fn validate_session_selection_rejects_new_with_resume() {
+        let err = validate_session_selection(true, Some("sid-session"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--new cannot be combined with --resume"));
+    }
+
+    #[test]
+    fn validate_session_selection_rejects_prompt_without_new_or_resume() {
+        let err = validate_session_selection(false, None, Some("hello"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--prompt requires --new or --resume"));
+    }
+
+    #[test]
+    fn validate_session_selection_accepts_prompt_with_new_or_resume() {
+        assert!(validate_session_selection(true, None, Some("hello")).is_ok());
+        assert!(validate_session_selection(false, Some("sid-session"), Some("hello")).is_ok());
+        assert!(validate_session_selection(false, None, None).is_ok());
+        assert!(validate_session_selection(true, None, None).is_ok());
+        assert!(validate_session_selection(false, Some("sid-session"), None).is_ok());
+    }
+
+    #[test]
     fn validate_connect_mode_rejects_raw() {
-        let err = validate_connect_mode(true, None, None, None, None)
+        let err = validate_connect_mode(true, None, None, false, None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--connect cannot be combined with --raw"));
+    }
+
+    #[test]
+    fn validate_connect_mode_rejects_new() {
+        let err = validate_connect_mode(false, None, None, true, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--connect cannot be combined with --new"));
     }
 
     #[test]
