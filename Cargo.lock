@@ -1044,6 +1044,8 @@ dependencies = [
 [[package]]
 name = "mxsh"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c08690e6f42886176aceb5dbe87a8ef13c6a4d803bbd0e5344262a67df66dd"
 dependencies = [
  "libc",
  "serde",

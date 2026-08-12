@@ -31,7 +31,7 @@ unicode-width = "0.2"
 arrrg = "^0.10"
 arrrg_derive = "^0.10"
 claudius = { version = "^0.33" }
-mxsh = { path = "../mxsh/mxsh", default-features = false, features = ["embed", "unix-runtime"] }
+mxsh = { version = "0.3.0", default-features = false, features = ["embed", "unix-runtime"] }
 handled = { version = "^0.7" }
 rc_conf = { version = "^0.18", default-features = false }
 setsum = "^0.9"
