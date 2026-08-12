@@ -23,10 +23,7 @@ use rustyline::error::ReadlineError;
 use serde_json::{Value, json};
 use utf8path::Path;
 
-use claudius::chat::{
-    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, SessionStats, help_text,
-    parse_command,
-};
+use claudius::chat::{ChatAgent, ChatArgs, ChatConfig, ChatSession, SessionStats};
 use claudius::{
     Anthropic, ContentBlock, Effort, KnownModel, MessageParam, MessageParamContent, MessageRole,
     Model, TokenRates,
@@ -690,9 +687,44 @@ struct AgentSummary {
     current: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed slash command.
+///
+/// Slash commands are builtin to sid: they control the chat session and are
+/// never sent to the API.  Model parameters are set by configuration, not by
+/// slash commands, so they cannot leak into a live session here.
+#[derive(Debug, Clone, PartialEq)]
 enum SidCommand {
+    /// Clear the conversation history.
+    Clear,
+
+    /// Summarize the session and continue in a new child session.
     Compact,
+
+    /// Set a per-session dollar spend limit.
+    Spend(f64),
+
+    /// Clear the spend limit.
+    ClearSpend,
+
+    /// Save the transcript to a specific file immediately.
+    SaveTranscript(String),
+
+    /// Load conversation history from a file.
+    LoadTranscript(String),
+
+    /// Display help information.
+    Help,
+
+    /// Exit the chat application.
+    Quit,
+
+    /// Display session statistics.
+    Stats,
+
+    /// Show the current configuration.
+    ShowConfig,
+
+    /// Report a parsing error back to the caller.
     Invalid(String),
 }
 
@@ -1873,137 +1905,29 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                             ),
                             Err(err) => terminal.print_error(&context, &err.to_string()),
                         },
-                        SidCommand::Invalid(message) => {
-                            terminal.print_error(&context, &message);
-                        }
-                    }
-                    continue;
-                }
-
-                if let Some(cmd) = parse_command(line) {
-                    match cmd {
-                        ChatCommand::Quit => {
+                        SidCommand::Quit => {
                             println!("Goodbye!");
                             break;
                         }
-                        ChatCommand::Clear => match session.clear() {
+                        SidCommand::Clear => match session.clear() {
                             Ok(()) => terminal.print_info(&context, "Conversation cleared."),
                             Err(err) => terminal.print_error(&context, &err.to_string()),
                         },
-                        ChatCommand::Help => {
+                        SidCommand::Help => {
                             print_help();
                         }
-                        ChatCommand::Model(model_name) => {
-                            session.set_model(&model_name);
-                            terminal
-                                .print_info(&context, &format!("Model changed to: {model_name}"));
-                        }
-                        ChatCommand::System(prompt) => {
-                            match session.insert_system_message(prompt.clone()) {
-                                Ok(()) => terminal.print_info(
-                                    &context,
-                                    &format!("System message inserted: {prompt}"),
-                                ),
-                                Err(err) => terminal.print_error(&context, &err.to_string()),
-                            }
-                        }
-                        ChatCommand::MaxTokens(value) => {
-                            session.set_max_tokens(value);
-                            terminal.print_info(&context, &format!("max_tokens set to {value}"));
-                        }
-                        ChatCommand::Temperature(value) => {
-                            session.set_temperature(Some(value));
-                            terminal
-                                .print_info(&context, &format!("temperature set to {value:.2}"));
-                        }
-                        ChatCommand::ClearTemperature => {
-                            session.set_temperature(None);
-                            terminal.print_info(&context, "temperature reset to model default");
-                        }
-                        ChatCommand::TopP(value) => {
-                            session.set_top_p(Some(value));
-                            terminal.print_info(&context, &format!("top_p set to {value:.2}"));
-                        }
-                        ChatCommand::ClearTopP => {
-                            session.set_top_p(None);
-                            terminal.print_info(&context, "top_p reset to model default");
-                        }
-                        ChatCommand::TopK(value) => {
-                            session.set_top_k(Some(value));
-                            terminal.print_info(&context, &format!("top_k set to {value}"));
-                        }
-                        ChatCommand::ClearTopK => {
-                            session.set_top_k(None);
-                            terminal.print_info(&context, "top_k reset to model default");
-                        }
-                        ChatCommand::AddStopSequence(sequence) => {
-                            session.add_stop_sequence(sequence.clone());
-                            terminal
-                                .print_info(&context, &format!("Added stop sequence: {sequence}"));
-                        }
-                        ChatCommand::ClearStopSequences => {
-                            session.clear_stop_sequences();
-                            terminal.print_info(&context, "Stop sequences cleared.");
-                        }
-                        ChatCommand::ListStopSequences => {
-                            print_stop_sequences(session.config().stop_sequences());
-                        }
-                        ChatCommand::Thinking(budget) => {
-                            session.set_thinking_budget(budget);
-                            match budget {
-                                Some(tokens) => terminal.print_info(
-                                    &context,
-                                    &format!(
-                                        "Extended thinking enabled with {tokens} token budget."
-                                    ),
-                                ),
-                                None => {
-                                    terminal.print_info(&context, "Extended thinking disabled.");
-                                }
-                            }
-                        }
-                        ChatCommand::ThinkingAdaptive => {
-                            let effort = session.config().effort();
-                            session.set_thinking_adaptive(effort);
-                            terminal.print_info(&context, "Adaptive thinking enabled.");
-                        }
-                        ChatCommand::Effort(effort) => {
-                            session.set_effort(Some(effort));
-                            terminal.print_info(
-                                &context,
-                                &format!("Effort level set to {}.", effort_name(effort)),
-                            );
-                        }
-                        ChatCommand::ClearEffort => {
-                            session.set_effort(None);
-                            terminal.print_info(&context, "Effort level cleared.");
-                        }
-                        ChatCommand::Spend(dollars) => {
+                        SidCommand::Spend(dollars) => {
                             session.set_session_spend(Some(dollars));
                             terminal.print_info(
                                 &context,
                                 &format!("Session spend limit set to ${dollars:.2}."),
                             );
                         }
-                        ChatCommand::ClearSpend => {
+                        SidCommand::ClearSpend => {
                             session.set_session_spend(None);
                             terminal.print_info(&context, "Session spend limit cleared.");
                         }
-                        ChatCommand::Caching(enabled) => {
-                            session.set_caching_enabled(enabled);
-                            if enabled {
-                                terminal.print_info(&context, "Prompt caching enabled.");
-                            } else {
-                                terminal.print_info(&context, "Prompt caching disabled.");
-                            }
-                        }
-                        ChatCommand::TranscriptPath(_) | ChatCommand::ClearTranscriptPath => {
-                            terminal.print_info(
-                                &context,
-                                "Transcript auto-save is managed by the session system.",
-                            );
-                        }
-                        ChatCommand::SaveTranscript(path) => {
+                        SidCommand::SaveTranscript(path) => {
                             match session.save_transcript_to(&path) {
                                 Ok(()) => terminal
                                     .print_info(&context, &format!("Transcript saved to {path}")),
@@ -2013,7 +1937,7 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                                 ),
                             }
                         }
-                        ChatCommand::LoadTranscript(path) => {
+                        SidCommand::LoadTranscript(path) => {
                             match session.load_transcript_from(&path) {
                                 Ok(()) => terminal.print_info(
                                     &context,
@@ -2025,13 +1949,13 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
                                 ),
                             }
                         }
-                        ChatCommand::Stats => {
+                        SidCommand::Stats => {
                             print_stats(&session.stats());
                         }
-                        ChatCommand::ShowConfig => {
+                        SidCommand::ShowConfig => {
                             print_config(&session.stats());
                         }
-                        ChatCommand::Invalid(message) => {
+                        SidCommand::Invalid(message) => {
                             terminal.print_error(&context, &message);
                         }
                     }
@@ -2129,12 +2053,7 @@ fn run_connect_mode(setup: ConnectSetup) -> Result<(), SError> {
                 }
 
                 if let Some(cmd) = parse_sid_command(line) {
-                    client.handle_sid_command(cmd, &mut terminal)?;
-                    continue;
-                }
-
-                if let Some(cmd) = parse_command(line) {
-                    if client.handle_chat_command(cmd, &mut terminal)? {
+                    if client.handle_sid_command(cmd, &mut terminal)? {
                         break;
                     }
                     continue;
@@ -2291,7 +2210,7 @@ impl RawTerminalClient {
         &mut self,
         cmd: SidCommand,
         terminal: &mut SidTerminal,
-    ) -> Result<(), SError> {
+    ) -> Result<bool, SError> {
         match cmd {
             SidCommand::Compact => {
                 if let Some(data) =
@@ -2308,24 +2227,11 @@ impl RawTerminalClient {
                     );
                 }
             }
-            SidCommand::Invalid(message) => {
-                terminal.print_error(&(), &message);
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_chat_command(
-        &mut self,
-        cmd: ChatCommand,
-        terminal: &mut SidTerminal,
-    ) -> Result<bool, SError> {
-        match cmd {
-            ChatCommand::Quit => {
+            SidCommand::Quit => {
                 println!("Goodbye!");
                 return Ok(true);
             }
-            ChatCommand::Clear => {
+            SidCommand::Clear => {
                 if self
                     .send_request_data("clear", RawRequest::Clear, terminal)?
                     .is_some()
@@ -2333,198 +2239,10 @@ impl RawTerminalClient {
                     terminal.print_info(&(), "Conversation cleared.");
                 }
             }
-            ChatCommand::Help => {
+            SidCommand::Help => {
                 print_help();
             }
-            ChatCommand::Model(model_name) => {
-                if self
-                    .send_request_data(
-                        "model",
-                        RawRequest::SetModel {
-                            model: model_name.clone(),
-                        },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("Model changed to: {model_name}"));
-                }
-            }
-            ChatCommand::System(prompt) => {
-                if self
-                    .send_request_data(
-                        "system",
-                        RawRequest::InsertSystemMessage {
-                            text: prompt.clone(),
-                        },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("System message inserted: {prompt}"));
-                }
-            }
-            ChatCommand::MaxTokens(value) => {
-                if self
-                    .send_request_data(
-                        "max-tokens",
-                        RawRequest::SetMaxTokens { max_tokens: value },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("max_tokens set to {value}"));
-                }
-            }
-            ChatCommand::Temperature(value) => {
-                if self
-                    .send_request_data(
-                        "temperature",
-                        RawRequest::SetTemperature {
-                            temperature: Some(value),
-                        },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("temperature set to {value:.2}"));
-                }
-            }
-            ChatCommand::ClearTemperature => {
-                if self
-                    .send_request_data(
-                        "temperature",
-                        RawRequest::SetTemperature { temperature: None },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "temperature reset to model default");
-                }
-            }
-            ChatCommand::TopP(value) => {
-                if self
-                    .send_request_data(
-                        "top-p",
-                        RawRequest::SetTopP { top_p: Some(value) },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("top_p set to {value:.2}"));
-                }
-            }
-            ChatCommand::ClearTopP => {
-                if self
-                    .send_request_data("top-p", RawRequest::SetTopP { top_p: None }, terminal)?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "top_p reset to model default");
-                }
-            }
-            ChatCommand::TopK(value) => {
-                if self
-                    .send_request_data(
-                        "top-k",
-                        RawRequest::SetTopK { top_k: Some(value) },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("top_k set to {value}"));
-                }
-            }
-            ChatCommand::ClearTopK => {
-                if self
-                    .send_request_data("top-k", RawRequest::SetTopK { top_k: None }, terminal)?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "top_k reset to model default");
-                }
-            }
-            ChatCommand::AddStopSequence(sequence) => {
-                if self
-                    .send_request_data(
-                        "stop-sequence",
-                        RawRequest::AddStopSequence {
-                            sequence: sequence.clone(),
-                        },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(&(), &format!("Added stop sequence: {sequence}"));
-                }
-            }
-            ChatCommand::ClearStopSequences => {
-                if self
-                    .send_request_data("stop-sequences", RawRequest::ClearStopSequences, terminal)?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "Stop sequences cleared.");
-                }
-            }
-            ChatCommand::ListStopSequences => {
-                if let Some(data) = self.send_request_data(
-                    "stop-sequences",
-                    RawRequest::ListStopSequences,
-                    terminal,
-                )? {
-                    print_stop_sequences(&json_string_array(&data, "stop_sequences"));
-                }
-            }
-            ChatCommand::Thinking(budget) => {
-                if self
-                    .send_request_data(
-                        "thinking",
-                        RawRequest::SetThinkingBudget { tokens: budget },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    match budget {
-                        Some(tokens) => terminal.print_info(
-                            &(),
-                            &format!("Extended thinking enabled with {tokens} token budget."),
-                        ),
-                        None => terminal.print_info(&(), "Extended thinking disabled."),
-                    }
-                }
-            }
-            ChatCommand::ThinkingAdaptive => {
-                if self
-                    .send_request_data("thinking", RawRequest::SetThinkingAdaptive, terminal)?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "Adaptive thinking enabled.");
-                }
-            }
-            ChatCommand::Effort(effort) => {
-                if self
-                    .send_request_data(
-                        "effort",
-                        RawRequest::SetEffort {
-                            effort: Some(effort),
-                        },
-                        terminal,
-                    )?
-                    .is_some()
-                {
-                    terminal.print_info(
-                        &(),
-                        &format!("Effort level set to {}.", effort_name(effort)),
-                    );
-                }
-            }
-            ChatCommand::ClearEffort => {
-                if self
-                    .send_request_data("effort", RawRequest::SetEffort { effort: None }, terminal)?
-                    .is_some()
-                {
-                    terminal.print_info(&(), "Effort level cleared.");
-                }
-            }
-            ChatCommand::Spend(dollars) => {
+            SidCommand::Spend(dollars) => {
                 if self
                     .send_request_data(
                         "spend",
@@ -2538,7 +2256,7 @@ impl RawTerminalClient {
                     terminal.print_info(&(), &format!("Session spend limit set to ${dollars:.2}."));
                 }
             }
-            ChatCommand::ClearSpend => {
+            SidCommand::ClearSpend => {
                 if self
                     .send_request_data("spend", RawRequest::SetSpend { dollars: None }, terminal)?
                     .is_some()
@@ -2546,25 +2264,7 @@ impl RawTerminalClient {
                     terminal.print_info(&(), "Session spend limit cleared.");
                 }
             }
-            ChatCommand::Caching(enabled) => {
-                if self
-                    .send_request_data("caching", RawRequest::SetCaching { enabled }, terminal)?
-                    .is_some()
-                {
-                    if enabled {
-                        terminal.print_info(&(), "Prompt caching enabled.");
-                    } else {
-                        terminal.print_info(&(), "Prompt caching disabled.");
-                    }
-                }
-            }
-            ChatCommand::TranscriptPath(_) | ChatCommand::ClearTranscriptPath => {
-                terminal.print_info(
-                    &(),
-                    "Transcript auto-save is managed by the session system.",
-                );
-            }
-            ChatCommand::SaveTranscript(path) => {
+            SidCommand::SaveTranscript(path) => {
                 if self
                     .send_request_data(
                         "save-transcript",
@@ -2576,7 +2276,7 @@ impl RawTerminalClient {
                     terminal.print_info(&(), &format!("Transcript saved to {path}"));
                 }
             }
-            ChatCommand::LoadTranscript(path) => {
+            SidCommand::LoadTranscript(path) => {
                 if self
                     .send_request_data(
                         "load-transcript",
@@ -2588,19 +2288,19 @@ impl RawTerminalClient {
                     terminal.print_info(&(), &format!("Transcript loaded from {path}"));
                 }
             }
-            ChatCommand::Stats => {
+            SidCommand::Stats => {
                 if let Some(data) = self.send_request_data("stats", RawRequest::Stats, terminal)? {
                     print_remote_stats(&data);
                 }
             }
-            ChatCommand::ShowConfig => {
+            SidCommand::ShowConfig => {
                 if let Some(data) =
                     self.send_request_data("config", RawRequest::ShowConfig, terminal)?
                 {
                     print_remote_config(&data);
                 }
             }
-            ChatCommand::Invalid(message) => {
+            SidCommand::Invalid(message) => {
                 terminal.print_error(&(), &message);
             }
         }
@@ -2979,6 +2679,10 @@ fn raw_result_message(result: &RawResultEnvelope) -> String {
         .unwrap_or_else(|| "raw request failed".to_string())
 }
 
+/// Parses user input for slash commands.
+///
+/// Returns `Some(SidCommand)` if the input is a slash command (valid or not),
+/// or `None` if it should be treated as a regular message.
 fn parse_sid_command(input: &str) -> Option<SidCommand> {
     let input = input.trim();
     if !input.starts_with('/') {
@@ -2988,25 +2692,58 @@ fn parse_sid_command(input: &str) -> Option<SidCommand> {
     let mut parts = input[1..].splitn(2, ' ');
     let command = parts.next()?.to_ascii_lowercase();
     let argument = parts.next().map(str::trim).filter(|s| !s.is_empty());
-    if command == "compact" {
-        return if argument.is_some() {
-            Some(SidCommand::Invalid(
-                "/compact does not take any arguments".to_string(),
-            ))
-        } else {
-            Some(SidCommand::Compact)
-        };
-    }
-    None
+
+    let result = match command.as_str() {
+        "clear" => SidCommand::Clear,
+        "compact" => match argument {
+            Some(_) => SidCommand::Invalid("/compact does not take any arguments".to_string()),
+            None => SidCommand::Compact,
+        },
+        "help" | "?" => SidCommand::Help,
+        "quit" | "exit" | "q" => SidCommand::Quit,
+        "stats" | "status" => SidCommand::Stats,
+        "config" => SidCommand::ShowConfig,
+        "spend" => match argument {
+            Some(arg) if arg.eq_ignore_ascii_case("clear") => SidCommand::ClearSpend,
+            Some(arg) => match arg.parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => SidCommand::Spend(value),
+                _ => SidCommand::Invalid("/spend expects a positive dollar amount".to_string()),
+            },
+            None => SidCommand::Invalid("/spend requires a dollar amount".to_string()),
+        },
+        "save" => match argument {
+            Some(arg) => SidCommand::SaveTranscript(arg.to_string()),
+            None => SidCommand::Invalid("/save requires a file path".to_string()),
+        },
+        "load" => match argument {
+            Some(arg) => SidCommand::LoadTranscript(arg.to_string()),
+            None => SidCommand::Invalid("/load requires a file path".to_string()),
+        },
+        _ => SidCommand::Invalid(format!("Unknown command: /{command}")),
+    };
+
+    Some(result)
+}
+
+/// Help text describing the available slash commands.
+fn help_text() -> &'static str {
+    r#"Available commands:
+  /clear                 Clear conversation history
+  /compact               Summarize the session and continue in a new child session
+  /edit                  Compose a message in an external editor
+  /spend <dollars>       Set session spend limit in dollars (or 'clear')
+  /save <file>           Save the current transcript immediately
+  /load <file>           Load a transcript from disk
+  /stats                 Show session statistics
+  /config                Show current configuration
+  /help                  Show this help message
+  /quit                  Exit the chat"#
 }
 
 fn print_help() {
     for line in help_text().lines() {
         println!("    {line}");
     }
-    println!(
-        "      /compact              Summarize the session and continue in a new child session"
-    );
 }
 
 fn load_agent_summaries(
@@ -4289,10 +4026,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_commands() {
-        assert_eq!(parse_sid_command("/agent"), None);
-        assert_eq!(parse_sid_command("/agents"), None);
-        assert_eq!(parse_sid_command("/agent switch review"), None);
+    fn parse_compact_command() {
         assert_eq!(parse_sid_command("/compact"), Some(SidCommand::Compact));
         assert_eq!(
             parse_sid_command("/compact now"),
@@ -4300,6 +4034,93 @@ mod tests {
                 "/compact does not take any arguments".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn parse_unknown_commands_are_invalid() {
+        for input in ["/agent", "/agents", "/agent switch review"] {
+            assert_eq!(
+                parse_sid_command(input),
+                Some(SidCommand::Invalid(format!(
+                    "Unknown command: /{}",
+                    input[1..].split(' ').next().unwrap()
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_session_commands() {
+        assert_eq!(parse_sid_command("/quit"), Some(SidCommand::Quit));
+        assert_eq!(parse_sid_command("/exit"), Some(SidCommand::Quit));
+        assert_eq!(parse_sid_command("/help"), Some(SidCommand::Help));
+        assert_eq!(parse_sid_command("/clear"), Some(SidCommand::Clear));
+        assert_eq!(parse_sid_command("/stats"), Some(SidCommand::Stats));
+        assert_eq!(parse_sid_command("/config"), Some(SidCommand::ShowConfig));
+        assert_eq!(
+            parse_sid_command("/spend 2.50"),
+            Some(SidCommand::Spend(2.50))
+        );
+        assert_eq!(
+            parse_sid_command("/spend clear"),
+            Some(SidCommand::ClearSpend)
+        );
+        assert_eq!(
+            parse_sid_command("/save /tmp/t.md"),
+            Some(SidCommand::SaveTranscript("/tmp/t.md".to_string()))
+        );
+        assert_eq!(
+            parse_sid_command("/load /tmp/t.md"),
+            Some(SidCommand::LoadTranscript("/tmp/t.md".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_command_errors() {
+        assert_eq!(
+            parse_sid_command("/spend"),
+            Some(SidCommand::Invalid(
+                "/spend requires a dollar amount".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_sid_command("/spend nope"),
+            Some(SidCommand::Invalid(
+                "/spend expects a positive dollar amount".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_sid_command("/save"),
+            Some(SidCommand::Invalid(
+                "/save requires a file path".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_model_param_commands_are_rejected() {
+        for input in [
+            "/model claude-sonnet-4-0",
+            "/system be terse",
+            "/max_tokens 8192",
+            "/temperature 0.5",
+            "/top_p 0.5",
+            "/top_k 40",
+            "/stop add END",
+            "/thinking 2048",
+            "/effort high",
+            "/cache on",
+            "/transcript /tmp/t.md",
+        ] {
+            assert_eq!(
+                parse_sid_command(input),
+                Some(SidCommand::Invalid(format!(
+                    "Unknown command: /{}",
+                    input[1..].split(' ').next().unwrap()
+                ))),
+                "expected {input} to be rejected"
+            );
+        }
     }
 
     #[test]

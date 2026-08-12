@@ -35,9 +35,9 @@ external tools.  When `agents.conf` or `tools.conf` exists, configuration is
 loaded from `SID_HOME`.
 
 The interactive prompt accepts ordinary user messages and slash commands.  Use
-`/help` inside a running session for chat commands such as changing the model,
-switching agents, compacting the conversation into a new child session, saving
-or loading transcripts, clearing context, and printing session stats.  Use
+`/help` inside a running session for the builtin commands: compacting the
+conversation into a new child session, saving or loading transcripts, setting
+a session spend limit, clearing context, and printing session stats.  Use
 `--resume <session-id-or-dir>` to reopen an earlier session directory,
 reload `transcript.json`, continue appending to the same journals, and restore
 the persisted bash shell state for future `bash` tool calls.
@@ -208,8 +208,8 @@ warning.
 
 ## MODEL SELECTION
 
-The model can be selected at startup with `--param-model MODEL`, configured per
-agent with `<agent>_MODEL`, or changed during a session with `/model MODEL`.
+The model can be selected at startup with `--param-model MODEL` or configured
+per agent with `<agent>_MODEL`.
 Run `sid --help` to see the compiled default model.  Use `/help` inside a
 session to see the current chat commands.
 
@@ -407,9 +407,8 @@ another without restarting:
 ```
 
 The active transcript, session journals, and persisted bash state remain tied
-to the same `sid` session directory.  Explicit runtime overrides such as
-`/model`, `/temperature`, `/stop`, `/thinking`, `/budget`, and `/cache` remain
-in effect after an agent switch until they are changed again.
+to the same `sid` session directory.  Explicit runtime overrides set with
+`--param-<name>` at startup remain in effect after an agent switch.
 
 `/compact` runs the reserved `compact` agent when it is configured in
 `agents.conf`; otherwise `sid` uses a built-in compaction prompt.  The command
