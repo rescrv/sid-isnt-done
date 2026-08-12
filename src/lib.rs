@@ -3507,6 +3507,7 @@ You are operating in the sid-isn't-done environment.  Tools:
     - The virtual filesystem maps / to the workspace root.
     - It is not an operating-system chroot.
     - Absolute editor paths are workspace-rooted; /foo means {workspace_root}/foo.
+    - Use the edit tool to browse skills if you need specialized knowledge.
 - bash: A genuine bash shell:
     - Connected via PTY.
     - Without support for cursor positioning.
@@ -3518,7 +3519,6 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
-    - Use the index to browse skills if you need specialized knowledge.
 
 CRITICAL — the edit tool and bash tool use different path namespaces:
 - The edit tool's / is the workspace root ({workspace_root}).
@@ -6536,6 +6536,7 @@ You are operating in the sid-isn't-done environment.  Tools:
     - The virtual filesystem maps / to the workspace root.
     - It is not an operating-system chroot.
     - Absolute editor paths are workspace-rooted; /foo means {workspace_root}/foo.
+    - Use the edit tool to browse skills if you need specialized knowledge.
 - bash: A genuine bash shell:
     - Connected via PTY.
     - Without support for cursor positioning.
@@ -6547,7 +6548,6 @@ You are operating in the sid-isn't-done environment.  Tools:
     - Runs in the host filesystem namespace, not a chroot.
     - Host / remains visible subject to OS permissions and sandbox policy.
     - Bash cannot see sid's virtual /skills mount.
-    - Use the index to browse skills if you need specialized knowledge.
 
 CRITICAL — the edit tool and bash tool use different path namespaces:
 - The edit tool's / is the workspace root ({workspace_root}).
