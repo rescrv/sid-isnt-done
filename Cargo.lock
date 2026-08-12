@@ -1669,7 +1669,7 @@ checksum = "f82993487a0ae32810febb62bd73cb7e010375f730088ddf76afcb4bdc12ffba"
 
 [[package]]
 name = "sid-isnt-done"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrrg",
  "arrrg_derive",

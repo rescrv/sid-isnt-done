@@ -8,12 +8,11 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 
-use claudius::Effort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current `sid --raw` protocol version.
-pub const RAW_PROTOCOL_VERSION: u32 = 4;
+pub const RAW_PROTOCOL_VERSION: u32 = 5;
 
 /// A client request envelope sent to `sid --raw`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -34,11 +33,6 @@ pub enum RawRequest {
     /// Send a normal user turn to the agent.
     UserTurn {
         /// User-visible message text.
-        text: String,
-    },
-    /// Insert a system message into the conversation transcript.
-    InsertSystemMessage {
-        /// System message text.
         text: String,
     },
     /// Reply to an outstanding server prompt.
@@ -63,66 +57,10 @@ pub enum RawRequest {
     Compact,
     /// Clear the conversation transcript.
     Clear,
-    /// Change the active model.
-    SetModel {
-        /// Model name to activate.
-        model: String,
-    },
-    /// Change or clear the system prompt.
-    SetSystemPrompt {
-        /// New prompt text, or `null` to clear it.
-        prompt: Option<String>,
-    },
-    /// Change the maximum response token limit.
-    SetMaxTokens {
-        /// Per-response token budget.
-        max_tokens: u32,
-    },
-    /// Change or clear temperature.
-    SetTemperature {
-        /// Sampling temperature, or `null` to clear it.
-        temperature: Option<f32>,
-    },
-    /// Change or clear top-p.
-    SetTopP {
-        /// Top-p value, or `null` to clear it.
-        top_p: Option<f32>,
-    },
-    /// Change or clear top-k.
-    SetTopK {
-        /// Top-k value, or `null` to clear it.
-        top_k: Option<u32>,
-    },
-    /// Add a stop sequence.
-    AddStopSequence {
-        /// Sequence to add.
-        sequence: String,
-    },
-    /// Clear all stop sequences.
-    ClearStopSequences,
-    /// Return the active stop sequences.
-    ListStopSequences,
-    /// Change or clear the explicit thinking budget.
-    SetThinkingBudget {
-        /// Token budget, or `null` to disable explicit thinking.
-        tokens: Option<u32>,
-    },
-    /// Enable adaptive thinking using the current effort setting.
-    SetThinkingAdaptive,
-    /// Change or clear the adaptive effort level.
-    SetEffort {
-        /// Effort level, or `null` to clear it.
-        effort: Option<Effort>,
-    },
     /// Change or clear the session spend limit.
     SetSpend {
         /// Spend limit in dollars, or `null` to clear it.
         dollars: Option<f64>,
-    },
-    /// Toggle prompt caching.
-    SetCaching {
-        /// Desired caching state.
-        enabled: bool,
     },
     /// Save the transcript to an arbitrary path.
     SaveTranscript {
@@ -249,7 +187,7 @@ impl RawAcceptedRequest {
     /// reconstruction.
     pub fn from_envelope(envelope: &RawRequestEnvelope) -> Option<Self> {
         match &envelope.request {
-            RawRequest::UserTurn { .. } | RawRequest::InsertSystemMessage { .. } => Some(Self {
+            RawRequest::UserTurn { .. } => Some(Self {
                 protocol_version: RAW_PROTOCOL_VERSION,
                 sequence: 0,
                 request_id: envelope.request_id.clone(),
@@ -673,46 +611,6 @@ mod tests {
             protocol_version: RAW_PROTOCOL_VERSION,
             request_id: "r-3".to_string(),
             request: RawRequest::Shutdown,
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, envelope);
-    }
-
-    #[test]
-    fn request_set_model_roundtrip() {
-        let envelope = RawRequestEnvelope {
-            protocol_version: RAW_PROTOCOL_VERSION,
-            request_id: "r-4".to_string(),
-            request: RawRequest::SetModel {
-                model: "sonnet".to_string(),
-            },
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, envelope);
-    }
-
-    #[test]
-    fn request_set_temperature_with_value_roundtrip() {
-        let envelope = RawRequestEnvelope {
-            protocol_version: RAW_PROTOCOL_VERSION,
-            request_id: "r-5".to_string(),
-            request: RawRequest::SetTemperature {
-                temperature: Some(0.7),
-            },
-        };
-        let json = serde_json::to_string(&envelope).unwrap();
-        let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, envelope);
-    }
-
-    #[test]
-    fn request_set_temperature_null_roundtrip() {
-        let envelope = RawRequestEnvelope {
-            protocol_version: RAW_PROTOCOL_VERSION,
-            request_id: "r-6".to_string(),
-            request: RawRequest::SetTemperature { temperature: None },
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let decoded: RawRequestEnvelope = serde_json::from_str(&json).unwrap();
@@ -1209,25 +1107,6 @@ mod tests {
             request.request,
             RawRequest::UserTurn {
                 text: "what did I ask?".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn accepted_request_from_envelope_keeps_inserted_system_message_text() {
-        let envelope = RawRequestEnvelope {
-            protocol_version: RAW_PROTOCOL_VERSION,
-            request_id: "system-1".to_string(),
-            request: RawRequest::InsertSystemMessage {
-                text: "pin this instruction".to_string(),
-            },
-        };
-        let request = RawAcceptedRequest::from_envelope(&envelope).unwrap();
-        assert_eq!(request.request_id, "system-1");
-        assert_eq!(
-            request.request,
-            RawRequest::InsertSystemMessage {
-                text: "pin this instruction".to_string(),
             }
         );
     }

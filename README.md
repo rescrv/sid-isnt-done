@@ -51,7 +51,8 @@ Use `--raw` to run `sid` as a JSONL protocol server on stdin/stdout.  In raw
 mode the process owns session state and emits accepted request markers, typed
 events, prompts, and terminal results instead of the human-oriented terminal UI.
 Requests are semantic operations such as user turns, agent switches,
-compaction, and config updates.  Raw mode is intended for
+compaction, and session spend limits.  Model parameters are set by
+configuration, not over the wire.  Raw mode is intended for
 alternative frontends and local automation.
 Use `--listen SPEC` to run the same protocol on a reconnectable socket instead
 of stdin/stdout.  `SPEC` is `tcp://HOST:PORT`, `vsock://CID:PORT` on Linux,

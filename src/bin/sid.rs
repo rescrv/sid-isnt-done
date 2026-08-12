@@ -803,66 +803,21 @@ impl SessionStatsRollup {
     }
 }
 
+/// Session-scoped overrides that persist across agent switches.
+///
+/// Model parameters come from configuration and cannot change at runtime, so
+/// the session spend limit is the only live override that must carry over to a
+/// switched agent.
 #[derive(Clone, Debug, Default)]
 struct SessionOverrides {
-    model: Option<Model>,
-    system_prompt: Option<Option<String>>,
-    max_tokens: Option<u32>,
-    temperature: Option<Option<f32>>,
-    top_p: Option<Option<f32>>,
-    top_k: Option<Option<u32>>,
-    stop_sequences: Option<Option<Vec<String>>>,
-    thinking_budget: Option<Option<u32>>,
-    thinking_adaptive: Option<Option<Effort>>,
-    effort: Option<Option<Effort>>,
     session_spend: Option<Option<f64>>,
-    caching_enabled: Option<bool>,
 }
 
 impl SessionOverrides {
     fn apply_to(&self, config: &mut ChatConfig) {
-        if let Some(model) = self.model.as_ref() {
-            config.set_model(model.clone());
-        }
-        if let Some(prompt) = self.system_prompt.as_ref() {
-            config.set_system_prompt(prompt.clone());
-        }
-        if let Some(max_tokens) = self.max_tokens {
-            config.set_max_tokens(max_tokens);
-        }
-        if let Some(temperature) = self.temperature {
-            config.set_temperature(temperature);
-        }
-        if let Some(top_p) = self.top_p {
-            config.set_top_p(top_p);
-        }
-        if let Some(top_k) = self.top_k {
-            config.set_top_k(top_k);
-        }
-        if let Some(stop_sequences) = self.stop_sequences.as_ref() {
-            config.template.stop_sequences = stop_sequences.clone();
-        }
-        if let Some(thinking_budget) = self.thinking_budget {
-            config.set_thinking_budget(thinking_budget);
-        }
-        if let Some(effort) = self.thinking_adaptive {
-            config.set_thinking_adaptive(effort);
-        }
-        if let Some(effort) = self.effort {
-            config.set_effort(effort);
-        }
         if let Some(session_spend) = self.session_spend {
             config.set_session_spend(session_spend);
         }
-        if let Some(caching_enabled) = self.caching_enabled {
-            config.caching_enabled = caching_enabled;
-        }
-    }
-
-    fn apply_to_without_system_prompt(&self, config: &mut ChatConfig) {
-        let mut overrides = self.clone();
-        overrides.system_prompt = None;
-        overrides.apply_to(config);
     }
 }
 
@@ -1045,11 +1000,6 @@ impl SidRuntimeSession {
         self.persist_transcript()
     }
 
-    fn insert_system_message(&mut self, message: String) -> Result<(), SError> {
-        self.chat.insert_system_message(message);
-        self.persist_transcript()
-    }
-
     fn save_transcript_to(&self, path: &str) -> Result<(), SError> {
         self.chat
             .save_transcript_to(path)
@@ -1091,80 +1041,10 @@ impl SidRuntimeSession {
         self.persist_transcript()
     }
 
-    fn set_model(&mut self, model_name: &str) {
-        let model = model_name
-            .parse()
-            .unwrap_or_else(|_| Model::Custom(model_name.to_string()));
-        self.chat.config_mut().set_model(model.clone());
-        self.overrides.model = Some(model);
-    }
-
-    fn set_system_prompt(&mut self, prompt: Option<String>) {
-        self.chat.config_mut().set_system_prompt(prompt.clone());
-        self.overrides.system_prompt = Some(prompt);
-    }
-
-    fn set_max_tokens(&mut self, max_tokens: u32) {
-        self.chat.config_mut().set_max_tokens(max_tokens);
-        self.overrides.max_tokens = Some(max_tokens);
-    }
-
-    fn set_temperature(&mut self, temperature: Option<f32>) {
-        self.chat.config_mut().set_temperature(temperature);
-        self.overrides.temperature = Some(temperature);
-    }
-
-    fn set_top_p(&mut self, top_p: Option<f32>) {
-        self.chat.config_mut().set_top_p(top_p);
-        self.overrides.top_p = Some(top_p);
-    }
-
-    fn set_top_k(&mut self, top_k: Option<u32>) {
-        self.chat.config_mut().set_top_k(top_k);
-        self.overrides.top_k = Some(top_k);
-    }
-
-    fn add_stop_sequence(&mut self, sequence: String) {
-        let stop_sequences = self
-            .chat
-            .template_mut()
-            .stop_sequences
-            .get_or_insert_with(Vec::new);
-        if !stop_sequences.iter().any(|existing| existing == &sequence) {
-            stop_sequences.push(sequence);
-        }
-        self.overrides.stop_sequences = Some(self.chat.template().stop_sequences.clone());
-    }
-
-    fn clear_stop_sequences(&mut self) {
-        self.chat.template_mut().stop_sequences = None;
-        self.overrides.stop_sequences = Some(None);
-    }
-
-    fn set_thinking_budget(&mut self, thinking_budget: Option<u32>) {
-        self.chat.config_mut().set_thinking_budget(thinking_budget);
-        self.overrides.thinking_budget = Some(thinking_budget);
-    }
-
-    fn set_thinking_adaptive(&mut self, effort: Option<Effort>) {
-        self.chat.config_mut().set_thinking_adaptive(effort);
-        self.overrides.thinking_adaptive = Some(effort);
-    }
-
-    fn set_effort(&mut self, effort: Option<Effort>) {
-        self.chat.config_mut().set_effort(effort);
-        self.overrides.effort = Some(effort);
-    }
-
     fn set_session_spend(&mut self, dollars: Option<f64>) {
         self.chat.config_mut().set_session_spend(dollars);
         self.overrides.session_spend = Some(dollars);
         self.sid_spend = dollars.map(SidSpendState::from_dollars);
-    }
-
-    fn set_caching_enabled(&mut self, enabled: bool) {
-        self.chat.config_mut().caching_enabled = enabled;
-        self.overrides.caching_enabled = Some(enabled);
     }
 
     fn current_agent_summary(&self) -> Result<AgentSummary, SError> {
@@ -1243,8 +1123,7 @@ impl SidRuntimeSession {
             compactor_fallback,
         )?
         .with_memory_source(self.sid_session.compaction_provenance().cloned());
-        self.overrides
-            .apply_to_without_system_prompt(compactor.config_mut());
+        self.overrides.apply_to(compactor.config_mut());
 
         let expert = compactor.compaction_snapshot();
         let compaction_prompt = compactor
@@ -1729,9 +1608,11 @@ async fn try_main(setup: StartupSetup) -> Result<(), SError> {
             agent_id,
             config.clone(),
         )?,
-        None => {
-            SidAgent::from_workspace_with_config_root(&workspace_root, &config_root, config.clone())?
-        }
+        None => SidAgent::from_workspace_with_config_root(
+            &workspace_root,
+            &config_root,
+            config.clone(),
+        )?,
     }
     .with_session(sid_session.clone())
     .with_compact_tool_output(compact);
@@ -2927,12 +2808,6 @@ where
                 session,
             ))))
         }
-        RawRequest::InsertSystemMessage { text } => {
-            session.insert_system_message(text)?;
-            Ok(RequestDisposition::Continue(Some(session_identity_json(
-                session,
-            ))))
-        }
         RawRequest::PromptResponse { .. } => Err(cli_error(
             "unexpected_prompt_response",
             "prompt_response is only valid while the server is waiting on a prompt",
@@ -2983,83 +2858,8 @@ where
                 session,
             ))))
         }
-        RawRequest::SetModel { model } => {
-            session.set_model(&model);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetSystemPrompt { prompt } => {
-            session.set_system_prompt(prompt);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetMaxTokens { max_tokens } => {
-            session.set_max_tokens(max_tokens);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetTemperature { temperature } => {
-            session.set_temperature(temperature);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetTopP { top_p } => {
-            session.set_top_p(top_p);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetTopK { top_k } => {
-            session.set_top_k(top_k);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::AddStopSequence { sequence } => {
-            session.add_stop_sequence(sequence);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::ClearStopSequences => {
-            session.clear_stop_sequences();
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::ListStopSequences => Ok(RequestDisposition::Continue(Some(json!({
-            "stop_sequences": session.config().stop_sequences(),
-        })))),
-        RawRequest::SetThinkingBudget { tokens } => {
-            session.set_thinking_budget(tokens);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetThinkingAdaptive => {
-            session.set_thinking_adaptive(session.config().effort());
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetEffort { effort } => {
-            session.set_effort(effort);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
         RawRequest::SetSpend { dollars } => {
             session.set_session_spend(dollars);
-            Ok(RequestDisposition::Continue(Some(config_json(
-                &session.stats(),
-            ))))
-        }
-        RawRequest::SetCaching { enabled } => {
-            session.set_caching_enabled(enabled);
             Ok(RequestDisposition::Continue(Some(config_json(
                 &session.stats(),
             ))))
@@ -4165,7 +3965,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_agent_preserves_transcript_overrides_and_saved_transcript() {
+    fn switch_agent_preserves_transcript_spend_and_saved_transcript() {
         let root = unique_workspace_root("agent-switch");
         write_multi_agent_config(&root);
         let mut session = configured_runtime_session(&root, "build");
@@ -4173,9 +3973,6 @@ mod tests {
         session
             .replace_messages(vec![MessageParam::user("resume me")])
             .unwrap();
-        session.set_model("claude-sonnet-4-0");
-        session.set_temperature(Some(0.5));
-        session.add_stop_sequence("END".to_string());
         session.set_session_spend(Some(5.0));
 
         assert_eq!(
@@ -4193,9 +3990,9 @@ mod tests {
             SessionSnapshot {
                 agent_id: "review".to_string(),
                 messages: vec![MessageParam::user("resume me")],
-                model: "claude-sonnet-4-0".parse().unwrap(),
-                temperature: Some(0.5),
-                stop_sequences: vec!["END".to_string()],
+                model: "claude-haiku-4-5".parse().unwrap(),
+                temperature: None,
+                stop_sequences: vec![],
                 has_session_spend: true,
             }
         );
@@ -4223,7 +4020,10 @@ mod tests {
         let root = unique_workspace_root("spend-block");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("claude-sonnet-4-5");
+        session
+            .chat
+            .config_mut()
+            .set_model("claude-sonnet-4-5".parse().unwrap());
         session.set_session_spend(Some(0.000015));
         session
             .sid_spend
@@ -4254,8 +4054,11 @@ mod tests {
         let root = unique_workspace_root("spend-clamp");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("claude-sonnet-4-5");
-        session.set_max_tokens(100);
+        session
+            .chat
+            .config_mut()
+            .set_model("claude-sonnet-4-5".parse().unwrap());
+        session.chat.config_mut().set_max_tokens(100);
         session.set_session_spend(Some(0.000045));
 
         assert_eq!(
@@ -4274,8 +4077,11 @@ mod tests {
         let root = unique_workspace_root("spend-custom-model");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("custom-model");
-        session.set_max_tokens(100);
+        session
+            .chat
+            .config_mut()
+            .set_model("custom-model".parse().unwrap());
+        session.chat.config_mut().set_max_tokens(100);
         session.set_session_spend(Some(0.000030));
 
         assert_eq!(
@@ -4294,8 +4100,6 @@ mod tests {
         let root = unique_workspace_root("spend-agent-switch");
         write_multi_agent_config(&root);
         let mut session = configured_runtime_session(&root, "build");
-        session.set_model("claude-sonnet-4-5");
-        session.set_max_tokens(100);
         session.set_session_spend(Some(0.000030));
         session
             .sid_spend
@@ -4322,11 +4126,13 @@ mod tests {
             stats.spend_used_micro_cents,
             dollars_to_micro_cents(0.000015)
         );
+        // Model parameters come from configuration and do not carry across
+        // agent switches, so the clamp applies to the default max_tokens.
         assert_eq!(
             session.spend_turn_clamp().unwrap(),
             Some(SpendTurnClamp {
-                original_max_tokens: Some(100),
-                clamped_max_tokens: 1,
+                original_max_tokens: Some(4096),
+                clamped_max_tokens: 3,
             })
         );
 
@@ -4338,7 +4144,10 @@ mod tests {
         let root = unique_workspace_root("spend-clear");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("claude-sonnet-4-5");
+        session
+            .chat
+            .config_mut()
+            .set_model("claude-sonnet-4-5".parse().unwrap());
         session.set_session_spend(Some(0.000015));
         session
             .sid_spend
@@ -4361,7 +4170,10 @@ mod tests {
         let root = unique_workspace_root("spend-reset");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("claude-sonnet-4-5");
+        session
+            .chat
+            .config_mut()
+            .set_model("claude-sonnet-4-5".parse().unwrap());
         session.set_session_spend(Some(0.000015));
         session
             .sid_spend
@@ -4393,7 +4205,10 @@ mod tests {
         let root = unique_workspace_root("raw-spend-reset");
         let sid_session = test_sid_session(&root);
         let mut session = new_runtime_session(&root, &root, sid_session, None);
-        session.set_model("claude-sonnet-4-5");
+        session
+            .chat
+            .config_mut()
+            .set_model("claude-sonnet-4-5".parse().unwrap());
         session.set_session_spend(Some(0.000015));
         session
             .sid_spend

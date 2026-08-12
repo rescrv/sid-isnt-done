@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn parse_request_line_succeeds_for_user_turn() {
         let line =
-            r#"{"protocol_version":4,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
+            r#"{"protocol_version":5,"request_id":"r-2","op":"user_turn","text":"hello world"}"#;
         let envelope = parse_request_line(line).unwrap();
         assert_eq!(
             envelope.request,
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn should_interrupt_polls_interrupt_request() {
         let input = PollInput::new(&[
-            r#"{"protocol_version":4,"request_id":"interrupt-1","op":"interrupt"}"#,
+            r#"{"protocol_version":5,"request_id":"interrupt-1","op":"interrupt"}"#,
         ]);
         let output = Vec::new();
         let mut server = RawServer::new(input, output);
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn should_interrupt_rejects_non_interrupt_request_as_busy() {
         let input =
-            PollInput::new(&[r#"{"protocol_version":4,"request_id":"stats-1","op":"stats"}"#]);
+            PollInput::new(&[r#"{"protocol_version":5,"request_id":"stats-1","op":"stats"}"#]);
         let output = Vec::new();
         let server = RawServer::new(input, output);
 
