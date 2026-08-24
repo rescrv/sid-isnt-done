@@ -1024,6 +1024,31 @@ pub fn run_script_with_output(
             "the script hit an unimplemented mxsh feature: {detail}"
         ));
     }
+
+    // mxsh carries execution problems on the RunOutcome as diagnostics rather
+    // than on stderr, so without this they vanish.  A parse/syntax error is
+    // the sharp edge: mxsh reports it as Ok(status = 2) with an error
+    // diagnostic and never runs the script, which otherwise reaches the user
+    // only as a bare `Exit 2 after 0 iterations`.  Echo every error-level
+    // diagnostic and treat a parse error as fatal so it names itself.
+    let mut parse_error: Option<String> = None;
+    for diagnostic in &outcome.diagnostics {
+        if diagnostic.message.contains("parse error") {
+            parse_error.get_or_insert_with(|| diagnostic.message.clone());
+            continue;
+        }
+        // Other error-level diagnostics would otherwise vanish; echo them so a
+        // failing run is never silent, but do not make them fatal (runtime
+        // errors, e.g. a failed redirection, set `$?` and the script decides).
+        let rendered = diagnostic.to_string();
+        if rendered.starts_with("error:") {
+            eprintln!("ralph: mxsh {rendered}");
+        }
+    }
+    if let Some(message) = parse_error {
+        return Err(format!("the script failed to parse: {message}"));
+    }
+
     Ok(ScriptOutcome {
         status: outcome.status.code(),
     })
