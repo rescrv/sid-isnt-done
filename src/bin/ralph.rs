@@ -32,6 +32,7 @@ use sid_isnt_done::ralph::journal::generate_run_id;
 use sid_isnt_done::ralph::runner::{
     CONTROL_DIR_ENV, RunnerOptions, ShimRequest, call_control_dir, run_ralph,
 };
+use sid_isnt_done::session::{SID_SESSION_DIR_ENV, SID_SESSIONS_ENV, SidSession};
 
 /// Exit code for a malformed ralph command line (EX_USAGE).
 const EXIT_USAGE: u8 = 64;
@@ -129,9 +130,12 @@ fn run_interpreter(args: RunArgs) -> Result<i32, String> {
     let script_text = std::fs::read_to_string(&script_path)
         .map_err(|err| format!("failed to read {}: {err}", script_path.display()))?;
 
-    let runs_root = PathBuf::from(workspace_root.as_str())
-        .join(".ralph")
-        .join("runs");
+    // ralph journals under the sid session directory, never the workspace.
+    // Launched from an interactive session, the parent exports
+    // SID_SESSION_DIR; standalone, create a fresh session under SID_HOME (or,
+    // when resuming, locate the session that already holds the run).
+    let session_dir = resolve_session_dir(&config_root, &workspace_root, args.resume.as_deref())?;
+    let runs_root = session_dir.join("runs");
     std::fs::create_dir_all(&runs_root).map_err(|err| {
         format!(
             "failed to create runs directory {}: {err}",
@@ -198,6 +202,57 @@ fn resolve_config_root() -> Result<Path<'static>, String> {
         }
         Err(std::env::VarError::NotUnicode(_)) => Err("SID_HOME is not valid UTF-8".to_string()),
     }
+}
+
+/// Resolve the sid session directory ralph journals under.  Prefer the
+/// parent's `SID_SESSION_DIR` (set when launched from an interactive session).
+/// Standalone, create a fresh session under `SID_HOME` for a new run, or find
+/// the session already holding `resume` when resuming.
+fn resolve_session_dir(
+    config_root: &Path,
+    workspace_root: &Path,
+    resume: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var(SID_SESSION_DIR_ENV)
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    match resume {
+        Some(id) => find_run_session(&resolve_sessions_root(config_root), id),
+        None => {
+            let session = SidSession::create_with_workspace(config_root, workspace_root)
+                .map_err(|err| format!("failed to create a session: {err}"))?;
+            Ok(session.root().clone())
+        }
+    }
+}
+
+/// Mirror sid's sessions-root resolution: honor `SID_SESSIONS`, else fall back
+/// to `<SID_HOME>/sessions`.
+fn resolve_sessions_root(config_root: &Path) -> PathBuf {
+    match std::env::var(SID_SESSIONS_ENV) {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(config_root.as_str()).join("sessions"),
+    }
+}
+
+/// Find the session directory that holds `runs/<run_id>`, so `--resume` works
+/// across standalone invocations, each of which lives in its own session.
+fn find_run_session(sessions_root: &std::path::Path, run_id: &str) -> Result<PathBuf, String> {
+    let entries = std::fs::read_dir(sessions_root).map_err(|err| {
+        format!(
+            "failed to scan sessions {}: {err}",
+            sessions_root.display()
+        )
+    })?;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if candidate.join("runs").join(run_id).is_dir() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("no such run to --resume: {run_id}"))
 }
 
 /// Resolve a script: absolute paths as-is, otherwise relative to the
