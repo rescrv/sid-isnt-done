@@ -240,12 +240,8 @@ fn resolve_sessions_root(config_root: &Path) -> PathBuf {
 /// Find the session directory that holds `runs/<run_id>`, so `--resume` works
 /// across standalone invocations, each of which lives in its own session.
 fn find_run_session(sessions_root: &std::path::Path, run_id: &str) -> Result<PathBuf, String> {
-    let entries = std::fs::read_dir(sessions_root).map_err(|err| {
-        format!(
-            "failed to scan sessions {}: {err}",
-            sessions_root.display()
-        )
-    })?;
+    let entries = std::fs::read_dir(sessions_root)
+        .map_err(|err| format!("failed to scan sessions {}: {err}", sessions_root.display()))?;
     for entry in entries.flatten() {
         let candidate = entry.path();
         if candidate.join("runs").join(run_id).is_dir() {

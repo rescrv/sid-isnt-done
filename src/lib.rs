@@ -1436,11 +1436,11 @@ impl Agent for SidAgent {
                 .log_api_response(resp)
                 .map_err(|err| Error::unknown(format!("failed to log API response: {err}")))?;
         }
-        let totals = self.record_token_usage(resp.usage);
+        let totals = self.record_token_usage(&resp.usage);
         let rates = self.token_rates();
         let cost_suffix = match rates {
             Some(rates) => {
-                let turn_cost = compute_cost_micro_cents(resp.usage, rates);
+                let turn_cost = compute_cost_micro_cents(&resp.usage, rates);
                 format!(
                     " turn={} total={}",
                     format_cost(turn_cost),
@@ -1613,7 +1613,7 @@ impl ChatAgent for SidAgent {
 }
 
 impl SidAgent {
-    fn record_token_usage(&self, usage: Usage) -> TokenUsageTotals {
+    fn record_token_usage(&self, usage: &Usage) -> TokenUsageTotals {
         let rates = self.token_rates();
         let mut totals = self
             .token_usage_totals
@@ -1869,7 +1869,7 @@ struct TokenUsageTotals {
 }
 
 impl TokenUsageTotals {
-    fn add(&mut self, usage: Usage, rates: Option<TokenRates>) {
+    fn add(&mut self, usage: &Usage, rates: Option<TokenRates>) {
         self.input = self.input.saturating_add(tokens_to_u64(usage.input_tokens));
         self.cache_creation = self
             .cache_creation
@@ -1889,7 +1889,7 @@ impl TokenUsageTotals {
 }
 
 /// Compute the cost in micro-cents for a single Usage at the given TokenRates.
-fn compute_cost_micro_cents(usage: Usage, rates: TokenRates) -> u64 {
+fn compute_cost_micro_cents(usage: &Usage, rates: TokenRates) -> u64 {
     let input = tokens_to_u64(usage.input_tokens).saturating_mul(rates.input);
     let output = tokens_to_u64(usage.output_tokens).saturating_mul(rates.output);
     let cache_creation = optional_tokens_to_u64(usage.cache_creation_input_tokens)
@@ -4782,13 +4782,13 @@ compact_TOOLS='bash'
     fn token_usage_totals_accumulate_input_cached_input_and_output() {
         let mut totals = TokenUsageTotals::default();
         totals.add(
-            Usage::new(10, 4)
+            &Usage::new(10, 4)
                 .with_cache_creation_input_tokens(3)
                 .with_cache_read_input_tokens(6),
             None,
         );
         totals.add(
-            Usage::new(20, 8)
+            &Usage::new(20, 8)
                 .with_cache_creation_input_tokens(5)
                 .with_cache_read_input_tokens(7),
             None,
@@ -4810,7 +4810,7 @@ compact_TOOLS='bash'
     fn token_usage_totals_treat_negative_counts_as_zero() {
         let mut totals = TokenUsageTotals::default();
         totals.add(
-            Usage::new(-10, -4)
+            &Usage::new(-10, -4)
                 .with_cache_creation_input_tokens(-3)
                 .with_cache_read_input_tokens(-6),
             None,
@@ -4829,7 +4829,7 @@ compact_TOOLS='bash'
         };
         let mut totals = TokenUsageTotals::default();
         totals.add(
-            Usage::new(100, 50)
+            &Usage::new(100, 50)
                 .with_cache_creation_input_tokens(20)
                 .with_cache_read_input_tokens(10),
             Some(rates),
@@ -4845,7 +4845,7 @@ compact_TOOLS='bash'
     #[test]
     fn token_usage_totals_no_cost_without_rates() {
         let mut totals = TokenUsageTotals::default();
-        totals.add(Usage::new(100, 50), None);
+        totals.add(&Usage::new(100, 50), None);
 
         assert_eq!(totals.cost_micro_cents, 0);
     }
